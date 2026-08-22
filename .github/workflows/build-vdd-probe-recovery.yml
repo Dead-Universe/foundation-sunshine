@@ -1,13 +1,9 @@
 name: Build VDD Probe Recovery Fast
 
 on:
-  pull_request:
+  push:
     branches:
-      - master
-    types:
-      - opened
-      - synchronize
-      - reopened
+      - codex/vdd-ddx-probe-recovery
   workflow_dispatch:
 
 concurrency:
