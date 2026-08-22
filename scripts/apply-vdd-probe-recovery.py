@@ -4,96 +4,95 @@ from pathlib import Path
 path = Path("src/video.cpp")
 text = path.read_text(encoding="utf-8")
 
-old_decl = """    const auto probe_capture_override = capture_override_for_encoder_probe();
-"""
-new_decl = """    auto probe_capture_override = capture_override_for_encoder_probe();
-"""
-if old_decl not in text:
-    raise SystemExit("expected probe_capture_override declaration not found")
-text = text.replace(old_decl, new_decl, 1)
+# Keep the upstream DDX-first probe selection intact.  The recovery belongs
+# inside validate_encoder(), where we can distinguish "DDX enumerated an
+# output" from "DDX actually managed to create a capture display".
+old = """    const auto configured_capture_backend = config::video.capture;
 
-old_block = """      const auto capture_ready_displays = encoder_list.empty() ?
-                                            std::vector<std::string> {} :
-                                            platf::display_names(encoder_list.front()->platform_formats->dev_type);
-      const bool exact_target_unavailable = target_requires_exact_resolution &&
-                                            std::ranges::find(capture_ready_displays, configured_display_name) == capture_ready_displays.end();
-      if (exact_target_unavailable) {
-        last_encoder_probe_result = {
-          probe_error_e::no_active_display,
-          \"The requested display is not available to the encoder probe capture backend.\",
-          \"Connect or enable the selected display, then try again.\"
-        };
-        BOOST_LOG(error) << \"Requested output [\"sv << configured_output_name
-                         << \"] is unavailable to temporary capture backend [\"sv
-                         << *probe_capture_override << \" ]\"sv;
-        return -1;
-      }
-      probe_display_name = select_encoder_probe_display(configured_display_name, capture_ready_displays);
+    BOOST_LOG(info) << \"Trying encoder [\"sv << encoder.name << ']';
 """
+new = """    const auto configured_capture_backend = config::video.capture;
+    auto effective_probe_capture_override = probe_capture_override;
 
-# Upstream currently has no space before the closing bracket in the log string.
-# Keep a second exact form so the patcher is strict without being whitespace-fragile.
-old_block_actual = """      const auto capture_ready_displays = encoder_list.empty() ?
-                                            std::vector<std::string> {} :
-                                            platf::display_names(encoder_list.front()->platform_formats->dev_type);
-      const bool exact_target_unavailable = target_requires_exact_resolution &&
-                                            std::ranges::find(capture_ready_displays, configured_display_name) == capture_ready_displays.end();
-      if (exact_target_unavailable) {
-        last_encoder_probe_result = {
-          probe_error_e::no_active_display,
-          \"The requested display is not available to the encoder probe capture backend.\",
-          \"Connect or enable the selected display, then try again.\"
-        };
-        BOOST_LOG(error) << \"Requested output [\"sv << configured_output_name
-                         << \"] is unavailable to temporary capture backend [\"sv
-                         << *probe_capture_override << \"]\"sv;
-        return -1;
-      }
-      probe_display_name = select_encoder_probe_display(configured_display_name, capture_ready_displays);
+    BOOST_LOG(info) << \"Trying encoder [\"sv << encoder.name << ']';
 """
+if old not in text:
+    raise SystemExit("expected validate_encoder prologue not found")
+text = text.replace(old, new, 1)
 
-new_block = """      const auto capture_ready_displays = encoder_list.empty() ?
-                                            std::vector<std::string> {} :
-                                            platf::display_names(encoder_list.front()->platform_formats->dev_type);
+old = """    if (probe_capture_override) {
+      BOOST_LOG(info) << \"Temporarily using capture backend [\"sv << *probe_capture_override
+                      << \"] for encoder probe while configured capture backend is [\"sv
+                      << configured_capture_backend << \"]\"sv;
+    }
+"""
+new = """    if (effective_probe_capture_override) {
+      BOOST_LOG(info) << \"Temporarily using capture backend [\"sv << *effective_probe_capture_override
+                      << \"] for encoder probe while configured capture backend is [\"sv
+                      << configured_capture_backend << \"]\"sv;
+    }
+"""
+if old not in text:
+    raise SystemExit("expected validate_encoder probe logging block not found")
+text = text.replace(old, new, 1)
 
-      // Preserve the existing DDX-first cold-start behavior whenever DDX can
-      // capture at least one output. Hyper-V GPU-PV can expose active displays
-      // while Desktop Duplication is unavailable for every output
-      // (DuplicateOutput(E_INVALIDARG)). In that narrow case only, stop forcing
-      // the probe through DDX and let the configured VDD backend run. The
-      // Windows VDD backend still keeps its own vdd -> ddx runtime fallback, so
-      // hosts where direct ZakoVDD capture is unsupported do not lose the old
-      // safety net.
-      if (config::video.capture == \"vdd\" && capture_ready_displays.empty()) {
-        BOOST_LOG(warning) << \"No DDX capture-ready display is available for encoder probing; \"
-                           << \"retrying with configured VDD direct capture while preserving runtime DDX fallback\"sv;
-        probe_capture_override.reset();
-        probe_display_name = configured_display_name;
-      }
-      else {
-        const bool exact_target_unavailable = target_requires_exact_resolution &&
-                                              std::ranges::find(capture_ready_displays, configured_display_name) == capture_ready_displays.end();
-        if (exact_target_unavailable) {
-          last_encoder_probe_result = {
-            probe_error_e::no_active_display,
-            \"The requested display is not available to the encoder probe capture backend.\",
-            \"Connect or enable the selected display, then try again.\"
-          };
-          BOOST_LOG(error) << \"Requested output [\"sv << configured_output_name
-                           << \"] is unavailable to temporary capture backend [\"sv
-                           << *probe_capture_override << \" ]\"sv;
-          return -1;
+old = """    if (probe_capture_override) {
+      config_max_ref_frames.capture_backend_override = *probe_capture_override;
+      config_autoselect.capture_backend_override = *probe_capture_override;
+    }
+
+    // If the encoder isn't supported at all (not even H.264), bail early
+    reset_display(disp, encoder.platform_formats->dev_type, probe_display_name, config_autoselect);
+    if (!disp) {
+      return false;
+    }
+"""
+new = """    if (effective_probe_capture_override) {
+      config_max_ref_frames.capture_backend_override = *effective_probe_capture_override;
+      config_autoselect.capture_backend_override = *effective_probe_capture_override;
+    }
+
+    // If the encoder isn't supported at all (not even H.264), bail early.
+    // Keep upstream's DDX-first cold-start behavior.  However, Hyper-V GPU-PV
+    // can enumerate a DXGI output successfully and still fail DuplicateOutput()
+    // when reset_display() actually opens it.  In that narrow case, and only
+    // when the configured runtime backend is VDD, retry this same encoder once
+    // with the real VDD backend.  If DDX succeeds, nothing changes.  If VDD
+    // direct capture is unsupported, the Windows VDD backend retains its own
+    // VDD -> DDX fallback, so the existing safety net is not removed.
+    reset_display(disp, encoder.platform_formats->dev_type, probe_display_name, config_autoselect);
+    if (!disp &&
+        configured_capture_backend == \"vdd\" &&
+        effective_probe_capture_override &&
+        *effective_probe_capture_override == \"ddx\") {
+      BOOST_LOG(warning) << \"DDX encoder probe could not create a capture display; \"
+                         << \"retrying the same encoder with configured VDD direct capture \"
+                         << \"while preserving the VDD backend's runtime DDX fallback\"sv;
+
+      effective_probe_capture_override.reset();
+      config_max_ref_frames.capture_backend_override.clear();
+      config_autoselect.capture_backend_override.clear();
+      reset_display(disp, encoder.platform_formats->dev_type, probe_display_name, config_autoselect);
+    }
+    if (!disp) {
+      return false;
+    }
+"""
+if old not in text:
+    raise SystemExit("expected validate_encoder initial display probe block not found")
+text = text.replace(old, new, 1)
+
+old = """        if (probe_capture_override) {
+          generic_hdr_config.capture_backend_override = *probe_capture_override;
         }
-        probe_display_name = select_encoder_probe_display(configured_display_name, capture_ready_displays);
-      }
 """
-
-# Normalize the one intended upstream log token in the replacement after matching.
-matched = old_block_actual if old_block_actual in text else old_block if old_block in text else None
-if matched is None:
-    raise SystemExit("expected encoder probe display-selection block not found")
-text = text.replace(matched, new_block, 1)
-text = text.replace('<< *probe_capture_override << " ]"sv;', '<< *probe_capture_override << "]"sv;', 1)
+new = """        if (effective_probe_capture_override) {
+          generic_hdr_config.capture_backend_override = *effective_probe_capture_override;
+        }
+"""
+if old not in text:
+    raise SystemExit("expected validate_encoder HDR override block not found")
+text = text.replace(old, new, 1)
 
 path.write_text(text, encoding="utf-8")
-print("Applied conservative VDD encoder-probe recovery patch to src/video.cpp")
+print("Applied DDX-first / VDD-on-open-failure encoder-probe recovery patch to src/video.cpp")
