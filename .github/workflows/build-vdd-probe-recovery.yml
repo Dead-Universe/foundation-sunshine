@@ -1,0 +1,187 @@
+name: Build VDD Probe Recovery
+
+on:
+  push:
+    branches:
+      - codex/vdd-ddx-probe-recovery
+  workflow_dispatch:
+
+concurrency:
+  group: vdd-probe-recovery-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  RECOVERY_VERSION: vdd-recovery-${{ github.run_number }}.杂鱼
+
+jobs:
+  build_win:
+    name: Windows recovery build
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+
+      - name: Apply conservative VDD probe recovery
+        shell: pwsh
+        run: |
+          python .\scripts\apply-vdd-probe-recovery.py
+          git diff --check
+          git diff -- src/video.cpp
+
+      - name: Setup Dependencies Windows
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ucrt64
+          update: true
+          install: >-
+            wget
+            curl
+
+      - name: Update Windows dependencies
+        env:
+          opus_version: '1.6.1-1'
+        shell: msys2 {0}
+        run: |
+          opus_tarball="mingw-w64-ucrt-x86_64-opus-${opus_version}-any.pkg.tar.zst"
+          wget https://repo.msys2.org/mingw/ucrt64/${opus_tarball}
+          dependencies=(
+            "git"
+            "mingw-w64-ucrt-x86_64-ccache"
+            "mingw-w64-ucrt-x86_64-cmake"
+            "mingw-w64-ucrt-x86_64-ninja"
+            "mingw-w64-ucrt-x86_64-cppwinrt"
+            "mingw-w64-ucrt-x86_64-curl-winssl"
+            "mingw-w64-ucrt-x86_64-graphviz"
+            "mingw-w64-ucrt-x86_64-MinHook"
+            "mingw-w64-ucrt-x86_64-miniupnpc"
+            "mingw-w64-ucrt-x86_64-nlohmann-json"
+            "mingw-w64-ucrt-x86_64-onevpl"
+            "mingw-w64-ucrt-x86_64-openssl"
+            "mingw-w64-ucrt-x86_64-toolchain"
+            "mingw-w64-ucrt-x86_64-autotools"
+          )
+          pacman -Syu --noconfirm "${dependencies[@]}"
+          pacman --noconfirm -U ${opus_tarball}
+
+      - name: Verify Build Tools
+        shell: msys2 {0}
+        run: |
+          which cmake
+          which ninja
+          which gcc
+          cmake --version | head -1
+          ninja --version
+          gcc --version | head -1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Setup .NET for DualSense sidecar
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build self-contained DualSense sidecar
+        shell: pwsh
+        run: .\scripts\build-ds5-sidecar.ps1 -ReleaseTag $env:RECOVERY_VERSION
+
+      - name: Build Web UI
+        shell: pwsh
+        run: |
+          npm ci
+          npm run lint:webui
+          npm run test:webui
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          $env:SUNSHINE_SOURCE_ASSETS_DIR = "${{ github.workspace }}\src_assets"
+          $env:SUNSHINE_ASSETS_DIR = "${{ github.workspace }}\build"
+          npm run build
+
+      - name: Cache compiler objects
+        uses: actions/cache@v6
+        with:
+          path: ${{ github.workspace }}\.ccache
+          key: ccache-vdd-recovery-${{ github.run_id }}
+          restore-keys: |
+            ccache-vdd-recovery-
+            ccache-windows-
+
+      - name: Build Windows
+        shell: msys2 {0}
+        env:
+          BRANCH: codex/vdd-ddx-probe-recovery
+          BUILD_VERSION: ${{ env.RECOVERY_VERSION }}
+          COMMIT: ${{ github.sha }}
+          CCACHE_DIR: ${{ github.workspace }}\.ccache
+          CCACHE_MAXSIZE: 2G
+          CCACHE_COMPILERCHECK: content
+          DRIVER_DEPS_REQUIRED: OFF
+        run: |
+          mkdir -p build
+          ccache --zero-stats
+          cmake \
+            -B build \
+            -G Ninja \
+            -S . \
+            -DBUILD_DOCS=OFF \
+            -DBUILD_TESTS=ON \
+            -DBUILD_TRAY_TESTS=ON \
+            -DBUILD_WEB_UI=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DSUNSHINE_ASSETS_DIR=assets \
+            -DDRIVER_DEPS_REQUIRED=OFF \
+            -DSUNSHINE_PUBLISHER_NAME='Dead-Universe' \
+            -DSUNSHINE_PUBLISHER_WEBSITE='https://github.com/Dead-Universe/foundation-sunshine' \
+            -DSUNSHINE_PUBLISHER_ISSUE_URL='https://github.com/Dead-Universe/foundation-sunshine/issues'
+          ninja -C build
+          ccache --show-stats
+
+      - name: Run native tests
+        shell: msys2 {0}
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $url = "https://jrsoftware.org/download.php/is.exe"
+          $installer = "$env:TEMP\innosetup.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-' -Wait
+          "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Package Windows
+        shell: msys2 {0}
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          cd build
+          cmake --install . --prefix ./inno_staging
+          test -f ./inno_staging/tools/ds5-sidecar-package.json
+          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" sunshine_installer.iss | tee inno-build.log
+          cpack -G ZIP --config ./CPackConfig.cmake --verbose
+          mv ./cpack_artifacts/Sunshine.exe ../artifacts/Sunshine.VDD-Probe-Recovery.WindowsInstaller.exe
+          mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine.VDD-Probe-Recovery.Portable-x64.zip
+          cd ..
+          git diff -- src/video.cpp > artifacts/vdd-probe-recovery.patch
+          git rev-parse HEAD > artifacts/source-commit.txt
+          sha256sum artifacts/Sunshine.VDD-Probe-Recovery.WindowsInstaller.exe artifacts/Sunshine.VDD-Probe-Recovery.Portable-x64.zip > artifacts/SHA256SUMS.txt
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: sunshine-vdd-probe-recovery-r${{ github.run_number }}
+          path: |
+            artifacts/Sunshine.VDD-Probe-Recovery.WindowsInstaller.exe
+            artifacts/Sunshine.VDD-Probe-Recovery.Portable-x64.zip
+            artifacts/vdd-probe-recovery.patch
+            artifacts/source-commit.txt
+            artifacts/SHA256SUMS.txt
+          if-no-files-found: error
