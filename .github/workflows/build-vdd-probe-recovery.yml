@@ -1,9 +1,6 @@
 name: Build VDD Probe Recovery
 
 on:
-  push:
-    branches:
-      - codex/vdd-ddx-probe-recovery
   pull_request:
     branches:
       - master
@@ -155,40 +152,82 @@ jobs:
         shell: msys2 {0}
         run: ctest --test-dir build --output-on-failure
 
-      - name: Install Inno Setup
-        shell: pwsh
-        run: |
-          $url = "https://jrsoftware.org/download.php/is.exe"
-          $installer = "$env:TEMP\innosetup.exe"
-          Invoke-WebRequest -Uri $url -OutFile $installer
-          Start-Process -FilePath $installer -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-' -Wait
-          "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      - name: Package Windows
+      - name: Package portable ZIP
         shell: msys2 {0}
         run: |
           set -o pipefail
           mkdir -p artifacts
           cd build
-          cmake --install . --prefix ./inno_staging
-          test -f ./inno_staging/tools/ds5-sidecar-package.json
-          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" sunshine_installer.iss | tee inno-build.log
           cpack -G ZIP --config ./CPackConfig.cmake --verbose
-          mv ./cpack_artifacts/Sunshine.exe ../artifacts/Sunshine.VDD-Probe-Recovery.WindowsInstaller.exe
           mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine.VDD-Probe-Recovery.Portable-x64.zip
           cd ..
           git diff -- src/video.cpp > artifacts/vdd-probe-recovery.patch
           git rev-parse HEAD > artifacts/source-commit.txt
-          sha256sum artifacts/Sunshine.VDD-Probe-Recovery.WindowsInstaller.exe artifacts/Sunshine.VDD-Probe-Recovery.Portable-x64.zip > artifacts/SHA256SUMS.txt
+          sha256sum artifacts/Sunshine.VDD-Probe-Recovery.Portable-x64.zip > artifacts/SHA256SUMS-portable.txt
 
-      - name: Upload Artifacts
+      - name: Upload portable artifact
         uses: actions/upload-artifact@v7
         with:
-          name: sunshine-vdd-probe-recovery-r${{ github.run_number }}
+          name: sunshine-vdd-probe-recovery-portable-r${{ github.run_number }}
           path: |
-            artifacts/Sunshine.VDD-Probe-Recovery.WindowsInstaller.exe
             artifacts/Sunshine.VDD-Probe-Recovery.Portable-x64.zip
             artifacts/vdd-probe-recovery.patch
             artifacts/source-commit.txt
-            artifacts/SHA256SUMS.txt
+            artifacts/SHA256SUMS-portable.txt
+          if-no-files-found: error
+
+      - name: Cache Inno Setup
+        id: cache-inno-setup
+        uses: actions/cache@v6
+        with:
+          path: C:\Program Files (x86)\Inno Setup 6
+          key: inno-setup-6-${{ runner.os }}-v1
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+
+          if (-not (Test-Path $iscc)) {
+            Write-Host 'Inno Setup cache miss; trying Chocolatey.'
+            $choco = Get-Command choco.exe -ErrorAction SilentlyContinue
+            if ($choco) {
+              choco install innosetup -y --no-progress --limit-output
+            }
+          }
+
+          if (-not (Test-Path $iscc)) {
+            Write-Warning 'Chocolatey did not provide ISCC.exe; falling back to the official installer.'
+            $installer = Join-Path $env:RUNNER_TEMP 'innosetup.exe'
+            Invoke-WebRequest -Uri 'https://jrsoftware.org/download.php/is.exe' -OutFile $installer
+            Start-Process -FilePath $installer -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-' -Wait
+          }
+
+          if (-not (Test-Path $iscc)) {
+            throw 'Inno Setup installation failed: ISCC.exe was not found.'
+          }
+
+          Write-Host "Using Inno Setup: $iscc"
+          'C:\Program Files (x86)\Inno Setup 6' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Package Windows installer
+        shell: msys2 {0}
+        run: |
+          set -o pipefail
+          cd build
+          cmake --install . --prefix ./inno_staging
+          test -f ./inno_staging/tools/ds5-sidecar-package.json
+          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" sunshine_installer.iss | tee inno-build.log
+          mv ./cpack_artifacts/Sunshine.exe ../artifacts/Sunshine.VDD-Probe-Recovery.WindowsInstaller.exe
+          cd ..
+          sha256sum artifacts/Sunshine.VDD-Probe-Recovery.WindowsInstaller.exe > artifacts/SHA256SUMS-installer.txt
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: sunshine-vdd-probe-recovery-installer-r${{ github.run_number }}
+          path: |
+            artifacts/Sunshine.VDD-Probe-Recovery.WindowsInstaller.exe
+            artifacts/SHA256SUMS-installer.txt
           if-no-files-found: error
