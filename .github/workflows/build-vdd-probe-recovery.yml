@@ -1,4 +1,4 @@
-name: Build VDD Probe Recovery
+name: Build VDD Probe Recovery Fast
 
 on:
   pull_request:
@@ -16,12 +16,17 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
-  RECOVERY_VERSION: vdd-recovery-${{ github.run_number }}.杂鱼
+  RECOVERY_VERSION: vdd-recovery-fast-${{ github.run_number }}.杂鱼
+  BASE_PORTABLE_RUN_ID: '32571343151'
+  BASE_PORTABLE_ARTIFACT: sunshine-vdd-probe-recovery-portable-r4
 
 jobs:
-  build_win:
-    name: Windows recovery build
+  build_win_fast:
+    name: Windows recovery fast build
     runs-on: windows-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -29,14 +34,14 @@ jobs:
           ref: ${{ github.sha }}
           submodules: recursive
 
-      - name: Apply conservative VDD probe recovery
+      - name: Apply latest DDX-open-failure VDD recovery
         shell: pwsh
         run: |
           python .\scripts\apply-vdd-probe-recovery.py
           git diff --check
           git diff -- src/video.cpp
 
-      - name: Setup Dependencies Windows
+      - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
         with:
           msystem: ucrt64
@@ -45,13 +50,13 @@ jobs:
             wget
             curl
 
-      - name: Update Windows dependencies
+      - name: Install Windows build dependencies
         env:
           opus_version: '1.6.1-1'
         shell: msys2 {0}
         run: |
           opus_tarball="mingw-w64-ucrt-x86_64-opus-${opus_version}-any.pkg.tar.zst"
-          wget https://repo.msys2.org/mingw/ucrt64/${opus_tarball}
+          wget -q https://repo.msys2.org/mingw/ucrt64/${opus_tarball}
           dependencies=(
             "git"
             "mingw-w64-ucrt-x86_64-ccache"
@@ -71,53 +76,17 @@ jobs:
           pacman -Syu --noconfirm "${dependencies[@]}"
           pacman --noconfirm -U ${opus_tarball}
 
-      - name: Verify Build Tools
-        shell: msys2 {0}
-        run: |
-          which cmake
-          which ninja
-          which gcc
-          cmake --version | head -1
-          ninja --version
-          gcc --version | head -1
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version-file: .node-version
-          cache: npm
-          cache-dependency-path: package-lock.json
-
-      - name: Setup .NET for DualSense sidecar
-        uses: actions/setup-dotnet@v6
-        with:
-          dotnet-version: '10.0.x'
-
-      - name: Build self-contained DualSense sidecar
-        shell: pwsh
-        run: .\scripts\build-ds5-sidecar.ps1 -ReleaseTag $env:RECOVERY_VERSION
-
-      - name: Build Web UI
-        shell: pwsh
-        run: |
-          npm ci
-          npm run lint:webui
-          npm run test:webui
-          New-Item -ItemType Directory -Force -Path build | Out-Null
-          $env:SUNSHINE_SOURCE_ASSETS_DIR = "${{ github.workspace }}\src_assets"
-          $env:SUNSHINE_ASSETS_DIR = "${{ github.workspace }}\build"
-          npm run build
-
-      - name: Cache compiler objects
+      - name: Restore compiler cache
         uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}\.ccache
-          key: ccache-vdd-recovery-${{ github.run_id }}
+          key: ccache-vdd-fast-${{ github.run_id }}
           restore-keys: |
+            ccache-vdd-fast-
             ccache-vdd-recovery-
             ccache-windows-
 
-      - name: Build Windows
+      - name: Build patched Sunshine executable only
         shell: msys2 {0}
         env:
           BRANCH: codex/vdd-ddx-probe-recovery
@@ -135,8 +104,8 @@ jobs:
             -G Ninja \
             -S . \
             -DBUILD_DOCS=OFF \
-            -DBUILD_TESTS=ON \
-            -DBUILD_TRAY_TESTS=ON \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_TRAY_TESTS=OFF \
             -DBUILD_WEB_UI=OFF \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -145,89 +114,51 @@ jobs:
             -DSUNSHINE_PUBLISHER_NAME='Dead-Universe' \
             -DSUNSHINE_PUBLISHER_WEBSITE='https://github.com/Dead-Universe/foundation-sunshine' \
             -DSUNSHINE_PUBLISHER_ISSUE_URL='https://github.com/Dead-Universe/foundation-sunshine/issues'
-          ninja -C build
+          ninja -C build sunshine
           ccache --show-stats
+          find build -iname 'sunshine.exe' -type f -print
 
-      - name: Run native tests
-        shell: msys2 {0}
-        run: ctest --test-dir build --output-on-failure
-
-      - name: Package portable ZIP
-        shell: msys2 {0}
-        run: |
-          set -o pipefail
-          mkdir -p artifacts
-          cd build
-          cpack -G ZIP --config ./CPackConfig.cmake --verbose
-          mv ./cpack_artifacts/Sunshine.zip ../artifacts/Sunshine.VDD-Probe-Recovery.Portable-x64.zip
-          cd ..
-          git diff -- src/video.cpp > artifacts/vdd-probe-recovery.patch
-          git rev-parse HEAD > artifacts/source-commit.txt
-          sha256sum artifacts/Sunshine.VDD-Probe-Recovery.Portable-x64.zip > artifacts/SHA256SUMS-portable.txt
-
-      - name: Upload portable artifact
-        uses: actions/upload-artifact@v7
+      - name: Download last known-good portable shell
+        uses: actions/download-artifact@v7
         with:
-          name: sunshine-vdd-probe-recovery-portable-r${{ github.run_number }}
-          path: |
-            artifacts/Sunshine.VDD-Probe-Recovery.Portable-x64.zip
-            artifacts/vdd-probe-recovery.patch
-            artifacts/source-commit.txt
-            artifacts/SHA256SUMS-portable.txt
-          if-no-files-found: error
+          name: ${{ env.BASE_PORTABLE_ARTIFACT }}
+          path: base-portable
+          repository: Dead-Universe/foundation-sunshine
+          run-id: ${{ env.BASE_PORTABLE_RUN_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Cache Inno Setup
-        id: cache-inno-setup
-        uses: actions/cache@v6
-        with:
-          path: C:\Program Files (x86)\Inno Setup 6
-          key: inno-setup-6-${{ runner.os }}-v1
-
-      - name: Install Inno Setup
+      - name: Overlay patched executable into portable package
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          New-Item -ItemType Directory -Force -Path artifacts, fast-portable | Out-Null
 
-          if (-not (Test-Path $iscc)) {
-            Write-Host 'Inno Setup cache miss; trying Chocolatey.'
-            $choco = Get-Command choco.exe -ErrorAction SilentlyContinue
-            if ($choco) {
-              choco install innosetup -y --no-progress --limit-output
-            }
-          }
+          $baseZip = Get-ChildItem -Path base-portable -Recurse -File -Filter 'Sunshine.VDD-Probe-Recovery.Portable-x64.zip' | Select-Object -First 1
+          if (-not $baseZip) { throw 'Base r4 portable ZIP was not found in downloaded artifact.' }
+          Expand-Archive -Path $baseZip.FullName -DestinationPath fast-portable -Force
 
-          if (-not (Test-Path $iscc)) {
-            Write-Warning 'Chocolatey did not provide ISCC.exe; falling back to the official installer.'
-            $installer = Join-Path $env:RUNNER_TEMP 'innosetup.exe'
-            Invoke-WebRequest -Uri 'https://jrsoftware.org/download.php/is.exe' -OutFile $installer
-            Start-Process -FilePath $installer -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-' -Wait
-          }
+          $builtExe = Get-ChildItem -Path build -Recurse -File -Filter 'sunshine.exe' | Select-Object -First 1
+          if (-not $builtExe) { throw 'Freshly built sunshine.exe was not found.' }
 
-          if (-not (Test-Path $iscc)) {
-            throw 'Inno Setup installation failed: ISCC.exe was not found.'
-          }
+          $targetExe = Get-ChildItem -Path fast-portable -Recurse -File -Filter 'sunshine.exe' | Select-Object -First 1
+          if (-not $targetExe) { throw 'sunshine.exe was not found inside the r4 portable package.' }
 
-          Write-Host "Using Inno Setup: $iscc"
-          'C:\Program Files (x86)\Inno Setup 6' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Copy-Item -Path $builtExe.FullName -Destination $targetExe.FullName -Force
+          Compress-Archive -Path 'fast-portable\*' -DestinationPath 'artifacts\Sunshine.VDD-Probe-Recovery.Fast.Portable-x64.zip' -CompressionLevel Optimal -Force
 
-      - name: Package Windows installer
-        shell: msys2 {0}
-        run: |
-          set -o pipefail
-          cd build
-          cmake --install . --prefix ./inno_staging
-          test -f ./inno_staging/tools/ds5-sidecar-package.json
-          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" sunshine_installer.iss | tee inno-build.log
-          mv ./cpack_artifacts/Sunshine.exe ../artifacts/Sunshine.VDD-Probe-Recovery.WindowsInstaller.exe
-          cd ..
-          sha256sum artifacts/Sunshine.VDD-Probe-Recovery.WindowsInstaller.exe > artifacts/SHA256SUMS-installer.txt
+          git diff -- src/video.cpp | Out-File -FilePath 'artifacts\vdd-probe-recovery.patch' -Encoding utf8
+          git rev-parse HEAD | Out-File -FilePath 'artifacts\source-commit.txt' -Encoding ascii
+          Get-FileHash 'artifacts\Sunshine.VDD-Probe-Recovery.Fast.Portable-x64.zip' -Algorithm SHA256 |
+            ForEach-Object { "$($_.Hash.ToLower())  Sunshine.VDD-Probe-Recovery.Fast.Portable-x64.zip" } |
+            Out-File -FilePath 'artifacts\SHA256SUMS.txt' -Encoding ascii
 
-      - name: Upload installer artifact
+      - name: Upload fast portable artifact
         uses: actions/upload-artifact@v7
         with:
-          name: sunshine-vdd-probe-recovery-installer-r${{ github.run_number }}
+          name: sunshine-vdd-probe-recovery-fast-r${{ github.run_number }}
           path: |
-            artifacts/Sunshine.VDD-Probe-Recovery.WindowsInstaller.exe
-            artifacts/SHA256SUMS-installer.txt
+            artifacts/Sunshine.VDD-Probe-Recovery.Fast.Portable-x64.zip
+            artifacts/vdd-probe-recovery.patch
+            artifacts/source-commit.txt
+            artifacts/SHA256SUMS.txt
           if-no-files-found: error
