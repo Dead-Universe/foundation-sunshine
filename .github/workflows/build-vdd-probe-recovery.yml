@@ -4,6 +4,13 @@ on:
   push:
     branches:
       - codex/vdd-ddx-probe-recovery
+  pull_request:
+    branches:
+      - master
+    types:
+      - opened
+      - synchronize
+      - reopened
   workflow_dispatch:
 
 concurrency:
