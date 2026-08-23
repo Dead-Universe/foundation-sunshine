@@ -51,24 +51,35 @@ new = '''    if (effective_probe_capture_override) {
 
     // Keep upstream's DDX-first probe behavior. Hyper-V GPU-PV can enumerate
     // a DXGI output but still fail when reset_display() actually opens it.
-    // Retry with VDD only after the configured target resolves to a real OS
-    // display name. During cold start the Zako VDD is not present yet, so the
-    // probe target is empty and we intentionally do not attempt VDD here.
+    // If the earlier probe target was empty, re-resolve the configured ZakoHDR
+    // sentinel at the moment DDX has failed. This catches a VDD that appeared
+    // during display preparation without turning cold-start into repeated VDD
+    // attempts when Windows still has no concrete Zako display to target.
     reset_display(disp, encoder.platform_formats->dev_type, probe_display_name, config_autoselect);
+    auto vdd_retry_display_name = probe_display_name;
     if (!disp &&
         configured_capture_backend == "vdd" &&
-        !probe_display_name.empty() &&
+        vdd_retry_display_name.empty()) {
+      vdd_retry_display_name = display_device::get_display_name(config::video.output_name);
+      if (!vdd_retry_display_name.empty()) {
+        BOOST_LOG(info) << "Resolved live VDD probe target after DDX failure: ["sv
+                        << vdd_retry_display_name << ']';
+      }
+    }
+    if (!disp &&
+        configured_capture_backend == "vdd" &&
+        !vdd_retry_display_name.empty() &&
         effective_probe_capture_override &&
         *effective_probe_capture_override == "ddx") {
       BOOST_LOG(warning) << "DDX encoder probe could not create capture display ["sv
-                         << probe_display_name
+                         << vdd_retry_display_name
                          << "]; retrying the same encoder with configured VDD direct capture "
                          << "while preserving the VDD backend's runtime DDX fallback"sv;
 
       effective_probe_capture_override.reset();
       config_max_ref_frames.capture_backend_override.clear();
       config_autoselect.capture_backend_override.clear();
-      reset_display(disp, encoder.platform_formats->dev_type, probe_display_name, config_autoselect);
+      reset_display(disp, encoder.platform_formats->dev_type, vdd_retry_display_name, config_autoselect);
     }
     if (!disp) {
       return false;
@@ -168,4 +179,32 @@ if old not in display_text:
 display_text = display_text.replace(old, new, 1)
 
 display_path.write_text(display_text, encoding="utf-8")
-print("Applied DDX-first / active-target VDD recovery plus ZakoVDD-only DDX-test bypass")
+
+# Preserve the real Win32 error immediately after CreateFileW. The previous
+# diagnostic streamed GetLastError() through BOOST_LOG, and logging itself can
+# call Win32 APIs before the value is formatted, which produced misleading
+# "err=0" reports even though CreateFileW returned INVALID_HANDLE_VALUE.
+ioctl_path = Path("src/display_device/vdd_ioctl.cpp")
+ioctl_text = ioctl_path.read_text(encoding="utf-8")
+old = '''        if (m_handle == INVALID_HANDLE_VALUE) {
+          // Interface was enumerated (path resolved) but the kernel still
+          // refused to give us a handle. Propagate the failure.
+          BOOST_LOG(warning) << "vdd_ioctl: CreateFileW failed (err=" << GetLastError() << ")";
+          return open_result::failed;
+        }
+'''
+new = '''        if (m_handle == INVALID_HANDLE_VALUE) {
+          // Interface was enumerated (path resolved) but the kernel still
+          // refused to give us a handle. Capture the thread last-error value
+          // before logging can disturb it.
+          const DWORD create_error = GetLastError();
+          BOOST_LOG(warning) << "vdd_ioctl: CreateFileW failed (err=" << create_error << ")";
+          return open_result::failed;
+        }
+'''
+if old not in ioctl_text:
+    raise SystemExit("expected vdd_ioctl CreateFileW failure block not found")
+ioctl_text = ioctl_text.replace(old, new, 1)
+ioctl_path.write_text(ioctl_text, encoding="utf-8")
+
+print("Applied DDX-first VDD recovery, live Zako target re-resolution, ZakoVDD-only DDX-test bypass, and stable IOCTL error logging")
