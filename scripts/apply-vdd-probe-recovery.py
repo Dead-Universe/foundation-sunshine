@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 from pathlib import Path
 
-path = Path("src/video.cpp")
-text = path.read_text(encoding="utf-8")
+video_path = Path("src/video.cpp")
+text = video_path.read_text(encoding="utf-8")
 
 old = '''    const auto configured_capture_backend = config::video.capture;
 
@@ -90,5 +90,82 @@ if old not in text:
     raise SystemExit("expected validate_encoder HDR override block not found")
 text = text.replace(old, new, 1)
 
-path.write_text(text, encoding="utf-8")
-print("Applied DDX-first / active-target VDD-on-open-failure encoder-probe recovery patch to src/video.cpp")
+video_path.write_text(text, encoding="utf-8")
+
+# The VDD retry above only helps if display_base_t::init() can actually select
+# the ZakoVDD output. On GPU-PV, requiring test_dxgi_duplication() for that
+# output recreates the same DDX gate we are trying to recover from. Respect the
+# per-display probe override here: the first DDX attempt still performs the DDX
+# test, while the retry (override cleared, effective backend = vdd) may accept
+# only the confirmed ZakoVDD output without Desktop Duplication validation.
+display_path = Path("src/platform/windows/display_base.cpp")
+display_text = display_path.read_text(encoding="utf-8")
+
+old = '''    auto adapter_name = from_utf8(config::video.adapter_name);
+    const bool is_rdp_session = !is_running_as_system_user && display_device::w_utils::is_any_rdp_session_active();
+    auto output_name = is_rdp_session ? std::wstring {} : from_utf8(display_name);
+
+    if (is_rdp_session) {
+'''
+new = '''    auto adapter_name = from_utf8(config::video.adapter_name);
+    const bool is_rdp_session = !is_running_as_system_user && display_device::w_utils::is_any_rdp_session_active();
+    auto output_name = is_rdp_session ? std::wstring {} : from_utf8(display_name);
+    const auto &effective_capture_backend =
+      config.capture_backend_override.empty() ? config::video.capture : config.capture_backend_override;
+    const bool direct_vdd_capture = effective_capture_backend == "vdd";
+    std::wstring vdd_output_name;
+    if (direct_vdd_capture) {
+      const auto vdd_device_id = display_device::find_device_by_friendlyname(ZAKO_NAME);
+      if (!vdd_device_id.empty()) {
+        vdd_output_name = from_utf8(display_device::get_display_name(vdd_device_id));
+      }
+    }
+
+    if (is_rdp_session) {
+'''
+if old not in display_text:
+    raise SystemExit("expected display_base_t::init capture selection prologue not found")
+display_text = display_text.replace(old, new, 1)
+
+old = '''          if (!is_rdp_session && !output_name.empty() && desc.DeviceName != output_name) {
+            continue;
+          }
+
+          const bool output_accepted = is_rdp_session ||
+                                       (desc.AttachedToDesktop && test_dxgi_duplication(adapter_tmp, output_tmp, false));
+
+          if (output_accepted) {
+            BOOST_LOG(is_rdp_session ? info : debug) << "[Display Init] Selected display: " << to_utf8(desc.DeviceName);
+'''
+new = '''          if (!is_rdp_session && !output_name.empty() && desc.DeviceName != output_name) {
+            continue;
+          }
+          if (direct_vdd_capture &&
+              output_name.empty() &&
+              !vdd_output_name.empty() &&
+              desc.DeviceName != vdd_output_name) {
+            continue;
+          }
+
+          const bool is_selected_vdd_output =
+            direct_vdd_capture &&
+            !vdd_output_name.empty() &&
+            desc.DeviceName == vdd_output_name;
+          const bool output_accepted = is_rdp_session ||
+                                       (desc.AttachedToDesktop &&
+                                        (is_selected_vdd_output ||
+                                         test_dxgi_duplication(adapter_tmp, output_tmp, false)));
+
+          if (output_accepted) {
+            if (is_selected_vdd_output) {
+              BOOST_LOG(info) << "[vdd] Selected ZakoVDD output without requiring DXGI Desktop Duplication: "
+                              << to_utf8(desc.DeviceName);
+            }
+            BOOST_LOG(is_rdp_session ? info : debug) << "[Display Init] Selected display: " << to_utf8(desc.DeviceName);
+'''
+if old not in display_text:
+    raise SystemExit("expected display_base_t::init DXGI output acceptance block not found")
+display_text = display_text.replace(old, new, 1)
+
+display_path.write_text(display_text, encoding="utf-8")
+print("Applied DDX-first / active-target VDD recovery plus ZakoVDD-only DDX-test bypass")
