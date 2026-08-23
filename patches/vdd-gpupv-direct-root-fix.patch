@@ -1,7 +1,7 @@
 diff --git a/src/video.cpp b/src/video.cpp
 --- a/src/video.cpp
 +++ b/src/video.cpp
-@@ -52,23 +52,11 @@ namespace video {
+@@ -58,19 +58,12 @@ namespace video {
      std::atomic<std::uint64_t> next_hdr_pipeline_status_id { 1 };
  
      std::optional<std::string>
@@ -28,7 +28,7 @@ diff --git a/src/video.cpp b/src/video.cpp
 diff --git a/src/platform/windows/display_base.cpp b/src/platform/windows/display_base.cpp
 --- a/src/platform/windows/display_base.cpp
 +++ b/src/platform/windows/display_base.cpp
-@@ -575,6 +575,14 @@ namespace platf::dxgi {
+@@ -613,6 +613,14 @@ namespace platf::dxgi {
      auto adapter_name = from_utf8(config::video.adapter_name);
      const bool is_rdp_session = !is_running_as_system_user && display_device::w_utils::is_any_rdp_session_active();
      auto output_name = is_rdp_session ? std::wstring {} : from_utf8(display_name);
@@ -43,7 +43,7 @@ diff --git a/src/platform/windows/display_base.cpp b/src/platform/windows/displa
  
      if (is_rdp_session) {
        BOOST_LOG(info) << "[Display Init] RDP session detected - using first available RDP virtual display";
-@@ -623,11 +631,27 @@ namespace platf::dxgi {
+@@ -661,11 +669,27 @@ namespace platf::dxgi {
            if (!is_rdp_session && !output_name.empty() && desc.DeviceName != output_name) {
              continue;
            }
@@ -72,7 +72,7 @@ diff --git a/src/platform/windows/display_base.cpp b/src/platform/windows/displa
              BOOST_LOG(is_rdp_session ? info : debug) << "[Display Init] Selected display: " << to_utf8(desc.DeviceName);
  
              output = std::move(output_tmp);
-@@ -1202,6 +1226,14 @@ namespace platf {
+@@ -1242,6 +1266,14 @@ namespace platf {
    std::vector<std::string>
    display_names(mem_type_e) {
      std::vector<std::string> display_names;
@@ -87,7 +87,7 @@ diff --git a/src/platform/windows/display_base.cpp b/src/platform/windows/displa
  
      HRESULT status;
  
-@@ -1260,7 +1292,22 @@ namespace platf {
+@@ -1300,7 +1332,22 @@ namespace platf {
  
          bool can_capture = false;
  
@@ -114,7 +114,7 @@ diff --git a/src/platform/windows/display_base.cpp b/src/platform/windows/displa
 diff --git a/src/main.cpp b/src/main.cpp
 --- a/src/main.cpp
 +++ b/src/main.cpp
-@@ -486,13 +486,6 @@ main(int argc, char *argv[]) {
+@@ -487,12 +487,6 @@ main(int argc, char *argv[]) {
  
    std::unique_ptr<platf::deinit_t> mDNS;
    std::future<void> sync_mDNS;
@@ -127,7 +127,7 @@ diff --git a/src/main.cpp b/src/main.cpp
  
    std::unique_ptr<platf::deinit_t> upnp_unmap;
    auto sync_upnp = std::async(std::launch::async, [&upnp_unmap]() {
-@@ -548,11 +541,30 @@ main(int argc, char *argv[]) {
+@@ -543,10 +537,35 @@ main(int argc, char *argv[]) {
    // so they stay behind it.
    std::thread configThread { confighttp::start };
  
