@@ -1,0 +1,138 @@
+name: Validate VDD GPU-PV Root Fix
+
+on:
+  pull_request:
+    branches:
+      - master
+    types:
+      - opened
+      - synchronize
+      - reopened
+  workflow_dispatch:
+
+concurrency:
+  group: '${{ github.workflow }}-${{ github.ref }}'
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  build_win:
+    name: Windows patched-source validation
+    runs-on: windows-latest
+    steps:
+      - name: Checkout clean branch source
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          submodules: recursive
+
+      - name: Verify and apply root-cause patch
+        shell: pwsh
+        run: |
+          git apply --check patches/vdd-gpupv-direct-root-fix.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply patches/vdd-gpupv-direct-root-fix.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git diff -- src/video.cpp src/platform/windows/display_base.cpp src/main.cpp
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ucrt64
+          update: true
+          install: >-
+            wget
+            curl
+
+      - name: Install Windows build dependencies
+        env:
+          opus_version: '1.6.1-1'
+        shell: msys2 {0}
+        run: |
+          opus_tarball="mingw-w64-ucrt-x86_64-opus-${opus_version}-any.pkg.tar.zst"
+          wget https://repo.msys2.org/mingw/ucrt64/${opus_tarball}
+          dependencies=(
+            "git"
+            "mingw-w64-ucrt-x86_64-ccache"
+            "mingw-w64-ucrt-x86_64-cmake"
+            "mingw-w64-ucrt-x86_64-ninja"
+            "mingw-w64-ucrt-x86_64-cppwinrt"
+            "mingw-w64-ucrt-x86_64-curl-winssl"
+            "mingw-w64-ucrt-x86_64-graphviz"
+            "mingw-w64-ucrt-x86_64-MinHook"
+            "mingw-w64-ucrt-x86_64-miniupnpc"
+            "mingw-w64-ucrt-x86_64-nlohmann-json"
+            "mingw-w64-ucrt-x86_64-onevpl"
+            "mingw-w64-ucrt-x86_64-openssl"
+            "mingw-w64-ucrt-x86_64-toolchain"
+            "mingw-w64-ucrt-x86_64-autotools"
+          )
+          pacman -Syu --noconfirm "${dependencies[@]}"
+          pacman --noconfirm -U ${opus_tarball}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build DualSense sidecar
+        shell: pwsh
+        env:
+          RELEASE_TAG: vdd-gpupv-root-validation
+        run: .\scripts\build-ds5-sidecar.ps1 -ReleaseTag $env:RELEASE_TAG
+
+      - name: Build web assets
+        shell: pwsh
+        run: |
+          npm ci
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          $env:SUNSHINE_SOURCE_ASSETS_DIR = "${{ github.workspace }}\src_assets"
+          $env:SUNSHINE_ASSETS_DIR = "${{ github.workspace }}\build"
+          npm run build
+
+      - name: Configure and build patched Sunshine
+        shell: msys2 {0}
+        env:
+          BRANCH: codex/vdd-gpupv-direct-clean
+          BUILD_VERSION: vdd-gpupv-root-validation
+          COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          GITHUB_TOKEN: ${{ secrets.DRIVER_DOWNLOAD_TOKEN }}
+          DRIVER_DEPS_REQUIRED: 'OFF'
+        run: |
+          mkdir -p build
+          cmake \
+            -B build \
+            -G Ninja \
+            -S . \
+            -DBUILD_DOCS=OFF \
+            -DBUILD_TESTS=ON \
+            -DBUILD_TRAY_TESTS=ON \
+            -DBUILD_WEB_UI=OFF \
+            -DSUNSHINE_ASSETS_DIR=assets \
+            -DDRIVER_DEPS_REQUIRED=${DRIVER_DEPS_REQUIRED} \
+            -DSUNSHINE_PUBLISHER_NAME='${{ github.repository_owner }}' \
+            -DSUNSHINE_PUBLISHER_WEBSITE='https://github.com/AlkaidLab/foundation-sunshine' \
+            -DSUNSHINE_PUBLISHER_ISSUE_URL='https://github.com/AlkaidLab/foundation-sunshine/issues'
+          ninja -C build
+
+      - name: Run native tests
+        shell: msys2 {0}
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Upload patched sunshine.exe
+        uses: actions/upload-artifact@v7
+        with:
+          name: vdd-gpupv-root-validation-${{ github.run_number }}
+          path: build/sunshine.exe
+          if-no-files-found: error
