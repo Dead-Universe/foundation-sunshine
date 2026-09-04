@@ -1,0 +1,201 @@
+diff --git a/src/video_probe.h b/src/video_probe.h
+--- a/src/video_probe.h
++++ b/src/video_probe.h
+@@ -21,5 +21,27 @@ namespace video {
+     // filtering, display wake-up retries, and scanning subsequent outputs.
+     return {};
+   }
++
++  inline bool
++  should_try_vdd_auto_fallback(
++    bool running_as_system,
++    bool output_is_explicit,
++    bool ddx_capture_ready,
++    bool standard_probe_finished,
++    bool standard_probe_succeeded) {
++    if (output_is_explicit) {
++      return false;
++    }
++
++    if (running_as_system) {
++      // WGC is unavailable in service mode. If no output passed the DDX
++      // preflight, VDD is the only remaining Windows capture path.
++      return !ddx_capture_ready;
++    }
++
++    // In an interactive session, preserve the existing DDX -> WGC order first.
++    // Only try VDD after that complete standard probe has actually failed.
++    return standard_probe_finished && !standard_probe_succeeded;
++  }
+ 
+ }  // namespace video
+diff --git a/tests/unit/test_video_probe.cpp b/tests/unit/test_video_probe.cpp
+--- a/tests/unit/test_video_probe.cpp
++++ b/tests/unit/test_video_probe.cpp
+@@ -24,3 +24,28 @@ TEST(VideoProbe, EmptyCaptureReadyListUsesBackendAutoselection) {
+   const std::array<std::string, 0> displays {};
+   EXPECT_TRUE(video::select_encoder_probe_display(R"(\\.\DISPLAY18)", displays).empty());
+ }
++
++TEST(VideoProbe, AutoServiceUsesVddWhenDdxIsUnavailable) {
++  EXPECT_TRUE(video::should_try_vdd_auto_fallback(true, false, false, false, false));
++}
++
++TEST(VideoProbe, AutoServiceKeepsDdxWhenCaptureIsReady) {
++  EXPECT_FALSE(video::should_try_vdd_auto_fallback(true, false, true, false, false));
++}
++
++TEST(VideoProbe, AutoInteractiveWaitsForStandardProbe) {
++  EXPECT_FALSE(video::should_try_vdd_auto_fallback(false, false, false, false, false));
++}
++
++TEST(VideoProbe, AutoInteractiveUsesVddAfterStandardProbeFails) {
++  EXPECT_TRUE(video::should_try_vdd_auto_fallback(false, false, false, true, false));
++}
++
++TEST(VideoProbe, AutoInteractiveKeepsStandardCaptureAfterProbeSucceeds) {
++  EXPECT_FALSE(video::should_try_vdd_auto_fallback(false, false, false, true, true));
++}
++
++TEST(VideoProbe, ExplicitOutputDisablesAutomaticVddSwitch) {
++  EXPECT_FALSE(video::should_try_vdd_auto_fallback(true, true, false, false, false));
++  EXPECT_FALSE(video::should_try_vdd_auto_fallback(false, true, false, true, false));
++}
+diff --git a/src/main.cpp b/src/main.cpp
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -31,6 +31,7 @@
+ #include "upnp.h"
+ #include "version.h"
+ #include "video.h"
++#include "video_probe.h"
+ #include "webhook/webhook.h"
+ #include "webhook/webhook_auth.h"
+ #include "ds5/config.h"
+@@ -151,6 +152,6 @@ mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) {
+  * that is stuck.
+  */
+-void
++bool
+ probe_encoders_with_watchdog() {
+   constexpr auto report_interval = 30s;
+ 
+@@ -188,6 +189,8 @@ probe_encoders_with_watchdog() {
+   else {
+     BOOST_LOG(info) << "Encoder probe completed in "sv << elapsed.count() << "ms"sv;
+   }
++
++  return !probe_failed;
+ }
+ 
+ int
+@@ -541,6 +544,11 @@ main(int argc, char *argv[]) {
+   std::thread configThread { confighttp::start };
+ 
+ #ifdef _WIN32
++  // Treat a literal "auto" the same as the UI/default empty value.
++  if (config::video.capture == "auto") {
++    config::video.capture.clear();
++  }
++
+   // Direct VDD capture consumes the IddCx target swapchain. Topology-only VDD
+   // activation can restore a desktop source mode with different dimensions,
+   // which is a valid scaled Windows path but invalid for our 1:1 capture path.
+@@ -558,8 +566,96 @@ main(int argc, char *argv[]) {
+       BOOST_LOG(error) << "[vdd] Failed to establish source=target mode before encoder probe"sv;
+     }
+   }
++
++  const bool auto_capture_requested = config::video.capture.empty();
++  const auto auto_vdd_device_id = display_device::find_device_by_friendlyname(ZAKO_NAME);
++  const bool auto_output_targets_vdd =
++    config::video.output_name == VDD_NAME ||
++    (!auto_vdd_device_id.empty() && config::video.output_name == auto_vdd_device_id);
++  const bool auto_output_is_explicit =
++    !config::video.output_name.empty() && !auto_output_targets_vdd;
++  bool auto_vdd_created = false;
++  bool auto_resolved_to_vdd = false;
++
++  const auto prepare_auto_vdd_fallback = [&]() -> bool {
++    auto &display_session = display_device::session_t::get();
++    const bool vdd_was_on = display_session.is_display_on();
++
++    if (!vdd_was_on) {
++      BOOST_LOG(info) << "[capture-auto] Standard Windows capture unavailable; creating ZakoVDD fallback"sv;
++      if (!display_session.create_vdd_monitor_noninteractive()) {
++        BOOST_LOG(warning) << "[capture-auto] ZakoVDD fallback could not be created"sv;
++        return false;
++      }
++      auto_vdd_created = true;
++    }
++    else {
++      BOOST_LOG(info) << "[capture-auto] Reusing active ZakoVDD as fallback candidate"sv;
++    }
++
++    if (!display_session.is_display_on() ||
++        !display_device::vdd_utils::normalize_vdd_source_mode_for_direct_capture()) {
++      BOOST_LOG(warning) << "[capture-auto] ZakoVDD fallback could not establish source=target mode"sv;
++      if (auto_vdd_created) {
++        display_session.destroy_vdd_monitor();
++        auto_vdd_created = false;
++      }
++      return false;
++    }
++
++    config::video.capture = "vdd";
++    auto_resolved_to_vdd = true;
++    BOOST_LOG(info) << "[capture-auto] Resolved capture backend to VDD for this Sunshine process"sv;
++    return true;
++  };
++
++  if (auto_capture_requested && auto_output_targets_vdd) {
++    BOOST_LOG(info) << "[capture-auto] Configured output is ZakoVDD; using VDD capture candidate"sv;
++    prepare_auto_vdd_fallback();
++  }
++  else if (auto_capture_requested && is_running_as_system_user && !auto_output_is_explicit) {
++    const auto ddx_capture_ready_displays = platf::display_names(platf::mem_type_e::dxgi);
++    const bool ddx_capture_ready = !ddx_capture_ready_displays.empty();
++
++    if (video::should_try_vdd_auto_fallback(
++          true,
++          false,
++          ddx_capture_ready,
++          false,
++          false)) {
++      BOOST_LOG(info) << "[capture-auto] No DDX-capable output found in service mode; trying ZakoVDD fallback"sv;
++      prepare_auto_vdd_fallback();
++    }
++  }
+ #endif
+ 
+-  probe_encoders_with_watchdog();
++  [[maybe_unused]] bool encoder_probe_succeeded = probe_encoders_with_watchdog();
++
++#ifdef _WIN32
++  if (auto_capture_requested &&
++      !is_running_as_system_user &&
++      !auto_resolved_to_vdd &&
++      video::should_try_vdd_auto_fallback(
++        false,
++        auto_output_is_explicit,
++        false,
++        true,
++        encoder_probe_succeeded)) {
++    BOOST_LOG(info) << "[capture-auto] DDX/WGC probe failed in interactive mode; trying ZakoVDD fallback"sv;
++    if (prepare_auto_vdd_fallback()) {
++      encoder_probe_succeeded = probe_encoders_with_watchdog();
++    }
++  }
++
++  if (auto_capture_requested && auto_resolved_to_vdd && !encoder_probe_succeeded) {
++    BOOST_LOG(warning) << "[capture-auto] VDD fallback probe failed; restoring Auto capture state"sv;
++    config::video.capture.clear();
++    auto_resolved_to_vdd = false;
++    if (auto_vdd_created) {
++      display_device::session_t::get().destroy_vdd_monitor();
++      auto_vdd_created = false;
++    }
++  }
++#endif
+ 
+   std::thread httpThread { nvhttp::start };

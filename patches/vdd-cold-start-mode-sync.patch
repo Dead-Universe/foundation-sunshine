@@ -1,0 +1,179 @@
+diff --git a/src/display_device/vdd_utils.h b/src/display_device/vdd_utils.h
+--- a/src/display_device/vdd_utils.h
++++ b/src/display_device/vdd_utils.h
+@@ -271,7 +271,17 @@
+    * The provider owns confirmation; Core performs bounded topology setup.
+    */
+   bool
+   create_vdd_monitor_noninteractive();
+ 
++  /**
++   * @brief Normalize the active VDD desktop/source mode to the committed target mode.
++   * @details Direct VDD capture consumes the IddCx target swapchain directly and
++   *          therefore requires identity scaling between the Windows desktop source
++   *          and target signal. Cold topology activation may otherwise restore a
++   *          persisted source mode whose dimensions differ from the target mode.
++   */
++  bool
++  normalize_vdd_source_mode_for_direct_capture();
++
+   bool
+   destroy_vdd_monitor();
+diff --git a/src/display_device/vdd_utils.cpp b/src/display_device/vdd_utils.cpp
+--- a/src/display_device/vdd_utils.cpp
++++ b/src/display_device/vdd_utils.cpp
+@@ -640,6 +640,111 @@
+       }
+       return true;
+     }
+ 
+     bool
++    normalize_vdd_source_mode_for_direct_capture() {
++      const auto vdd_device_id = find_device_by_friendlyname(ZAKO_NAME);
++      if (vdd_device_id.empty()) {
++        BOOST_LOG(error) << "[vdd] Cannot normalize direct-capture mode: VDD device was not found";
++        return false;
++      }
++
++      const auto get_target_resolution = [&]() -> boost::optional<resolution_t> {
++        const auto display_data = w_utils::query_display_config(w_utils::ACTIVE_ONLY_DEVICES);
++        if (!display_data) {
++          return boost::none;
++        }
++
++        const auto path = w_utils::get_active_path(vdd_device_id, display_data->paths);
++        if (!path) {
++          BOOST_LOG(warning) << "[vdd] Cannot normalize direct-capture mode: VDD path is not active";
++          return boost::none;
++        }
++
++        UINT32 target_index = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
++        if ((path->flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE) != 0) {
++          const UINT32 virtual_target_index = path->targetInfo.targetModeInfoIdx;
++          if (virtual_target_index != DISPLAYCONFIG_PATH_TARGET_MODE_IDX_INVALID) {
++            target_index = virtual_target_index;
++          }
++        }
++        else {
++          target_index = path->targetInfo.modeInfoIdx;
++        }
++
++        if (target_index == DISPLAYCONFIG_PATH_MODE_IDX_INVALID ||
++            target_index >= display_data->modes.size()) {
++          BOOST_LOG(warning) << "[vdd] Cannot normalize direct-capture mode: active VDD has no target mode";
++          return boost::none;
++        }
++
++        const auto &target_mode = display_data->modes[target_index];
++        if (target_mode.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_TARGET) {
++          BOOST_LOG(warning) << "[vdd] Cannot normalize direct-capture mode: target mode index has unexpected type";
++          return boost::none;
++        }
++
++        const auto &signal = target_mode.targetMode.targetVideoSignalInfo;
++        const auto width = signal.activeSize.cx ? signal.activeSize.cx : signal.totalSize.cx;
++        const auto height = signal.activeSize.cy ? signal.activeSize.cy : signal.totalSize.cy;
++        if (width == 0 || height == 0) {
++          BOOST_LOG(warning) << "[vdd] Cannot normalize direct-capture mode: target signal has invalid dimensions";
++          return boost::none;
++        }
++
++        return resolution_t {
++          static_cast<unsigned int>(width),
++          static_cast<unsigned int>(height)
++        };
++      };
++
++      const auto target_resolution = get_target_resolution();
++      if (!target_resolution) {
++        return false;
++      }
++
++      const std::unordered_set<std::string> device_ids {vdd_device_id};
++      auto current_modes = get_current_display_modes(device_ids);
++      const auto current_it = current_modes.find(vdd_device_id);
++      if (current_it == current_modes.end()) {
++        BOOST_LOG(warning) << "[vdd] Cannot normalize direct-capture mode: VDD source mode is unavailable";
++        return false;
++      }
++
++      if (!same_resolution(current_it->second.resolution, *target_resolution)) {
++        auto desired_mode = current_it->second;
++        BOOST_LOG(info) << "[vdd] Normalizing cold direct-capture mode: source "
++                        << desired_mode.resolution.width << "x" << desired_mode.resolution.height
++                        << " -> target " << target_resolution->width << "x" << target_resolution->height;
++        desired_mode.resolution = *target_resolution;
++
++        device_display_mode_map_t desired_modes;
++        desired_modes.emplace(vdd_device_id, desired_mode);
++        if (!set_display_modes(desired_modes)) {
++          BOOST_LOG(error) << "[vdd] Failed to align VDD source mode with committed target mode";
++          return false;
++        }
++      }
++
++      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
++      do {
++        const auto verify_target = get_target_resolution();
++        const auto verify_modes = get_current_display_modes(device_ids);
++        const auto verify_it = verify_modes.find(vdd_device_id);
++        if (verify_target && verify_it != verify_modes.end() &&
++            same_resolution(verify_it->second.resolution, *verify_target)) {
++          BOOST_LOG(info) << "[vdd] Direct-capture mode normalized: "
++                          << verify_target->width << "x" << verify_target->height
++                          << " source=target";
++          return true;
++        }
++
++        std::this_thread::sleep_for(std::chrono::milliseconds(100));
++      } while (std::chrono::steady_clock::now() < deadline);
++
++      BOOST_LOG(error) << "[vdd] VDD source and committed target modes remained different after normalization";
++      return false;
++    }
++
++    bool
+     toggle_display_power() {
+diff --git a/src/main.cpp b/src/main.cpp
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -20,5 +20,6 @@
+ #include "client_fingerprint.h"
+ #include "confighttp.h"
+ #include "display_device/session.h"
++#include "display_device/vdd_utils.h"
+ #include "entry_handler.h"
+ #include "file_handler.h"
+diff --git a/src/main.cpp b/src/main.cpp
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -540,15 +540,19 @@
+ #ifdef _WIN32
+-  // Direct VDD capture needs the Zako producer to exist before encoder probing.
+-  // The normal session path creates it later during Moonlight Launch, but that is
+-  // too late for startup capability probing and leaves nvhttp/rtsp unavailable.
+-  // Reuse the same non-interactive CREATEMONITOR + topology path as the proven
+-  // manual VDD creation flow instead of falling back to Desktop Duplication.
+-  if (config::video.capture == "vdd" &&
+-      !display_device::session_t::get().is_display_on()) {
+-    BOOST_LOG(info) << "[vdd] Direct capture requested; creating ZakoVDD before encoder probe"sv;
+-    if (!display_device::session_t::get().create_vdd_monitor_noninteractive()) {
+-      BOOST_LOG(error) << "[vdd] Failed to create ZakoVDD before encoder probe"sv;
++  // Direct VDD capture consumes the IddCx target swapchain. Topology-only VDD
++  // activation can restore a desktop source mode with different dimensions,
++  // which is a valid scaled Windows path but invalid for our 1:1 capture path.
++  if (config::video.capture == "vdd") {
++    if (!display_device::session_t::get().is_display_on()) {
++      BOOST_LOG(info) << "[vdd] Direct capture requested; creating ZakoVDD before encoder probe"sv;
++      if (!display_device::session_t::get().create_vdd_monitor_noninteractive()) {
++        BOOST_LOG(error) << "[vdd] Failed to create ZakoVDD before encoder probe"sv;
++      }
++    }
++
++    if (display_device::session_t::get().is_display_on() &&
++        !display_device::vdd_utils::normalize_vdd_source_mode_for_direct_capture()) {
++      BOOST_LOG(error) << "[vdd] Failed to establish source=target mode before encoder probe"sv;
+     }
+   }
+ #endif
+ 
