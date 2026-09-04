@@ -36,7 +36,7 @@ jobs:
       release_tag: ${{ steps.setup_release_auto.outputs.release_tag || steps.setup_release_manual.outputs.release_tag }}
       release_version: ${{ steps.setup_release_auto.outputs.release_version || steps.setup_release_manual.outputs.release_version }}
     permissions:
-      contents: write  # read does not work to check squash and merge details
+      contents: write
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -85,16 +85,30 @@ jobs:
           ref: ${{ github.sha }}
           submodules: recursive
 
+      - name: Apply validated VDD patch stack
+        if: github.ref_name == 'fix/vdd-cold-start-mode-sync' || github.head_ref == 'fix/vdd-cold-start-mode-sync'
+        shell: pwsh
+        run: |
+          $patches = @(
+            'patches/vdd-gpupv-direct-root-fix.patch',
+            'patches/vdd-cold-start-mode-sync.patch',
+            'patches/vdd-auto-capture-fallback.patch',
+            'patches/vdd-lockscreen-live-reconfigure.patch'
+          )
+          foreach ($patch in $patches) {
+            Write-Host "Checking $patch"
+            git apply --check $patch
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            git apply $patch
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Setup Dependencies Windows
         uses: msys2/setup-msys2@v2
         with:
           msystem: ucrt64
-          # Required, not redundant with the `pacman -Syu` below. When
-          # msys2-runtime itself needs upgrading, pacman closes every MSYS2
-          # process to finish the job, which kills the workflow shell and fails
-          # the step with exit 1. setup-msys2 performs that upgrade with the
-          # restart it needs; by the time our own step runs, the runtime is
-          # already current and only the dependency list is left to install.
           update: true
           install: >-
             wget
@@ -105,16 +119,8 @@ jobs:
           opus_version: '1.6.1-1'
         shell: msys2 {0}
         run: |
-          # download pinned opus version
           opus_tarball="mingw-w64-ucrt-x86_64-opus-${opus_version}-any.pkg.tar.zst"
           wget https://repo.msys2.org/mingw/ucrt64/${opus_tarball}
-
-          # install dependencies
-          # NOTE: gcc/gcc-libs were previously pinned to 15.1.0-5 to work around
-          # a broken upstream gcc 15.x. Since msys2 has moved on to gcc 16.x and
-          # other packages (cmake, etc.) now require gcc-libs 16.x ABI, pinning
-          # an old gcc-libs causes cmake.exe to silently fail to load (exit 127).
-          # Let pacman install the full toolchain at the current upstream version.
           dependencies=(
             "git"
             "mingw-w64-ucrt-x86_64-ccache"
@@ -126,31 +132,23 @@ jobs:
             "mingw-w64-ucrt-x86_64-MinHook"
             "mingw-w64-ucrt-x86_64-miniupnpc"
             "mingw-w64-ucrt-x86_64-nlohmann-json"
-            # "mingw-w64-ucrt-x86_64-nodejs"  # Replaced by actions/setup-node (vite 8 requires MSVC Node.js)
-            # "mingw-w64-ucrt-x86_64-nsis"  # Replaced by Inno Setup
             "mingw-w64-ucrt-x86_64-onevpl"
             "mingw-w64-ucrt-x86_64-openssl"
             "mingw-w64-ucrt-x86_64-toolchain"
             "mingw-w64-ucrt-x86_64-autotools"
           )
-
           pacman -Syu --noconfirm "${dependencies[@]}"
-
-          # install pinned opus after Syu to prevent upgrade
           pacman --noconfirm -U ${opus_tarball}
 
       - name: Verify Build Tools
         shell: msys2 {0}
         run: |
-          echo "Verifying build tools are installed..."
           which cmake || (echo "cmake not found" && exit 1)
           which ninja || (echo "ninja not found" && exit 1)
           which gcc || (echo "gcc not found" && exit 1)
-
-          echo "All build tools verified successfully"
-          echo "  CMake: $(cmake --version | head -1)"
-          echo "  Ninja: $(ninja --version)"
-          echo "  GCC: $(gcc --version | head -1)"
+          echo "CMake: $(cmake --version | head -1)"
+          echo "Ninja: $(ninja --version)"
+          echo "GCC: $(gcc --version | head -1)"
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -185,9 +183,6 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ github.workspace }}\.ccache
-          # The key must be unique per run for the cache to be written at all,
-          # so the prefix restore-key is what actually produces the hits: every
-          # run seeds itself from the most recent previous one.
           key: ccache-windows-${{ github.run_id }}
           restore-keys: |
             ccache-windows-
@@ -199,18 +194,9 @@ jobs:
           BUILD_VERSION: ${{ needs.setup_release.outputs.release_tag }}.杂鱼
           COMMIT: ${{ needs.setup_release.outputs.release_commit }}
           GITHUB_TOKEN: ${{ secrets.DRIVER_DOWNLOAD_TOKEN }}
-          # ccache.exe is a native binary, so it reads the Windows-style path
-          # straight out of the environment even under the msys2 shell.
           CCACHE_DIR: ${{ github.workspace }}\.ccache
           CCACHE_MAXSIZE: 2G
-          # `pacman -Syu` can move the toolchain underneath us between runs.
-          # Hashing the compiler binary instead of its mtime keeps the cache
-          # valid across runs that did not actually change gcc.
           CCACHE_COMPILERCHECK: content
-          # Fork PRs cannot access org-scoped secrets, so private-repo driver
-          # downloads (vmouse) may fail. Downgrade missing drivers from
-          # FATAL_ERROR to WARNING so the build/configure still succeeds; the
-          # affected drivers are simply excluded from the installer.
           DRIVER_DEPS_REQUIRED: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'OFF' || 'ON' }}
         run: |
           mkdir -p build
@@ -231,9 +217,6 @@ jobs:
             -DSUNSHINE_PUBLISHER_WEBSITE='https://github.com/AlkaidLab/foundation-sunshine' \
             -DSUNSHINE_PUBLISHER_ISSUE_URL='https://github.com/AlkaidLab/foundation-sunshine/issues'
           ninja -C build
-
-          # Printed so a run that suddenly gets slow can be diagnosed as a cache
-          # miss rather than guessed at.
           ccache --show-stats
 
       - name: Run native tests
@@ -245,7 +228,6 @@ jobs:
         run: |
           $innoDir = "${env:ProgramFiles(x86)}\Inno Setup 6"
           $iscc = Join-Path $innoDir "ISCC.exe"
-
           if (-not (Test-Path $iscc)) {
             Write-Host "Inno Setup is not present; installing with Chocolatey..."
             choco install innosetup --yes --no-progress --limit-output
@@ -253,11 +235,9 @@ jobs:
               throw "Chocolatey failed to install Inno Setup (exit code $LASTEXITCODE)."
             }
           }
-
           if (-not (Test-Path $iscc)) {
             throw "Inno Setup compiler was not found at $iscc after installation."
           }
-
           $version = (Get-Item $iscc).VersionInfo.FileVersion
           Write-Host "Using Inno Setup compiler: $iscc (version $version)"
           $innoDir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
@@ -268,19 +248,11 @@ jobs:
           set -o pipefail
           mkdir -p artifacts
           cd build
-
-          # Package the Inno Setup installer and portable ZIP.
-          # Install into the staging directory first.
           cmake --install . --prefix ./inno_staging
           test -f ./inno_staging/tools/ds5-sidecar-package.json
           test ! -e ./inno_staging/tools/sunshine-ds5-sidecar/Sunshine.Ds5Sidecar.exe
-
-          # Run the Inno Setup compiler and prove that it consumed only the
-          # lightweight package manifest, not the self-contained runtime.
           "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" sunshine_installer.iss | tee inno-build.log
           grep -F "ds5-sidecar-package.json" inno-build.log
-
-          # Generate the portable ZIP.
           cpack -G ZIP --config ./CPackConfig.cmake --verbose
           cmake -E tar tf ./cpack_artifacts/Sunshine.zip | tr '\\' '/' > portable-files.txt
           grep -F "Sunshine/tools/ds5-sidecar-package.json" portable-files.txt
@@ -288,8 +260,6 @@ jobs:
             echo "The optional DualSense runtime leaked into the main portable package"
             exit 1
           fi
-
-          # move
           mv ./cpack_artifacts/Sunshine.exe ../artifacts/sunshine-windows-installer.exe
           mv ./cpack_artifacts/Sunshine.zip ../artifacts/sunshine-windows-portable.zip
           cp ./ds5-sidecar-package/Sunshine.Ds5Sidecar.x64.zip ../artifacts/
@@ -298,25 +268,17 @@ jobs:
       - name: Rename release assets
         shell: msys2 {0}
         run: |
-          # Format tag to vYEAR.DATE where DATE is zero-padded to 4 digits
           TAG="${{ needs.setup_release.outputs.release_tag }}"
           NEWTAG="$TAG"
-
           if [[ "$TAG" =~ ^v([0-9]{4})\.([0-9]+) ]]; then
             YEAR="${BASH_REMATCH[1]}"
             DATE_PART="${BASH_REMATCH[2]}"
             DATE_PADDED=$(printf "%04d" "$DATE_PART")
             NEWTAG="v${YEAR}.${DATE_PADDED}"
           fi
-
-          # 重命名安装包和便携版
           INSTALLER_NAME="Sunshine.${NEWTAG}.WindowsInstaller.exe"
           mv artifacts/sunshine-windows-installer.exe "artifacts/${INSTALLER_NAME}"
           mv artifacts/sunshine-windows-portable.zip "artifacts/Sunshine.${NEWTAG}.Portable-x64.zip"
-
-          # Legacy Control Panel builds treat any release asset containing
-          # "Windows" as a full installer. Keep that marker exclusive to the
-          # actual installer so existing users can update to the fixed build.
           for asset in artifacts/*; do
             name=$(basename "$asset")
             lower=${name,,}
@@ -329,7 +291,6 @@ jobs:
       - name: Generate Checksums
         shell: pwsh
         run: |
-          # Generate SHA256 checksums from the final release asset names.
           .\scripts\generate-checksums.ps1 -Path .\artifacts -Output "SHA256SUMS.txt"
 
       - name: Upload Artifacts
