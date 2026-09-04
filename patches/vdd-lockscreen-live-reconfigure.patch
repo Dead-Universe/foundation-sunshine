@@ -85,7 +85,7 @@ diff --git a/src/video.cpp b/src/video.cpp
 +    }
 +
      // Get all the monitor names now, rather than at boot, to
-@@ -1950,4 +1964,9 @@ captureThread(
+@@ -1950,6 +1964,11 @@ captureThread(
          if (switch_display_event->peek()) {
            artificial_reinit = true;
            return false;
@@ -97,7 +97,7 @@ diff --git a/src/video.cpp b/src/video.cpp
 +        }
 +
          return true;
-@@ -2012,4 +2031,16 @@ captureThread(
+@@ -2012,5 +2031,17 @@ captureThread(
            if (!append_pending_capture_contexts() || capture_ctxs.empty()) {
              return;
            }
@@ -138,7 +138,7 @@ diff --git a/src/video.cpp b/src/video.cpp
 +    }
 +
      while (encode_session_ctx_queue.running()) {
-@@ -3825,4 +3869,18 @@ encode_run_sync(
+@@ -3825,5 +3869,19 @@ encode_run_sync(
            ec = platf::capture_e::reinit;
            return false;
          }
