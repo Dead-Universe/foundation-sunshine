@@ -1,0 +1,116 @@
+diff --git a/src/display_device/session.h b/src/display_device/session.h
+--- a/src/display_device/session.h
++++ b/src/display_device/session.h
+@@ -307,6 +307,7 @@
+     vdd_stage_result_e
+     prepare_vdd(parsed_config_t &config,
+       const rtsp_stream::launch_session_t &session,
+-      boost::optional<device_info_map_t> &pre_vdd_devices);
++      boost::optional<device_info_map_t> &pre_vdd_devices,
++      bool preserve_existing_vdd = false);
+ 
+     vdd_mode_update_e
+diff --git a/src/display_device/session.cpp b/src/display_device/session.cpp
+--- a/src/display_device/session.cpp
++++ b/src/display_device/session.cpp
+@@ -450,5 +450,7 @@
+     const bool will_disable_physical_displays =
+       should_prepare_vdd && !is_system_rdp_vdd_session &&
+       parsed_config->vdd_prep == parsed_config_t::vdd_prep_e::display_off;
++    const bool display_settings_blocked_at_entry =
++      !is_system_rdp_vdd_session && settings.is_changing_settings_going_to_fail();
+ 
+     // 在创建 VDD 可能使 Windows 自动激活显示器、Sunshine 应用目标布局之前保存拓扑。
+@@ -477,5 +479,9 @@
+       }
+ 
+       boost::optional<device_info_map_t> captured_pre_vdd_devices;
+-      const auto prepare_result = prepare_vdd(*parsed_config, session, captured_pre_vdd_devices);
++      const auto prepare_result = prepare_vdd(
++        *parsed_config,
++        session,
++        captured_pre_vdd_devices,
++        display_settings_blocked_at_entry);
+       if (captured_pre_vdd_devices) {
+@@ -526,4 +532,5 @@
+-    const bool should_defer_display_settings = settings.is_changing_settings_going_to_fail();
++    const bool should_defer_display_settings =
++      display_settings_blocked_at_entry || settings.is_changing_settings_going_to_fail();
+     if (should_defer_display_settings) {
+       timer->setup_timer([this, config_copy = *parsed_config, client_name = session.client_name,
+                            client_cert_uuid = session.client_cert_uuid,
+@@ -531,16 +538,37 @@
+                            hdr_target_source = session.hdr_target_source,
+                            hdr_capabilities = session.hdr_capabilities,
+                            pre_saved_initial_topology,
+-                           pre_vdd_devices = pending_vdd_.pre_vdd_devices,
+                            should_prepare_vdd,
+-                           vulkan_hdr_bridge_requested]() {
++                           vulkan_hdr_bridge_requested]() mutable {
+         if (settings.is_changing_settings_going_to_fail()) {
+           BOOST_LOG(warning) << "Applying display settings will fail - retrying later...";
+           return false;
+         }
+ 
+         if (should_prepare_vdd) {
+-          const auto vdd_stage_result = apply_vdd_display_stage(config_copy, pre_vdd_devices);
++          auto prepare_session = rtsp_stream::launch_session_t {};
++          prepare_session.client_name = client_name;
++          prepare_session.client_cert_uuid = client_cert_uuid;
++          prepare_session.enable_hdr = enable_hdr;
++          prepare_session.hdr_target_source = hdr_target_source;
++          if (!client_cert_uuid.empty()) {
++            prepare_session.env["SUNSHINE_CLIENT_CERT_UUID"] = client_cert_uuid;
++          }
++          prepare_session.hdr_capabilities = hdr_capabilities;
++
++          boost::optional<device_info_map_t> captured_pre_vdd_devices;
++          const auto deferred_prepare_result =
++            prepare_vdd(config_copy, prepare_session, captured_pre_vdd_devices);
++          if (captured_pre_vdd_devices) {
++            pending_vdd_.pre_vdd_devices = std::move(*captured_pre_vdd_devices);
++          }
++          if (deferred_prepare_result != vdd_stage_result_e::ready) {
++            BOOST_LOG(warning) << "Deferred VDD refresh after unlock is not ready yet; retrying";
++            return false;
++          }
++
++          const auto vdd_stage_result =
++            apply_vdd_display_stage(config_copy, pending_vdd_.pre_vdd_devices);
+           if (vdd_stage_result == vdd_stage_result_e::modes_failed) {
+             BOOST_LOG(warning) << "The rebuilt VDD has not published the requested mode yet; retrying the deferred display configuration";
+             return false;
+@@ -728,6 +756,10 @@
+   }
+ 
+   session_t::vdd_stage_result_e
+-  session_t::prepare_vdd(parsed_config_t &config, const rtsp_stream::launch_session_t &session, boost::optional<device_info_map_t> &pre_vdd_devices) {
++  session_t::prepare_vdd(
++    parsed_config_t &config,
++    const rtsp_stream::launch_session_t &session,
++    boost::optional<device_info_map_t> &pre_vdd_devices,
++    bool preserve_existing_vdd) {
+     pre_vdd_devices.reset();
+ 
+@@ -741,6 +773,14 @@
+                     << ", max-full-frame=" << hdr_brightness.max_full_nits << "]";
+     const vdd_utils::physical_size_t physical_size = vdd_utils::get_client_physical_size(session.client_name);
+ 
++    auto device_zako = display_device::find_device_by_friendlyname(ZAKO_NAME);
++    if (preserve_existing_vdd && !device_zako.empty()) {
++      config.device_id = device_zako;
++      BOOST_LOG(info) << "[Display] Locked session detected before VDD preparation; preserving existing VDD "
++                      << device_zako << " until display settings become available";
++      return vdd_stage_result_e::ready;
++    }
++
+     if (config::video.capture == "vdd") {
+       bool hardware_cursor_changed = false;
+       if (vdd_utils::ensure_hardware_cursor_enabled_for_capture(&hardware_cursor_changed)) {
+@@ -754,6 +795,4 @@
+       }
+     }
+ 
+-    auto device_zako = display_device::find_device_by_friendlyname(ZAKO_NAME);
+-
+     std::string rebuild_old_vdd_id;
