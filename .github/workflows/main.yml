@@ -20,8 +20,6 @@ concurrency:
   group: '${{ github.workflow }}-${{ github.ref }}'
   cancel-in-progress: true
 
-# The pinned LizardByte release action still composes a Node.js 20 action.
-# Run it on Node.js 24 ahead of GitHub's fall 2026 Node.js 20 removal.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
@@ -93,7 +91,8 @@ jobs:
             'patches/vdd-gpupv-direct-root-fix.patch',
             'patches/vdd-cold-start-mode-sync.patch',
             'patches/vdd-auto-capture-fallback.patch',
-            'patches/vdd-lockscreen-live-reconfigure.patch'
+            'patches/vdd-lockscreen-live-reconfigure.patch',
+            'patches/vdd-lockscreen-preflight-preserve.patch'
           )
           foreach ($patch in $patches) {
             Write-Host "Checking $patch"
