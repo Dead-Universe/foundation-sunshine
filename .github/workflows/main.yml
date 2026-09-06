@@ -92,8 +92,7 @@ jobs:
             'patches/vdd-cold-start-mode-sync.patch',
             'patches/vdd-auto-capture-fallback.patch',
             'patches/vdd-lockscreen-live-reconfigure.patch',
-            'patches/vdd-lockscreen-preflight-preserve.patch',
-            'patches/vdd-session-readiness.patch'
+            'patches/vdd-lockscreen-preflight-preserve.patch'
           )
           foreach ($patch in $patches) {
             Write-Host "Checking $patch"
@@ -102,6 +101,14 @@ jobs:
             git apply $patch
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
+
+          $zeroContextPatch = 'patches/vdd-session-readiness.patch'
+          Write-Host "Checking $zeroContextPatch (zero-context diff)"
+          git apply --check --unidiff-zero $zeroContextPatch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply --unidiff-zero $zeroContextPatch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           git diff --check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
