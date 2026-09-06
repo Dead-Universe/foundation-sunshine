@@ -1,0 +1,160 @@
+diff --git a/src/globals.h b/src/globals.h
+--- a/src/globals.h
++++ b/src/globals.h
+@@ -64,6 +64,7 @@ namespace mail {
+   MAIL(video_packets);
+   MAIL(audio_packets);
+   MAIL(switch_display);
++  MAIL(capture_reconfigure);
+   MAIL(active_display);
+ 
+   // Local mail
+diff --git a/src/display_device/parsed_config.cpp b/src/display_device/parsed_config.cpp
+--- a/src/display_device/parsed_config.cpp
++++ b/src/display_device/parsed_config.cpp
+@@ -570,7 +570,14 @@ resolve_display_intent(const config::video_t &config, const rtsp_stream::launch_session_t &session) {
+     bool explicit_vdd = session.use_vdd;
+ #ifdef _WIN32
+     // VDD_NAME is the stable alias exposed by the Windows host configuration UI.
+-    explicit_vdd = explicit_vdd || intent.device_id == VDD_NAME;
++    const auto vdd_device_id = find_device_by_friendlyname(ZAKO_NAME);
++    const bool effective_vdd_capture =
++      config.capture == "vdd" &&
++      !client_named_it &&
++      (intent.device_id.empty() ||
++       intent.device_id == VDD_NAME ||
++       (!vdd_device_id.empty() && intent.device_id == vdd_device_id));
++    explicit_vdd = explicit_vdd || intent.device_id == VDD_NAME || effective_vdd_capture;
+ #endif
+     if (explicit_vdd) {
+       intent.target = display_intent_t::target_e::vdd;
+diff --git a/src/display_device/session.cpp b/src/display_device/session.cpp
+--- a/src/display_device/session.cpp
++++ b/src/display_device/session.cpp
+@@ -560,8 +560,15 @@ session_t::configure_display(const config::video_t &config,
+           restore_state_impl(revert_reason_e::config_cleanup);
+           return true;
+         }
++
++        const bool rebind_live_vdd_capture = should_prepare_vdd && ::config::video.capture == "vdd";
++        if (rebind_live_vdd_capture &&
++            !vdd_utils::normalize_vdd_source_mode_for_direct_capture()) {
++          BOOST_LOG(warning) << "Deferred VDD configuration applied, but source=target is not stable yet; retrying before rebinding live capture";
++          return false;
++        }
+ #ifdef _WIN32
+-        else if (vulkan_hdr_bridge_requested) {
++        if (vulkan_hdr_bridge_requested) {
+           if (!platf::vulkan_hdr_bridge::enable_for_vdd_hdr_session()) {
+             BOOST_LOG(warning) << "Vulkan HDR bridge validation or registration failed; continuing without the workaround";
+           }
+@@ -570,5 +577,9 @@ session_t::configure_display(const config::video_t &config,
+           platf::vulkan_hdr_bridge::disable();
+         }
+ #endif
++        if (rebind_live_vdd_capture) {
++          BOOST_LOG(info) << "[Display] Deferred VDD configuration committed; requesting live capture/encoder reconfigure";
++          mail::man->event<bool>(mail::capture_reconfigure)->raise(true);
++        }
+         pending_vdd_.reset();
+         return true;
+diff --git a/src/video.cpp b/src/video.cpp
+--- a/src/video.cpp
++++ b/src/video.cpp
+@@ -1710,4 +1710,5 @@ captureThread(
+     auto switch_display_event = mail::man->event<int>(mail::switch_display);
++    auto capture_reconfigure_event = mail::man->event<bool>(mail::capture_reconfigure);
+     auto active_display_event = mail::man->event<std::string>(mail::active_display);
+ 
+     // Wait for the initial capture context or a request to stop the queue
+@@ -1717,4 +1718,17 @@ captureThread(
+     }
+     capture_ctxs.emplace_back(std::move(*initial_capture_ctx));
+ 
++    // A deferred display update can complete between HTTP Launch and capture
++    // startup. Bind the first open to the final VDD instead of briefly reopening
++    // the stale lock-screen target and then reinitializing it again.
++    if (capture_reconfigure_event->peek()) {
++      while (capture_reconfigure_event->peek()) {
++        capture_reconfigure_event->pop();
++      }
++      if (::config::video.capture == "vdd" && !::config::video.output_name.empty()) {
++        capture_ctxs.front().config.display_name = ::config::video.output_name;
++        BOOST_LOG(info) << "[Display] Applying deferred VDD target before initial capture open";
++      }
++    }
++
+     // Get all the monitor names now, rather than at boot, to
+@@ -1950,6 +1964,11 @@ captureThread(
+         if (switch_display_event->peek()) {
+           artificial_reinit = true;
+           return false;
+         }
+ 
++        if (capture_reconfigure_event->peek()) {
++          artificial_reinit = true;
++          return false;
++        }
++
+         return true;
+@@ -2012,5 +2031,17 @@ captureThread(
+           if (!append_pending_capture_contexts() || capture_ctxs.empty()) {
+             return;
+           }
+ 
++          if (capture_reconfigure_event->peek()) {
++            while (capture_reconfigure_event->peek()) {
++              capture_reconfigure_event->pop();
++            }
++            if (::config::video.capture == "vdd" && !::config::video.output_name.empty()) {
++              for (auto &capture_ctx : capture_ctxs) {
++                capture_ctx.config.display_name = ::config::video.output_name;
++              }
++            }
++            BOOST_LOG(info) << "[Display] Rebinding live capture after deferred VDD configuration";
++          }
++
+           while (capture_ctx_queue->running()) {
+@@ -3690,4 +3721,5 @@ encode_run_sync(
+     auto switch_display_event = mail::man->event<int>(mail::switch_display);
++    auto capture_reconfigure_event = mail::man->event<bool>(mail::capture_reconfigure);
+     auto active_display_event = mail::man->event<std::string>(mail::active_display);
+     std::string active_display_name;
+ 
+@@ -3700,4 +3732,16 @@ encode_run_sync(
+       synced_session_ctxs.emplace_back(std::make_unique<sync_session_ctx_t>(std::move(*ctx)));
+     }
+ 
++    if (capture_reconfigure_event->peek()) {
++      while (capture_reconfigure_event->peek()) {
++        capture_reconfigure_event->pop();
++      }
++      if (::config::video.capture == "vdd" && !::config::video.output_name.empty()) {
++        for (auto &ctx : synced_session_ctxs) {
++          ctx->config.display_name = ::config::video.output_name;
++        }
++        BOOST_LOG(info) << "[Display] Applying deferred VDD target before synchronous capture open";
++      }
++    }
++
+     while (encode_session_ctx_queue.running()) {
+@@ -3825,5 +3869,19 @@ encode_run_sync(
+           ec = platf::capture_e::reinit;
+           return false;
+         }
+ 
++        if (capture_reconfigure_event->peek()) {
++          while (capture_reconfigure_event->peek()) {
++            capture_reconfigure_event->pop();
++          }
++          if (::config::video.capture == "vdd" && !::config::video.output_name.empty()) {
++            for (auto &ctx : synced_session_ctxs) {
++              ctx->config.display_name = ::config::video.output_name;
++            }
++          }
++          BOOST_LOG(info) << "[Display] Rebinding synchronous capture after deferred VDD configuration";
++          ec = platf::capture_e::reinit;
++          return false;
++        }
++
+         return true;

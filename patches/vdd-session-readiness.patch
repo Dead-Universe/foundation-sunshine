@@ -1,0 +1,123 @@
+diff --git a/src/platform/windows/display_device/windows_utils.h b/src/platform/windows/display_device/windows_utils.h
+index b7b716c..3c08aa2 100644
+--- a/src/platform/windows/display_device/windows_utils.h
++++ b/src/platform/windows/display_device/windows_utils.h
+@@ -522,0 +523,8 @@
++  /**
++   * @brief Update the event-derived readiness state for a Windows session.
++   * @param session_id WTS session identifier from WM_WTSSESSION_CHANGE.
++   * @param desktop_ready True after unlock/desktop-ready; false while locked or logging on/off.
++   */
++  void
++  update_session_desktop_ready(DWORD session_id, bool desktop_ready);
++
+diff --git a/src/platform/windows/display_device/windows_utils.cpp b/src/platform/windows/display_device/windows_utils.cpp
+index 5de7d55..080fc3b 100644
+--- a/src/platform/windows/display_device/windows_utils.cpp
++++ b/src/platform/windows/display_device/windows_utils.cpp
+@@ -11,0 +12 @@
++#include <mutex>
+@@ -12,0 +14 @@
++#include <unordered_map>
+@@ -39,0 +42,35 @@ namespace display_device::w_utils {
++    std::mutex session_state_mutex;
++    std::unordered_map<DWORD, bool> session_desktop_ready_cache;
++
++    bool
++    get_cached_session_desktop_ready(DWORD session_id, bool &desktop_ready) {
++      std::lock_guard<std::mutex> lock(session_state_mutex);
++      const auto it = session_desktop_ready_cache.find(session_id);
++      if (it == session_desktop_ready_cache.end()) {
++        return false;
++      }
++
++      desktop_ready = it->second;
++      return true;
++    }
++
++    DWORD
++    find_active_user_session_id() {
++      PWTS_SESSION_INFOW sessions { nullptr };
++      DWORD session_count { 0 };
++      DWORD active_session_id { 0xFFFFFFFF };
++
++      if (WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &session_count)) {
++        for (DWORD index = 0; index < session_count; ++index) {
++          const auto &session = sessions[index];
++          if (session.State == WTSActive && session.SessionId != 0) {
++            active_session_id = session.SessionId;
++            break;
++          }
++        }
++        WTSFreeMemory(sessions);
++      }
++
++      return active_session_id != 0xFFFFFFFF ? active_session_id : WTSGetActiveConsoleSessionId();
++    }
++
+@@ -968,0 +1006,6 @@ namespace display_device::w_utils {
++  void
++  update_session_desktop_ready(DWORD session_id, bool desktop_ready) {
++    std::lock_guard<std::mutex> lock(session_state_mutex);
++    session_desktop_ready_cache[session_id] = desktop_ready;
++  }
++
+@@ -970,0 +1014,6 @@ namespace display_device::w_utils {
++    const DWORD session_id { find_active_user_session_id() };
++    if (session_id == 0xFFFFFFFF) {
++      BOOST_LOG(warning) << "Session readiness check: no active interactive session is currently attached";
++      return true;
++    }
++
+@@ -981 +1030 @@ namespace display_device::w_utils {
+-    if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTSGetActiveConsoleSessionId(), WTSSessionInfoEx, &buffer, &buffer_size_in_bytes)) {
++    if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, session_id, WTSSessionInfoEx, &buffer, &buffer_size_in_bytes)) {
+@@ -986,0 +1036,5 @@ namespace display_device::w_utils {
++          const bool user_present { wts_info->Data.WTSInfoExLevel1.UserName[0] != L'\0' };
++          bool cached_desktop_ready { false };
++          const bool has_cached_state { get_cached_session_desktop_ready(session_id, cached_desktop_ready) };
++          const bool event_blocked { has_cached_state && !cached_desktop_ready };
++          const bool is_blocked { !user_present || is_locked || event_blocked };
+@@ -992 +1046,7 @@ namespace display_device::w_utils {
+-          return is_locked;
++          BOOST_LOG(info) << "Session readiness check - Blocked: " << is_blocked
++                          << ", SessionId: " << session_id
++                          << ", UserPresent: " << user_present
++                          << ", WTSLocked: " << is_locked
++                          << ", CachedDesktopReady: "
++                          << (has_cached_state ? (cached_desktop_ready ? "true" : "false") : "unknown");
++          return is_blocked;
+diff --git a/src/platform/windows/display_device/session_listener.cpp b/src/platform/windows/display_device/session_listener.cpp
+index ad46fd6..3f53b9c 100644
+--- a/src/platform/windows/display_device/session_listener.cpp
++++ b/src/platform/windows/display_device/session_listener.cpp
+@@ -7,0 +8,4 @@
++#ifndef WTS_SESSION_DESKTOP_READY
++#define WTS_SESSION_DESKTOP_READY 0xF
++#endif
++
+@@ -34,0 +39,5 @@ namespace display_device {
++        case WTS_SESSION_LOGON:
++          w_utils::update_session_desktop_ready(static_cast<DWORD>(lparam), false);
++          BOOST_LOG(info) << "[SessionListener] 检测到会话登录事件, session=" << static_cast<DWORD>(lparam);
++          break;
++        case WTS_SESSION_DESKTOP_READY:
+@@ -35,0 +45 @@ namespace display_device {
++          w_utils::update_session_desktop_ready(static_cast<DWORD>(lparam), true);
+@@ -37 +47 @@ namespace display_device {
+-            BOOST_LOG(info) << "[SessionListener] 检测到会话解锁事件";
++            BOOST_LOG(info) << "[SessionListener] 检测到用户桌面就绪/解锁事件, session=" << static_cast<DWORD>(lparam);
+@@ -52 +62,6 @@ namespace display_device {
+-          BOOST_LOG(info) << "[SessionListener] 检测到会话锁定事件";
++          w_utils::update_session_desktop_ready(static_cast<DWORD>(lparam), false);
++          BOOST_LOG(info) << "[SessionListener] 检测到会话锁定事件, session=" << static_cast<DWORD>(lparam);
++          break;
++        case WTS_SESSION_LOGOFF:
++          w_utils::update_session_desktop_ready(static_cast<DWORD>(lparam), false);
++          BOOST_LOG(info) << "[SessionListener] 检测到会话注销事件, session=" << static_cast<DWORD>(lparam);
+@@ -55 +70 @@ namespace display_device {
+-          BOOST_LOG(info) << "[SessionListener] 检测到控制台断开事件";
++          BOOST_LOG(info) << "[SessionListener] 检测到控制台断开事件, session=" << static_cast<DWORD>(lparam);
+@@ -105 +120 @@ namespace display_device {
+-    if (!WTSRegisterSessionNotification(hidden_window_, NOTIFY_FOR_THIS_SESSION)) {
++    if (!WTSRegisterSessionNotification(hidden_window_, NOTIFY_FOR_ALL_SESSIONS)) {
