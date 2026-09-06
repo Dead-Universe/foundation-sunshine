@@ -56,9 +56,9 @@ jobs:
           git apply patches/vdd-lockscreen-preflight-preserve.patch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          git apply --check patches/vdd-session-readiness.patch
+          git apply --check --unidiff-zero patches/vdd-session-readiness.patch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git apply patches/vdd-session-readiness.patch
+          git apply --unidiff-zero patches/vdd-session-readiness.patch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           git diff --check
