@@ -1,0 +1,184 @@
+diff --git a/src/platform/windows/display_device/windows_utils.h b/src/platform/windows/display_device/windows_utils.h
+--- a/src/platform/windows/display_device/windows_utils.h
++++ b/src/platform/windows/display_device/windows_utils.h
+@@ -513,4 +513,12 @@
+   is_user_session_locked();
+ 
+   /**
++   * @brief Update the event-derived readiness state for a Windows session.
++   * @param session_id WTS session identifier from WM_WTSSESSION_CHANGE.
++   * @param desktop_ready True after unlock/desktop-ready; false while locked or logging on/off.
++   */
++  void
++  update_session_desktop_ready(DWORD session_id, bool desktop_ready);
++
++  /**
+    * @brief Check whether it is already known that the CCD API will fail to set settings.
+diff --git a/src/platform/windows/display_device/windows_utils.cpp b/src/platform/windows/display_device/windows_utils.cpp
+--- a/src/platform/windows/display_device/windows_utils.cpp
++++ b/src/platform/windows/display_device/windows_utils.cpp
+@@ -8,4 +8,6 @@
+ #include <array>
+ #include <cstdint>
+ #include <iostream>
++#include <mutex>
+ #include <system_error>
++#include <unordered_map>
+ 
+@@ -37,4 +39,19 @@
+       static_cast<DISPLAYCONFIG_DEVICE_INFO_TYPE>(-4)
+     };
+ 
++    std::mutex session_state_mutex;
++    std::unordered_map<DWORD, bool> session_desktop_ready_cache;
++
++    bool
++    get_cached_session_desktop_ready(DWORD session_id, bool &desktop_ready) {
++      std::lock_guard<std::mutex> lock(session_state_mutex);
++      const auto it = session_desktop_ready_cache.find(session_id);
++      if (it == session_desktop_ready_cache.end()) {
++        return false;
++      }
++
++      desktop_ready = it->second;
++      return true;
++    }
++
+     struct displayconfig_source_dpi_scale_get_t {
+@@ -966,8 +983,20 @@
+     return const_cast<DISPLAYCONFIG_PATH_INFO *>(get_active_path(device_id, const_cast<const std::vector<DISPLAYCONFIG_PATH_INFO> &>(paths)));
+   }
+ 
++  void
++  update_session_desktop_ready(DWORD session_id, bool desktop_ready) {
++    std::lock_guard<std::mutex> lock(session_state_mutex);
++    session_desktop_ready_cache[session_id] = desktop_ready;
++  }
++
+   bool
+   is_user_session_locked() {
++    const DWORD session_id { WTSGetActiveConsoleSessionId() };
++    if (session_id == 0xFFFFFFFF) {
++      BOOST_LOG(warning) << "Session readiness check: no active console session is currently attached";
++      return true;
++    }
++
+     LPWSTR buffer { nullptr };
+     const auto cleanup_guard {
+@@ -978,18 +1007,32 @@
+     };
+ 
+     DWORD buffer_size_in_bytes { 0 };
+-    if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTSGetActiveConsoleSessionId(), WTSSessionInfoEx, &buffer, &buffer_size_in_bytes)) {
++    if (WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, session_id, WTSSessionInfoEx, &buffer, &buffer_size_in_bytes)) {
+       if (buffer_size_in_bytes > 0) {
+         const auto wts_info { reinterpret_cast<const WTSINFOEXW *>(buffer) };
+         if (wts_info && wts_info->Level == 1) {
+-          const bool is_locked { wts_info->Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK };
+-          const auto session_flags = wts_info->Data.WTSInfoExLevel1.SessionFlags;
+-          
+-          BOOST_LOG(info) << "Session lock check - Locked: " << is_locked 
+-                           << ", SessionFlags: " << session_flags 
+-                           << " (LOCK=" << WTS_SESSIONSTATE_LOCK 
+-                           << ", UNLOCK=" << WTS_SESSIONSTATE_UNLOCK << ")";
+-          return is_locked;
++          const auto &level1 = wts_info->Data.WTSInfoExLevel1;
++          const auto session_flags = level1.SessionFlags;
++          const bool wts_locked { session_flags == WTS_SESSIONSTATE_LOCK };
++          const bool user_present { level1.UserName[0] != L'\0' };
++
++          bool cached_desktop_ready { false };
++          const bool has_cached_state {
++            get_cached_session_desktop_ready(session_id, cached_desktop_ready)
++          };
++          const bool event_blocked { has_cached_state && !cached_desktop_ready };
++          const bool is_blocked { !user_present || wts_locked || event_blocked };
++
++          BOOST_LOG(info) << "Session readiness check - Blocked: " << is_blocked
++                          << ", SessionId: " << session_id
++                          << ", UserPresent: " << user_present
++                          << ", WTSLocked: " << wts_locked
++                          << ", CachedDesktopReady: "
++                          << (has_cached_state ? (cached_desktop_ready ? "true" : "false") : "unknown")
++                          << ", SessionFlags: " << session_flags
++                          << " (LOCK=" << WTS_SESSIONSTATE_LOCK
++                          << ", UNLOCK=" << WTS_SESSIONSTATE_UNLOCK << ")";
++          return is_blocked;
+         }
+       }
+diff --git a/src/platform/windows/display_device/session_listener.cpp b/src/platform/windows/display_device/session_listener.cpp
+--- a/src/platform/windows/display_device/session_listener.cpp
++++ b/src/platform/windows/display_device/session_listener.cpp
+@@ -31,28 +31,49 @@
+   LRESULT CALLBACK
+   SessionEventListener::window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+     if (message == WM_WTSSESSION_CHANGE) {
++      const DWORD session_id = static_cast<DWORD>(lparam);
++
++      const auto run_pending_task_if_ready = []() {
++        if (w_utils::is_user_session_locked()) {
++          return;
++        }
++
++        std::lock_guard<std::mutex> lock(mutex_);
++        if (pending_task_) {
++          BOOST_LOG(info) << "[SessionListener] 用户桌面已就绪，执行等待任务";
++          task_queue_.push(std::move(pending_task_));
++          pending_task_ = nullptr;
++          cv_.notify_one();
++        }
++      };
++
+       switch (wparam) {
++        case WTS_SESSION_LOCK:
++          w_utils::update_session_desktop_ready(session_id, false);
++          BOOST_LOG(info) << "[SessionListener] 检测到会话锁定事件, session=" << session_id;
++          break;
++        case WTS_SESSION_LOGON:
++          // LOGON can precede the switch to the real user desktop. Keep display
++          // changes deferred until DESKTOP_READY (or UNLOCK) confirms readiness.
++          w_utils::update_session_desktop_ready(session_id, false);
++          BOOST_LOG(info) << "[SessionListener] 检测到会话登录事件, session=" << session_id;
++          break;
+         case WTS_SESSION_UNLOCK:
+-          {
+-            BOOST_LOG(info) << "[SessionListener] 检测到会话解锁事件";
+-            
+-            // 将pending_task_移入队列执行
+-            {
+-              std::lock_guard<std::mutex> lock(mutex_);
+-              if (pending_task_) {
+-                BOOST_LOG(info) << "[SessionListener] 执行解锁任务";
+-                task_queue_.push(std::move(pending_task_));
+-                pending_task_ = nullptr;
+-                cv_.notify_one();
+-              }
+-            }
+-          }
++          w_utils::update_session_desktop_ready(session_id, true);
++          BOOST_LOG(info) << "[SessionListener] 检测到会话解锁事件, session=" << session_id;
++          run_pending_task_if_ready();
+           break;
+-        case WTS_SESSION_LOCK:
+-          BOOST_LOG(info) << "[SessionListener] 检测到会话锁定事件";
++        case WTS_SESSION_DESKTOP_READY:
++          w_utils::update_session_desktop_ready(session_id, true);
++          BOOST_LOG(info) << "[SessionListener] 检测到用户桌面就绪事件, session=" << session_id;
++          run_pending_task_if_ready();
++          break;
++        case WTS_SESSION_LOGOFF:
++          w_utils::update_session_desktop_ready(session_id, false);
++          BOOST_LOG(info) << "[SessionListener] 检测到会话注销事件, session=" << session_id;
+           break;
+         case WTS_CONSOLE_DISCONNECT:
+-          BOOST_LOG(info) << "[SessionListener] 检测到控制台断开事件";
++          BOOST_LOG(info) << "[SessionListener] 检测到控制台断开事件, session=" << session_id;
+           break;
+         default:
+           break;
+@@ -101,2 +122,4 @@
+-    if (!WTSRegisterSessionNotification(hidden_window_, NOTIFY_FOR_THIS_SESSION)) {
++    // Sunshine runs as a service in Session 0. Listen to all WTS sessions so
++    // lock/unlock events from the actual interactive user session are visible.
++    if (!WTSRegisterSessionNotification(hidden_window_, NOTIFY_FOR_ALL_SESSIONS)) {
+       BOOST_LOG(warning) << "[SessionListener] 注册会话通知失败: " << GetLastError();
