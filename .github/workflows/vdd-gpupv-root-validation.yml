@@ -56,9 +56,14 @@ jobs:
           git apply patches/vdd-lockscreen-preflight-preserve.patch
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+          git apply --check patches/vdd-session-readiness.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git apply patches/vdd-session-readiness.patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
           git diff --check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          git diff -- src/globals.h src/display_device/parsed_config.cpp src/display_device/session.cpp src/display_device/session.h src/video.cpp src/video_probe.h tests/unit/test_video_probe.cpp src/platform/windows/display_base.cpp src/platform/windows/display_vdd.cpp src/main.cpp
+          git diff -- src/globals.h src/display_device/parsed_config.cpp src/display_device/session.cpp src/display_device/session.h src/video.cpp src/video_probe.h tests/unit/test_video_probe.cpp src/platform/windows/display_base.cpp src/platform/windows/display_vdd.cpp src/platform/windows/display_device/windows_utils.cpp src/platform/windows/display_device/windows_utils.h src/platform/windows/display_device/session_listener.cpp src/main.cpp
 
       - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
