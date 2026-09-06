@@ -3,7 +3,7 @@ diff --git a/src/platform/windows/display_device/windows_utils.h b/src/platform/
 +++ b/src/platform/windows/display_device/windows_utils.h
 @@ -513,4 +513,12 @@
    is_user_session_locked();
- 
+
    /**
 +   * @brief Update the event-derived readiness state for a Windows session.
 +   * @param session_id WTS session identifier from WM_WTSSESSION_CHANGE.
@@ -17,7 +17,7 @@ diff --git a/src/platform/windows/display_device/windows_utils.h b/src/platform/
 diff --git a/src/platform/windows/display_device/windows_utils.cpp b/src/platform/windows/display_device/windows_utils.cpp
 --- a/src/platform/windows/display_device/windows_utils.cpp
 +++ b/src/platform/windows/display_device/windows_utils.cpp
-@@ -8,4 +8,6 @@
+@@ -8,5 +8,7 @@
  #include <array>
  #include <cstdint>
  #include <iostream>
@@ -45,7 +45,7 @@ diff --git a/src/platform/windows/display_device/windows_utils.cpp b/src/platfor
 +    }
 +
      struct displayconfig_source_dpi_scale_get_t {
-@@ -966,8 +983,20 @@
+@@ -966,7 +983,19 @@
      return const_cast<DISPLAYCONFIG_PATH_INFO *>(get_active_path(device_id, const_cast<const std::vector<DISPLAYCONFIG_PATH_INFO> &>(paths)));
    }
  
@@ -65,7 +65,7 @@ diff --git a/src/platform/windows/display_device/windows_utils.cpp b/src/platfor
 +
      LPWSTR buffer { nullptr };
      const auto cleanup_guard {
-@@ -978,18 +1007,32 @@
+@@ -978,17 +1007,31 @@
      };
  
      DWORD buffer_size_in_bytes { 0 };
@@ -109,7 +109,18 @@ diff --git a/src/platform/windows/display_device/windows_utils.cpp b/src/platfor
 diff --git a/src/platform/windows/display_device/session_listener.cpp b/src/platform/windows/display_device/session_listener.cpp
 --- a/src/platform/windows/display_device/session_listener.cpp
 +++ b/src/platform/windows/display_device/session_listener.cpp
-@@ -31,28 +31,49 @@
+@@ -4,6 +4,10 @@
+ #include "src/logging.h"
+ 
+ #include <atomic>
+ 
++#ifndef WTS_SESSION_DESKTOP_READY
++#define WTS_SESSION_DESKTOP_READY 0xF
++#endif
++
+ namespace display_device {
+ 
+@@ -31,28 +35,49 @@
    LRESULT CALLBACK
    SessionEventListener::window_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
      if (message == WM_WTSSESSION_CHANGE) {
@@ -176,7 +187,7 @@ diff --git a/src/platform/windows/display_device/session_listener.cpp b/src/plat
            break;
          default:
            break;
-@@ -101,2 +122,4 @@
+@@ -101,2 +126,4 @@
 -    if (!WTSRegisterSessionNotification(hidden_window_, NOTIFY_FOR_THIS_SESSION)) {
 +    // Sunshine runs as a service in Session 0. Listen to all WTS sessions so
 +    // lock/unlock events from the actual interactive user session are visible.
