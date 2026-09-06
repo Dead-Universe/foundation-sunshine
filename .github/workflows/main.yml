@@ -92,7 +92,8 @@ jobs:
             'patches/vdd-cold-start-mode-sync.patch',
             'patches/vdd-auto-capture-fallback.patch',
             'patches/vdd-lockscreen-live-reconfigure.patch',
-            'patches/vdd-lockscreen-preflight-preserve.patch'
+            'patches/vdd-lockscreen-preflight-preserve.patch',
+            'patches/vdd-session-readiness.patch'
           )
           foreach ($patch in $patches) {
             Write-Host "Checking $patch"
