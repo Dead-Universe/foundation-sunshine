@@ -2,6 +2,7 @@
 #pragma once
 #include "console_input_bridge.h"
 #include "src/config.h"
+#include "src/logging.h"
 #include "src/display_device/parsed_config.h"
 #include "src/display_device/vdd_ioctl.h"
 #include "src/display_device/vdd_utils.h"
@@ -43,11 +44,17 @@ namespace platf::service_vdd {
   inline void start_display_follower() {
     static std::jthread follower([](std::stop_token stop) {
       DWORD prepared=MAXDWORD;ULONGLONG retry=0;
+      DWORD observed=MAXDWORD,last_result=ERROR_GEN_FAILURE;
       while(!stop.stop_requested()) {
         if(enabled()&&single_display.load()&&console_input_bridge::streaming_active.load()) {
           const auto session=WTSGetActiveConsoleSessionId();
           if(session!=MAXDWORD && (session!=prepared || GetTickCount64()>=retry)) {
             const auto result=prepare_console(session);
+            if(observed!=session || last_result!=result) {
+              BOOST_LOG(result==ERROR_SUCCESS?info:warning) << "[service-vdd] Console display preparation: session="
+                  << session << " result=" << result;
+              observed=session;last_result=result;
+            }
             prepared=result==ERROR_SUCCESS?session:MAXDWORD;
             retry=GetTickCount64()+(result==ERROR_SUCCESS?30000:2000);
           }

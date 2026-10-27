@@ -10,6 +10,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include "console_input_queue.h"
 #include "../../../tools/sunshinesvc_state.h"
 
 #ifndef PROC_THREAD_ATTRIBUTE_HANDLE_LIST
@@ -53,24 +54,25 @@ namespace platf::console_input_bridge {
     volatile LONG ready = 0;
     volatile LONG error = ERROR_SUCCESS;
     volatile LONG session = -1;
+    input_queue inputs;
   };
 
-  inline int run_helper(HANDLE remote_pipe, HANDLE remote_status, DWORD owner_pid) {
+  inline int run_helper(HANDLE remote_event, HANDLE remote_status, DWORD owner_pid) {
     if (!system_token() || owner_pid == GetCurrentProcessId()) return ERROR_ACCESS_DENIED;
     auto owner = OpenProcess(PROCESS_DUP_HANDLE | SYNCHRONIZE, FALSE, owner_pid);
     if (!owner) return GetLastError();
-    HANDLE pipe = nullptr;
+    HANDLE data_event = nullptr;
     HANDLE status_handle = nullptr;
-    const bool copied = DuplicateHandle(owner, remote_pipe, GetCurrentProcess(), &pipe, GENERIC_READ, FALSE, 0) &&
-                        DuplicateHandle(owner, remote_status, GetCurrentProcess(), &status_handle, FILE_MAP_WRITE, FALSE, 0);
-    if (!copied || GetFileType(pipe) != FILE_TYPE_PIPE) {
-      if (pipe) CloseHandle(pipe);
+    const bool copied = DuplicateHandle(owner, remote_event, GetCurrentProcess(), &data_event, SYNCHRONIZE, FALSE, 0) &&
+                        DuplicateHandle(owner, remote_status, GetCurrentProcess(), &status_handle, FILE_MAP_READ | FILE_MAP_WRITE, FALSE, 0);
+    if (!copied || WaitForSingleObject(data_event, 0) == WAIT_FAILED) {
+      if (data_event) CloseHandle(data_event);
       if (status_handle) CloseHandle(status_handle);
       CloseHandle(owner);
       return ERROR_INVALID_HANDLE;
     }
-    auto status = static_cast<helper_status *>(MapViewOfFile(status_handle, FILE_MAP_WRITE, 0, 0, sizeof(helper_status)));
-    if (!status) { const auto error = GetLastError(); CloseHandle(pipe); CloseHandle(status_handle); CloseHandle(owner); return error; }
+    auto status = static_cast<helper_status *>(MapViewOfFile(status_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(helper_status)));
+    if (!status) { const auto error = GetLastError(); CloseHandle(data_event); CloseHandle(status_handle); CloseHandle(owner); return error; }
     DWORD session = MAXDWORD;
     ProcessIdToSessionId(GetCurrentProcessId(), &session);
     HDESK desktop = nullptr;
@@ -87,22 +89,25 @@ namespace platf::console_input_bridge {
     InterlockedExchange(&status->session, static_cast<LONG>(session));
     InterlockedExchange(&status->error, ready ? ERROR_SUCCESS : static_cast<LONG>(GetLastError()));
     InterlockedExchange(&status->ready, ready ? 1 : -1);
-    while (ready && WaitForSingleObject(owner, 0) == WAIT_TIMEOUT) {
+    bool active = ready;
+    HANDLE waits[] {owner, data_event};
+    while (active && WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
+      SetThreadExecutionState(ES_DISPLAY_REQUIRED);
       INPUT input {};
-      DWORD bytes = 0;
-      if (!ReadFile(pipe, &input, sizeof(input), &bytes, nullptr) || bytes != sizeof(input)) break;
-      // Fail closed if the console changed after the parent selected this helper.
-      if (WTSGetActiveConsoleSessionId() != session) break;
-      if (input.type != INPUT_KEYBOARD && input.type != INPUT_MOUSE) break;
-      if (!sync_desktop()) { InterlockedExchange(&status->error, GetLastError()); continue; }
-      if (WTSGetActiveConsoleSessionId() != session) break;
-      if (input.type == INPUT_KEYBOARD) input.ki.dwExtraInfo = 0;
-      else input.mi.dwExtraInfo = 0;
-      InterlockedExchange(&status->error, SendInput(1, &input, sizeof(input)) == 1 ? ERROR_SUCCESS : static_cast<LONG>(GetLastError()));
+      while (status->inputs.pop(input)) {
+        // Fail closed if the console changed after the parent selected this helper.
+        if (WTSGetActiveConsoleSessionId() != session ||
+            (input.type != INPUT_KEYBOARD && input.type != INPUT_MOUSE)) { active = false; break; }
+        if (!sync_desktop()) { InterlockedExchange(&status->error, GetLastError()); continue; }
+        if (WTSGetActiveConsoleSessionId() != session) { active = false; break; }
+        if (input.type == INPUT_KEYBOARD) input.ki.dwExtraInfo = 0;
+        else input.mi.dwExtraInfo = 0;
+        InterlockedExchange(&status->error, SendInput(1, &input, sizeof(input)) == 1 ? ERROR_SUCCESS : static_cast<LONG>(GetLastError()));
+      }
     }
     if (owner) CloseHandle(owner);
     UnmapViewOfFile(status);
-    CloseHandle(pipe);
+    CloseHandle(data_event);
     CloseHandle(status_handle);
     // The input desktop is released by process exit; closing the assigned
     // desktop from this thread would be invalid.
@@ -110,14 +115,12 @@ namespace platf::console_input_bridge {
   }
 
   class helper_process {
-    HANDLE read_ = nullptr;
-    HANDLE write_ = nullptr;
+    HANDLE event_ = nullptr;
     HANDLE mapping_ = nullptr;
     HANDLE job_ = nullptr;
     HANDLE process_ = nullptr;
     helper_status *status_ = nullptr;
     DWORD session_ = MAXDWORD;
-    DWORD buffer_size_ = 0;
     std::mutex mutex_;
 
     void close() {
@@ -125,21 +128,16 @@ namespace platf::console_input_bridge {
       if (process_) CloseHandle(process_);
       if (status_) UnmapViewOfFile(status_);
       if (mapping_) CloseHandle(mapping_);
-      if (read_) CloseHandle(read_);
-      if (write_) CloseHandle(write_);
-      read_ = write_ = mapping_ = job_ = process_ = nullptr;
+      if (event_) CloseHandle(event_);
+      event_ = mapping_ = job_ = process_ = nullptr;
       status_ = nullptr;
       session_ = MAXDWORD;
-      buffer_size_ = 0;
     }
 
     bool open(DWORD session) {
       close();
-      if (!CreatePipe(&read_, &write_, nullptr, 65536)) return false;
-      DWORD outgoing = 0, incoming = 0;
-      if (!GetNamedPipeInfo(read_, nullptr, &outgoing, &incoming, nullptr)) return false;
-      buffer_size_ = outgoing > incoming ? outgoing : incoming;
-      if (buffer_size_ < sizeof(INPUT)) return false;
+      event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+      if (!event_) return false;
       mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(helper_status), nullptr);
       if (!mapping_) return false;
       status_ = static_cast<helper_status *>(MapViewOfFile(mapping_, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(helper_status)));
@@ -167,7 +165,7 @@ namespace platf::console_input_bridge {
       helper_exe.resize(separator + 1);
       helper_exe += L"tools\\sunshinesvc.exe";
       auto command = L"\"" + helper_exe + L"\" --console-input-agent " +
-                     std::to_wstring(reinterpret_cast<std::uintptr_t>(read_)) + L" " +
+                     std::to_wstring(reinterpret_cast<std::uintptr_t>(event_)) + L" " +
                      std::to_wstring(reinterpret_cast<std::uintptr_t>(mapping_)) + L" " + std::to_wstring(GetCurrentProcessId());
       // Cross-session inheritance is unsupported. The child duplicates only
       // these two anonymous objects from its still-running SYSTEM parent.
@@ -207,19 +205,16 @@ namespace platf::console_input_bridge {
     ~helper_process() { close(); }
     bool prepare() {
       std::lock_guard lock(mutex_);
-      return ensure(WTSGetActiveConsoleSessionId());
+      return ensure(WTSGetActiveConsoleSessionId()) && SetEvent(event_);
     }
     bool send(const INPUT &input) {
       std::lock_guard lock(mutex_);
       const auto target = WTSGetActiveConsoleSessionId();
       if (!ensure(target)) return false;
-      DWORD queued = 0;
-      // One writer owns the pipe. Check actual capacity before a fixed-size
-      // write so an unresponsive helper cannot block the streaming input loop.
-      if (!PeekNamedPipe(read_, nullptr, 0, nullptr, &queued, nullptr) || queued > buffer_size_ - sizeof(INPUT)) { close(); return false; }
       if (WTSGetActiveConsoleSessionId() != target) return false;
-      DWORD written = 0;
-      return WriteFile(write_, &input, sizeof(input), &written, nullptr) && written == sizeof(input);
+      // Queue publication and event signalling cannot wait on the child's read.
+      // A full queue fails immediately instead of blocking the input thread.
+      return status_->inputs.push(input) && SetEvent(event_);
     }
   };
 

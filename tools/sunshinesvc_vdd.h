@@ -45,6 +45,10 @@ namespace sunshinesvc::vdd {
   inline DWORD configure_console_display() {
     DWORD own=MAXDWORD;ProcessIdToSessionId(GetCurrentProcessId(),&own);
     if(own==0 || own!=WTSGetActiveConsoleSessionId())return ERROR_RETRY;
+    auto desktop=OpenInputDesktop(0,FALSE,MAXIMUM_ALLOWED);
+    if(!desktop)return GetLastError();
+    if(!SetThreadDesktop(desktop)){auto error=GetLastError();CloseDesktop(desktop);return error;}
+    // This bounded helper exits immediately; the assigned desktop closes then.
     for(unsigned attempt=0;attempt<3;++attempt) {
       UINT32 path_count=0,mode_count=0;
       auto result=GetDisplayConfigBufferSizes(QDC_ALL_PATHS,&path_count,&mode_count);
