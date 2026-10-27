@@ -606,7 +606,8 @@ target_compile_options(${PROJECT_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSH
 target_link_options(${PROJECT_NAME} PRIVATE)
 
 # Bound hardware and network waits in the aggregate suite.
-add_test(NAME ${PROJECT_NAME} COMMAND ${PROJECT_NAME})
+add_test(NAME ${PROJECT_NAME}
+        COMMAND ${PROJECT_NAME} --gtest_output=xml:${CMAKE_CURRENT_BINARY_DIR}/test_sunshine.xml)
 set_tests_properties(${PROJECT_NAME} PROPERTIES TIMEOUT 600)
 
 add_executable(abr_unit_tests

@@ -670,22 +670,47 @@ namespace platf::dxgi {
         adapter_name.clear();
       }
 
-      for (int x = 0; factory->EnumAdapters1(x, &adapter_p) != DXGI_ERROR_NOT_FOUND; ++x) {
+      for (UINT x = 0; ; ++x) {
+        adapter_p = nullptr;
+        status = factory->EnumAdapters1(x, &adapter_p);
+        if (status == DXGI_ERROR_NOT_FOUND) {
+          break;
+        }
+        if (FAILED(status) || !adapter_p) {
+          BOOST_LOG(error) << "[Display Init] Adapter enumeration failed [0x"sv << util::hex(status).to_string_view() << ']';
+          return -1;
+        }
         dxgi::adapter_t adapter_tmp { adapter_p };
 
         DXGI_ADAPTER_DESC1 adapter_desc;
-        adapter_tmp->GetDesc1(&adapter_desc);
+        status = adapter_tmp->GetDesc1(&adapter_desc);
+        if (FAILED(status)) {
+          BOOST_LOG(error) << "[Display Init] Adapter description failed [0x"sv << util::hex(status).to_string_view() << ']';
+          return -1;
+        }
 
         if (!adapter_name.empty() && adapter_desc.Description != adapter_name) {
           continue;
         }
 
-        dxgi::output_t::pointer output_p;
-        for (int y = 0; adapter_tmp->EnumOutputs(y, &output_p) != DXGI_ERROR_NOT_FOUND; ++y) {
+        for (UINT y = 0; ; ++y) {
+          dxgi::output_t::pointer output_p {};
+          status = adapter_tmp->EnumOutputs(y, &output_p);
+          if (status == DXGI_ERROR_NOT_FOUND) {
+            break;
+          }
+          if (FAILED(status) || !output_p) {
+            BOOST_LOG(error) << "[Display Init] Output enumeration failed [0x"sv << util::hex(status).to_string_view() << ']';
+            return -1;
+          }
           dxgi::output_t output_tmp { output_p };
 
           DXGI_OUTPUT_DESC desc;
-          output_tmp->GetDesc(&desc);
+          status = output_tmp->GetDesc(&desc);
+          if (FAILED(status)) {
+            BOOST_LOG(error) << "[Display Init] Output description failed [0x"sv << util::hex(status).to_string_view() << ']';
+            return -1;
+          }
 
           if (!is_rdp_session && !output_name.empty() && desc.DeviceName != output_name) {
             continue;
@@ -1410,8 +1435,16 @@ namespace platf {
       return {};
     }
 
-    dxgi::adapter_t::pointer adapter_p;
-    for (int x = 0; factory->EnumAdapters1(x, &adapter_p) != DXGI_ERROR_NOT_FOUND; ++x) {
+    for (UINT x = 0; ; ++x) {
+      dxgi::adapter_t::pointer adapter_p {};
+      status = factory->EnumAdapters1(x, &adapter_p);
+      if (status == DXGI_ERROR_NOT_FOUND) {
+        break;
+      }
+      if (FAILED(status) || !adapter_p) {
+        BOOST_LOG(error) << "DXGI adapter enumeration failed [0x"sv << util::hex(status).to_string_view() << ']';
+        return {};
+      }
       dxgi::adapter_t adapter { adapter_p };
       DXGI_ADAPTER_DESC1 adapter_desc;
       adapter->GetDesc1(&adapter_desc);
@@ -1426,8 +1459,16 @@ namespace platf {
         << ",Device Sys Mem: "sv << adapter_desc.DedicatedSystemMemory / 1048576 << " MiB"sv
         << ",Share Sys Mem: "sv << adapter_desc.SharedSystemMemory / 1048576 << " MiB"sv;
 
-      dxgi::output_t::pointer output_p {};
-      for (int y = 0; adapter->EnumOutputs(y, &output_p) != DXGI_ERROR_NOT_FOUND; ++y) {
+      for (UINT y = 0; ; ++y) {
+        dxgi::output_t::pointer output_p {};
+        status = adapter->EnumOutputs(y, &output_p);
+        if (status == DXGI_ERROR_NOT_FOUND) {
+          break;
+        }
+        if (FAILED(status) || !output_p) {
+          BOOST_LOG(error) << "DXGI output enumeration failed [0x"sv << util::hex(status).to_string_view() << ']';
+          return {};
+        }
         dxgi::output_t output { output_p };
 
         DXGI_OUTPUT_DESC desc;
@@ -1508,8 +1549,16 @@ namespace platf {
       return {};
     }
 
-    dxgi::adapter_t::pointer adapter_p;
-    for (int x = 0; factory->EnumAdapters1(x, &adapter_p) != DXGI_ERROR_NOT_FOUND; ++x) {
+    for (UINT x = 0; ; ++x) {
+      dxgi::adapter_t::pointer adapter_p {};
+      status = factory->EnumAdapters1(x, &adapter_p);
+      if (status == DXGI_ERROR_NOT_FOUND) {
+        break;
+      }
+      if (FAILED(status) || !adapter_p) {
+        BOOST_LOG(error) << "DXGI adapter enumeration failed [0x"sv << util::hex(status).to_string_view() << ']';
+        return {};
+      }
       dxgi::adapter_t adapter { adapter_p };
       DXGI_ADAPTER_DESC1 adapter_desc;
       adapter->GetDesc1(&adapter_desc);
