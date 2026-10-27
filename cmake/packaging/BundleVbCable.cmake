@@ -1,0 +1,17 @@
+# Bundle the unmodified standard VB-CABLE package. Downloads belong to the
+# build provisioning step; the generated installer works entirely offline.
+include_guard(GLOBAL)
+option(BUNDLE_VBCABLE "Bundle the standard VB-Audio VB-CABLE driver" OFF)
+set(VBCABLE_ARCHIVE "" CACHE FILEPATH "Official VBCABLE_Driver_Pack45.zip")
+set(VBCABLE_BUNDLED 0)
+if(NOT BUNDLE_VBCABLE)
+  return()
+endif()
+if(NOT EXISTS "${VBCABLE_ARCHIVE}")
+  message(FATAL_ERROR "BUNDLE_VBCABLE requires the complete offline VBCABLE_ARCHIVE")
+endif()
+file(SHA256 "${VBCABLE_ARCHIVE}" _vbcable_sha256)
+if(NOT _vbcable_sha256 STREQUAL "b950e39f01af1d04ea623c8f6d8eb9b6ea5c477c637295fabf20631c85116bfb")
+  message(FATAL_ERROR "VBCABLE_ARCHIVE is not the reviewed official standard Pack45")
+endif()
+set(VBCABLE_BUNDLED 1)
