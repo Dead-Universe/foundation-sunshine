@@ -1,0 +1,6 @@
+# Patch context lines contain a required leading space, including blank lines.
+# Patch content can contain meaningful CR bytes from upstream Windows files.
+# Keep the exact reviewed bytes so the manifest SHA256 survives publication.
+*.patch -text whitespace=-blank-at-eol
+*.json text eol=lf
+*.md text eol=lf

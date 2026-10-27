@@ -1,0 +1,113 @@
+diff --git a/src/nvenc/win/impl/nvenc_async_wait.h b/src/nvenc/win/impl/nvenc_async_wait.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..ee4515b151bdd3c1acf2048cfbf0e925039a75cc
+--- /dev/null
++++ b/src/nvenc/win/impl/nvenc_async_wait.h
+@@ -0,0 +1,23 @@
++#pragma once
++
++#include <windows.h>
++
++namespace nvenc::async_completion {
++  struct result_t {
++    DWORD status;
++    DWORD error;
++    bool extended;
++  };
++
++  // A delayed completion still owns the submitted picture and bitstream.
++  // Give it one bounded grace interval before destroying the encoder. Normal
++  // signaled events return immediately; invalid handles must never be retried.
++  inline result_t wait(HANDLE event, DWORD initial_ms) {
++    DWORD status = WaitForSingleObject(event, initial_ms);
++    if (status != WAIT_TIMEOUT) {
++      return {status, status == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS, false};
++    }
++    status = WaitForSingleObject(event, 400);
++    return {status, status == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS, true};
++  }
++}
+diff --git a/src/nvenc/win/impl/nvenc_d3d11_base.cpp b/src/nvenc/win/impl/nvenc_d3d11_base.cpp
+index 53376adc646d8aef863db805905842cb9c66b4c9..85df7a3540345512ee61aba67d250741af4b01c1 100644
+--- a/src/nvenc/win/impl/nvenc_d3d11_base.cpp
++++ b/src/nvenc/win/impl/nvenc_d3d11_base.cpp
+@@ -3,6 +3,8 @@
+  * @brief Definitions for abstract Direct3D11 NVENC encoder.
+  */
+ #include "nvenc_d3d11_base.h"
++#include "nvenc_async_wait.h"
++#include "src/logging.h"
+ 
+ #ifdef NVENC_NAMESPACE
+ namespace NVENC_NAMESPACE {
+@@ -42,8 +44,17 @@ namespace nvenc {
+ 
+     return false;
+   }
+-  
++
+   bool nvenc_d3d11_base::wait_for_async_event(uint32_t timeout_ms) {
+-    return WaitForSingleObject(async_event_handle, timeout_ms) == WAIT_OBJECT_0;
++    const auto started = GetTickCount64();
++    const auto result = ::nvenc::async_completion::wait(async_event_handle, timeout_ms);
++    if (result.status == WAIT_OBJECT_0 && result.extended) {
++      BOOST_LOG(warning) << "NvEnc: delayed completion recovered without encoder reset after "
++                         << GetTickCount64() - started << " ms";
++    }
++    else if (result.status == WAIT_FAILED) {
++      BOOST_LOG(error) << "NvEnc: completion wait failed, Windows error " << result.error;
++    }
++    return result.status == WAIT_OBJECT_0;
+   }
+ }
+diff --git a/tests/unit/platform/windows/test_nvenc_async_wait.cpp b/tests/unit/platform/windows/test_nvenc_async_wait.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c807e5b55715d96df78b3fc8d57f7d271c2ee59
+--- /dev/null
++++ b/tests/unit/platform/windows/test_nvenc_async_wait.cpp
+@@ -0,0 +1,45 @@
++#ifdef _WIN32
++#include <src/nvenc/win/impl/nvenc_async_wait.h>
++#include <gtest/gtest.h>
++#include <thread>
++#include <chrono>
++
++TEST(NvencAsyncCompletion, SignaledEventDoesNotEnterGraceInterval) {
++  HANDLE event = CreateEventW(nullptr, FALSE, TRUE, nullptr);
++  ASSERT_NE(event, nullptr);
++  const auto result = nvenc::async_completion::wait(event, 100);
++  CloseHandle(event);
++  EXPECT_EQ(result.status, WAIT_OBJECT_0);
++  EXPECT_FALSE(result.extended);
++}
++
++TEST(NvencAsyncCompletion, LateCompletionKeepsTheSubmittedFrame) {
++  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++  ASSERT_NE(event, nullptr);
++  std::jthread producer([event] {
++    std::this_thread::sleep_for(std::chrono::milliseconds(180));
++    SetEvent(event);
++  });
++  const auto result = nvenc::async_completion::wait(event, 100);
++  producer.join();
++  CloseHandle(event);
++  EXPECT_EQ(result.status, WAIT_OBJECT_0);
++  EXPECT_TRUE(result.extended);
++}
++
++TEST(NvencAsyncCompletion, MissingCompletionStillHasABoundedFailure) {
++  HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++  ASSERT_NE(event, nullptr);
++  const auto result = nvenc::async_completion::wait(event, 100);
++  CloseHandle(event);
++  EXPECT_EQ(result.status, WAIT_TIMEOUT);
++  EXPECT_TRUE(result.extended);
++}
++
++TEST(NvencAsyncCompletion, InvalidHandleFailsWithoutGraceInterval) {
++  const auto result = nvenc::async_completion::wait(nullptr, 100);
++  EXPECT_EQ(result.status, WAIT_FAILED);
++  EXPECT_EQ(result.error, ERROR_INVALID_HANDLE);
++  EXPECT_FALSE(result.extended);
++}
++#endif
