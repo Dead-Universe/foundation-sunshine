@@ -1,0 +1,4 @@
+# Patch context lines contain a required leading space, including blank lines.
+*.patch text eol=lf whitespace=-blank-at-eol
+*.json text eol=lf
+*.md text eol=lf

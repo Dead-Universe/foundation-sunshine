@@ -1,0 +1,1122 @@
+diff --git a/src/display_device/parsed_config.cpp b/src/display_device/parsed_config.cpp
+index 13d13ab1fa7c3ca465b8b639bc203b8ed9453575..bb8e66ec691c2e7a483514f1fe30d860b69cc40b 100644
+--- a/src/display_device/parsed_config.cpp
++++ b/src/display_device/parsed_config.cpp
+@@ -393,8 +393,11 @@ namespace display_device {
+     // An explicit VDD request does not depend on CCD being available.
+     bool explicit_vdd = session.use_vdd;
+ #ifdef _WIN32
+-    // VDD_NAME is the stable alias exposed by the Windows host configuration UI.
+-    explicit_vdd = explicit_vdd || intent.device_id == VDD_NAME;
++    // A process-level Auto decision must agree with display preparation.
++    // Preserve every explicitly named host or client display.
++    const bool automatic_output_uses_vdd =
++      config.capture == "vdd" && !client_named_it && intent.device_id.empty();
++    explicit_vdd = explicit_vdd || intent.device_id == VDD_NAME || automatic_output_uses_vdd;
+ #endif
+     if (explicit_vdd) {
+       intent.target = display_intent_t::target_e::vdd;
+diff --git a/src/display_device/session.cpp b/src/display_device/session.cpp
+index bba67f952912c2ef70926bb9b6a2d25bc787849b..04aca30db0c01a712109dc5a377279f9c9505083 100644
+--- a/src/display_device/session.cpp
++++ b/src/display_device/session.cpp
+@@ -175,10 +175,8 @@ namespace display_device {
+     current_vdd_prep.reset();
+     current_use_vdd.reset();
+     pending_vdd_.reset();
+-    // 恢复原始的 output_name，避免下一个会话使用已销毁的 VDD 设备 ID
+-    if (!original_output_name.empty()) {
+-      config::video.output_name = original_output_name;
+-      original_output_name.clear();
++    // Restore Auto too, so the next session cannot retain a destroyed VDD ID.
++    if (original_output_name.restore(config::video.output_name)) {
+       BOOST_LOG(debug) << "已恢复原始 output_name: " << config::video.output_name;
+     }
+   }
+@@ -886,9 +884,8 @@ namespace display_device {
+       settings.replace_vdd_id(rebuild_old_vdd_id, device_zako);
+     }
+ 
+-    if (original_output_name.empty()) {
+-      original_output_name = config::video.output_name;
+-      BOOST_LOG(debug) << "保存原始 output_name: " << original_output_name;
++    if (original_output_name.remember(config::video.output_name)) {
++      BOOST_LOG(debug) << "保存原始 output_name: " << config::video.output_name;
+     }
+ 
+     // Update configuration and state
+diff --git a/src/display_device/session.h b/src/display_device/session.h
+index b71bc8aa9c038ecfd5fa117f420ee3b0a94dd1cd..4b090775519b0e131085ac922341660831bbab5c 100644
+--- a/src/display_device/session.h
++++ b/src/display_device/session.h
+@@ -8,6 +8,7 @@
+ #include <boost/atomic.hpp>
+ // local includes
+ #include "settings.h"
++#include "vdd_output_state.h"
+ #include "vdd_utils.h"
+ 
+ namespace display_device {
+@@ -283,7 +284,7 @@ namespace display_device {
+     std::mutex mutex; /**< A mutex for ensuring thread-safety. */
+     std::string current_vdd_client_id; /**< Current client ID associated with VDD monitor. */
+     std::optional<vdd_utils::hdr_brightness_t> current_vdd_hdr_brightness; /**< HDR capabilities currently programmed into VDD. */
+-    std::string original_output_name; /**< Original output_name value before VDD device ID was set. */
++    vdd_output_state_t original_output_name; /**< Original output_name, including an empty Auto selection. */
+     boost::optional<parsed_config_t::device_prep_e> current_device_prep; /**< Current device preparation mode, respecting client overrides. */
+     boost::optional<parsed_config_t::vdd_prep_e> current_vdd_prep; /**< Current VDD preparation mode for VDD mode sessions. */
+     boost::optional<bool> current_use_vdd; /**< Whether current session is using VDD mode. */
+diff --git a/src/display_device/vdd_output_state.h b/src/display_device/vdd_output_state.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c65520328033395c5cee925536d2135acc734e52
+--- /dev/null
++++ b/src/display_device/vdd_output_state.h
+@@ -0,0 +1,33 @@
++#pragma once
++
++#include <optional>
++#include <string>
++#include <utility>
++
++namespace display_device {
++
++  // Empty means Auto and is a valid saved selection, not an absent snapshot.
++  class vdd_output_state_t {
++  public:
++    bool remember(const std::string &output_name) {
++      if (original_) {
++        return false;
++      }
++      original_ = output_name;
++      return true;
++    }
++
++    bool restore(std::string &output_name) {
++      if (!original_) {
++        return false;
++      }
++      output_name = std::move(*original_);
++      original_.reset();
++      return true;
++    }
++
++  private:
++    std::optional<std::string> original_;
++  };
++
++}  // namespace display_device
+diff --git a/src/display_device/vdd_utils.cpp b/src/display_device/vdd_utils.cpp
+index f8ea28b87388b3377e18b880d9d54a4cf2e9d5ab..1e66b2b33fa018b83f7c1dc85d3b503bf27727f5 100644
+--- a/src/display_device/vdd_utils.cpp
++++ b/src/display_device/vdd_utils.cpp
+@@ -662,6 +662,111 @@ namespace display_device {
+       return true;
+     }
+ 
++    bool
++    normalize_vdd_source_mode_for_direct_capture() {
++      const auto vdd_device_id = find_device_by_friendlyname(ZAKO_NAME);
++      if (vdd_device_id.empty()) {
++        BOOST_LOG(error) << "[vdd] Cannot normalize direct-capture mode: VDD device was not found";
++        return false;
++      }
++
++      const auto get_target_resolution = [&]() -> boost::optional<resolution_t> {
++        const auto display_data = w_utils::query_display_config(w_utils::ACTIVE_ONLY_DEVICES);
++        if (!display_data) {
++          return boost::none;
++        }
++
++        const auto path = w_utils::get_active_path(vdd_device_id, display_data->paths);
++        if (!path) {
++          BOOST_LOG(warning) << "[vdd] Cannot normalize direct-capture mode: VDD path is not active";
++          return boost::none;
++        }
++
++        UINT32 target_index = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
++        if ((path->flags & DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE) != 0) {
++          const UINT32 virtual_target_index = path->targetInfo.targetModeInfoIdx;
++          if (virtual_target_index != DISPLAYCONFIG_PATH_TARGET_MODE_IDX_INVALID) {
++            target_index = virtual_target_index;
++          }
++        }
++        else {
++          target_index = path->targetInfo.modeInfoIdx;
++        }
++
++        if (target_index == DISPLAYCONFIG_PATH_MODE_IDX_INVALID ||
++            target_index >= display_data->modes.size()) {
++          BOOST_LOG(warning) << "[vdd] Cannot normalize direct-capture mode: active VDD has no target mode";
++          return boost::none;
++        }
++
++        const auto &target_mode = display_data->modes[target_index];
++        if (target_mode.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_TARGET) {
++          BOOST_LOG(warning) << "[vdd] Cannot normalize direct-capture mode: target mode index has unexpected type";
++          return boost::none;
++        }
++
++        const auto &signal = target_mode.targetMode.targetVideoSignalInfo;
++        const auto width = signal.activeSize.cx ? signal.activeSize.cx : signal.totalSize.cx;
++        const auto height = signal.activeSize.cy ? signal.activeSize.cy : signal.totalSize.cy;
++        if (width == 0 || height == 0) {
++          BOOST_LOG(warning) << "[vdd] Cannot normalize direct-capture mode: target signal has invalid dimensions";
++          return boost::none;
++        }
++
++        return resolution_t {
++          static_cast<unsigned int>(width),
++          static_cast<unsigned int>(height)
++        };
++      };
++
++      const auto target_resolution = get_target_resolution();
++      if (!target_resolution) {
++        return false;
++      }
++
++      const std::unordered_set<std::string> device_ids {vdd_device_id};
++      auto current_modes = get_current_display_modes(device_ids);
++      const auto current_it = current_modes.find(vdd_device_id);
++      if (current_it == current_modes.end()) {
++        BOOST_LOG(warning) << "[vdd] Cannot normalize direct-capture mode: VDD source mode is unavailable";
++        return false;
++      }
++
++      if (!same_resolution(current_it->second.resolution, *target_resolution)) {
++        auto desired_mode = current_it->second;
++        BOOST_LOG(info) << "[vdd] Normalizing cold direct-capture mode: source "
++                        << desired_mode.resolution.width << "x" << desired_mode.resolution.height
++                        << " -> target " << target_resolution->width << "x" << target_resolution->height;
++        desired_mode.resolution = *target_resolution;
++
++        device_display_mode_map_t desired_modes;
++        desired_modes.emplace(vdd_device_id, desired_mode);
++        if (!set_display_modes(desired_modes)) {
++          BOOST_LOG(error) << "[vdd] Failed to align VDD source mode with committed target mode";
++          return false;
++        }
++      }
++
++      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
++      do {
++        const auto verify_target = get_target_resolution();
++        const auto verify_modes = get_current_display_modes(device_ids);
++        const auto verify_it = verify_modes.find(vdd_device_id);
++        if (verify_target && verify_it != verify_modes.end() &&
++            same_resolution(verify_it->second.resolution, *verify_target)) {
++          BOOST_LOG(info) << "[vdd] Direct-capture mode normalized: "
++                          << verify_target->width << "x" << verify_target->height
++                          << " source=target";
++          return true;
++        }
++
++        std::this_thread::sleep_for(std::chrono::milliseconds(100));
++      } while (std::chrono::steady_clock::now() < deadline);
++
++      BOOST_LOG(error) << "[vdd] VDD source and committed target modes remained different after normalization";
++      return false;
++    }
++
+     bool
+     toggle_display_power() {
+       auto now = std::chrono::steady_clock::now();
+diff --git a/src/display_device/vdd_utils.h b/src/display_device/vdd_utils.h
+index 2570cb6aa61f203538a20aa26fcf23c01ca61add..5c6489852ece6672caac39e59fcaaf79b86aa79d 100644
+--- a/src/display_device/vdd_utils.h
++++ b/src/display_device/vdd_utils.h
+@@ -273,6 +273,16 @@ namespace display_device::vdd_utils {
+   bool
+   create_vdd_monitor_noninteractive();
+ 
++  /**
++   * @brief Normalize the active VDD desktop/source mode to the committed target mode.
++   * @details Direct VDD capture consumes the IddCx target swapchain directly and
++   *          therefore requires identity scaling between the Windows desktop source
++   *          and target signal. Cold topology activation may otherwise restore a
++   *          persisted source mode whose dimensions differ from the target mode.
++   */
++  bool
++  normalize_vdd_source_mode_for_direct_capture();
++
+   bool
+   destroy_vdd_monitor();
+ 
+diff --git a/src/main.cpp b/src/main.cpp
+index 08eba79c4f7c88ea8ee16555867f06f6fda2d331..6a65884f0f6ec05a12321348a50fe2b692e3bd55 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -32,12 +32,14 @@
+ #include "upnp.h"
+ #include "version.h"
+ #include "video.h"
++#include "video_probe.h"
+ #include "webhook/webhook.h"
+ #include "webhook/webhook_auth.h"
+ #include "ds5/config.h"
+ #include "image_enhancement/config.h"
+ 
+ #ifdef _WIN32
++  #include "display_device/vdd_utils.h"
+   #include "platform/windows/misc.h"
+   #include "platform/windows/win_dark_mode.h"
+ #endif
+@@ -158,7 +160,7 @@ mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) {
+  * never works and nobody knows why" into a timestamped line naming the phase
+  * that is stuck.
+  */
+-void
++bool
+ probe_encoders_with_watchdog() {
+   constexpr auto report_interval = 30s;
+ 
+@@ -193,6 +195,8 @@ probe_encoders_with_watchdog() {
+   else {
+     BOOST_LOG(info) << "Encoder probe completed in "sv << elapsed.count() << "ms"sv;
+   }
++
++  return !probe_failed;
+ }
+ 
+ int
+@@ -466,12 +470,6 @@ main(int argc, char *argv[]) {
+ 
+   std::unique_ptr<platf::deinit_t> mDNS;
+   std::future<void> sync_mDNS;
+-  if (config::sunshine.flags[config::flag::MDNS_BROADCAST]) {
+-    BOOST_LOG(info) << "mDNS broadcast enabled"sv;
+-    sync_mDNS = std::async(std::launch::async, [&mDNS]() {
+-      mDNS = platf::publish::start();
+-    });
+-  }
+ 
+   std::unique_ptr<platf::deinit_t> upnp_unmap;
+   auto sync_upnp = std::async(std::launch::async, [&upnp_unmap]() {
+@@ -522,11 +520,133 @@ main(int argc, char *argv[]) {
+   // so they stay behind it.
+   std::thread configThread { confighttp::start };
+ 
+-  probe_encoders_with_watchdog();
++#ifdef _WIN32
++  // Treat a literal "auto" the same as the UI/default empty value.
++  if (config::video.capture == "auto") {
++    config::video.capture.clear();
++  }
++
++  // Direct VDD capture consumes the IddCx target swapchain. Topology-only VDD
++  // activation can restore a desktop source mode with different dimensions,
++  // which is a valid scaled Windows path but invalid for our 1:1 capture path.
++  if (config::video.capture == "vdd") {
++    if (!display_device::session_t::get().is_display_on()) {
++      BOOST_LOG(info) << "[vdd] Direct capture requested; creating ZakoVDD before encoder probe"sv;
++      if (!display_device::session_t::get().create_vdd_monitor_noninteractive()) {
++        BOOST_LOG(error) << "[vdd] Failed to create ZakoVDD before encoder probe"sv;
++      }
++    }
++
++    if (display_device::session_t::get().is_display_on() &&
++        !display_device::vdd_utils::normalize_vdd_source_mode_for_direct_capture()) {
++      BOOST_LOG(error) << "[vdd] Failed to establish source=target mode before encoder probe"sv;
++    }
++  }
++
++  const bool auto_capture_requested = config::video.capture.empty();
++  const auto auto_vdd_device_id = display_device::find_device_by_friendlyname(ZAKO_NAME);
++  const bool auto_output_targets_vdd =
++    config::video.output_name == VDD_NAME ||
++    (!auto_vdd_device_id.empty() && config::video.output_name == auto_vdd_device_id);
++  const bool auto_output_is_explicit =
++    !config::video.output_name.empty() && !auto_output_targets_vdd;
++  bool auto_vdd_created = false;
++  bool auto_resolved_to_vdd = false;
++
++  const auto prepare_auto_vdd_fallback = [&]() -> bool {
++    auto &display_session = display_device::session_t::get();
++    const bool vdd_was_on = display_session.is_display_on();
++
++    if (!vdd_was_on) {
++      BOOST_LOG(info) << "[capture-auto] Standard Windows capture unavailable; creating ZakoVDD fallback"sv;
++      if (!display_session.create_vdd_monitor_noninteractive()) {
++        BOOST_LOG(warning) << "[capture-auto] ZakoVDD fallback could not be created"sv;
++        return false;
++      }
++      auto_vdd_created = true;
++    }
++    else {
++      BOOST_LOG(info) << "[capture-auto] Reusing active ZakoVDD as fallback candidate"sv;
++    }
++
++    if (!display_session.is_display_on() ||
++        !display_device::vdd_utils::normalize_vdd_source_mode_for_direct_capture()) {
++      BOOST_LOG(warning) << "[capture-auto] ZakoVDD fallback could not establish source=target mode"sv;
++      if (auto_vdd_created) {
++        display_session.destroy_vdd_monitor();
++        auto_vdd_created = false;
++      }
++      return false;
++    }
++
++    config::video.capture = "vdd";
++    auto_resolved_to_vdd = true;
++    BOOST_LOG(info) << "[capture-auto] Resolved capture backend to VDD for this Sunshine process"sv;
++    return true;
++  };
++
++  if (auto_capture_requested && auto_output_targets_vdd) {
++    BOOST_LOG(info) << "[capture-auto] Configured output is ZakoVDD; using VDD capture candidate"sv;
++    prepare_auto_vdd_fallback();
++  }
++  else if (auto_capture_requested && is_running_as_system_user && !auto_output_is_explicit) {
++    const auto ddx_capture_ready_displays = platf::display_names(platf::mem_type_e::dxgi);
++    const bool ddx_capture_ready = !ddx_capture_ready_displays.empty();
++
++    if (video::should_try_vdd_auto_fallback(
++          true,
++          false,
++          ddx_capture_ready,
++          false,
++          false)) {
++      BOOST_LOG(info) << "[capture-auto] No DDX-capable output found in service mode; trying ZakoVDD fallback"sv;
++      prepare_auto_vdd_fallback();
++    }
++  }
++#endif
++
++  [[maybe_unused]] bool encoder_probe_succeeded = probe_encoders_with_watchdog();
++
++#ifdef _WIN32
++  if (auto_capture_requested &&
++      !is_running_as_system_user &&
++      !auto_resolved_to_vdd &&
++      video::should_try_vdd_auto_fallback(
++        false,
++        auto_output_is_explicit,
++        false,
++        true,
++        encoder_probe_succeeded)) {
++    BOOST_LOG(info) << "[capture-auto] DDX/WGC probe failed in interactive mode; trying ZakoVDD fallback"sv;
++    if (prepare_auto_vdd_fallback()) {
++      encoder_probe_succeeded = probe_encoders_with_watchdog();
++    }
++  }
++
++  if (auto_capture_requested && auto_resolved_to_vdd && !encoder_probe_succeeded) {
++    BOOST_LOG(warning) << "[capture-auto] VDD fallback probe failed; restoring Auto capture state"sv;
++    config::video.capture.clear();
++    auto_resolved_to_vdd = false;
++    if (auto_vdd_created) {
++      display_device::session_t::get().destroy_vdd_monitor();
++      auto_vdd_created = false;
++    }
++  }
++#endif
+ 
+   std::thread httpThread { nvhttp::start };
+   std::thread rtspThread { rtsp_stream::start };
+ 
++  // Moonlight requests /serverinfo immediately after mDNS discovery. Advertise
++  // only after the GameStream server threads have been started so a slow graphics
++  // probe cannot publish a host whose advertised HTTP endpoint is not listening.
++  if (config::sunshine.flags[config::flag::MDNS_BROADCAST]) {
++    BOOST_LOG(info) << "mDNS broadcast enabled"sv;
++    sync_mDNS = std::async(std::launch::async, [&mDNS]() {
++      mDNS = platf::publish::start();
++    });
++  }
++
+ #if defined(_WIN32) && defined(SUNSHINE_GUI_TRAY) && SUNSHINE_GUI_TRAY >= 1
+   // The service wrapper owns user-session agent startup in service mode.
+   // Standalone and portable runs need to reconcile the same bundled agent here.
+diff --git a/src/nvhttp_stream_start.cpp b/src/nvhttp_stream_start.cpp
+index 6666d371f96cfffc4d17b40b5a28dd695a52d2eb..d683ead6ac10270f197627ab4a4f476eeb7ca63c 100644
+--- a/src/nvhttp_stream_start.cpp
++++ b/src/nvhttp_stream_start.cpp
+@@ -21,6 +21,7 @@
+ #include "logging.h"
+ #include "touch_keyboard_session.h"
+ #include "video.h"
++#include "vdd_capture_recovery.h"
+ 
+ #include <algorithm>
+ 
+@@ -485,6 +486,9 @@ namespace nvhttp::stream_start {
+ 
+       const auto original_display_result = display_result;
+       const auto original_probe_result = video::last_encoder_probe_result;
++      // A late VDD recovery must probe VDD, even when the startup probe restored
++      // Auto. Commit the process preference only when recovery succeeds.
++      video::vdd_capture_recovery_t capture_recovery {config::video.capture, rtsp_stream::session_count() == 0};
+       rtsp_stream::launch_session_t recovery_session {};
+       fill_vdd_recovery_session(recovery_session, launch_session);
+ 
+@@ -501,6 +505,7 @@ namespace nvhttp::stream_start {
+               probe_matches_display_state,
+               true)) {
+           commit_vdd_recovery_to_launch_session(launch_session, recovery_session);
++          capture_recovery.commit();
+           recovery_result.succeeded = true;
+           recovery_result.detail = "A VDD-backed display became available after a short retry and encoder probing succeeded.";
+           BOOST_LOG(info) << "Recovered stream startup by preparing a VDD-backed display after a deferred retry";
+@@ -535,6 +540,7 @@ namespace nvhttp::stream_start {
+ 
+       if (!video::probe_encoders(make_vdd_probe_target())) {
+         commit_vdd_recovery_to_launch_session(launch_session, recovery_session);
++        capture_recovery.commit();
+         recovery_result.succeeded = true;
+         recovery_result.detail = "A VDD-backed display became available and encoder probing succeeded.";
+         BOOST_LOG(info) << "Recovered stream startup by preparing a VDD-backed display";
+diff --git a/src/platform/windows/display_base.cpp b/src/platform/windows/display_base.cpp
+index 0c29d4cebd71f0e0ff03e2e95dff8d603c54c213..2355df4db32bba553f944d50b6b01dbfdcc874fa 100644
+--- a/src/platform/windows/display_base.cpp
++++ b/src/platform/windows/display_base.cpp
+@@ -632,6 +632,16 @@ namespace platf::dxgi {
+     const bool is_rdp_session = !is_running_as_system_user && display_device::w_utils::is_any_rdp_session_active();
+     auto output_name = is_rdp_session ? std::wstring {} : from_utf8(display_name);
+     display_device_name.clear();
++    // Match the backend selected for this display, including a session override.
++    const auto &capture_backend = config.capture_backend_override.empty() ? config::video.capture : config.capture_backend_override;
++    const bool direct_vdd_capture = capture_backend == "vdd";
++    std::wstring vdd_output_name;
++    if (direct_vdd_capture) {
++      const auto vdd_device_id = display_device::find_device_by_friendlyname(ZAKO_NAME);
++      if (!vdd_device_id.empty()) {
++        vdd_output_name = from_utf8(display_device::get_display_name(vdd_device_id));
++      }
++    }
+ 
+     if (is_rdp_session) {
+       BOOST_LOG(info) << "[Display Init] RDP session detected - using first available RDP virtual display";
+@@ -660,31 +670,72 @@ namespace platf::dxgi {
+         adapter_name.clear();
+       }
+ 
+-      for (int x = 0; factory->EnumAdapters1(x, &adapter_p) != DXGI_ERROR_NOT_FOUND; ++x) {
++      for (UINT x = 0; ; ++x) {
++        adapter_p = nullptr;
++        status = factory->EnumAdapters1(x, &adapter_p);
++        if (status == DXGI_ERROR_NOT_FOUND) {
++          break;
++        }
++        if (FAILED(status) || !adapter_p) {
++          BOOST_LOG(error) << "[Display Init] Adapter enumeration failed [0x"sv << util::hex(status).to_string_view() << ']';
++          return -1;
++        }
+         dxgi::adapter_t adapter_tmp { adapter_p };
+ 
+         DXGI_ADAPTER_DESC1 adapter_desc;
+-        adapter_tmp->GetDesc1(&adapter_desc);
++        status = adapter_tmp->GetDesc1(&adapter_desc);
++        if (FAILED(status)) {
++          BOOST_LOG(error) << "[Display Init] Adapter description failed [0x"sv << util::hex(status).to_string_view() << ']';
++          return -1;
++        }
+ 
+         if (!adapter_name.empty() && adapter_desc.Description != adapter_name) {
+           continue;
+         }
+ 
+-        dxgi::output_t::pointer output_p;
+-        for (int y = 0; adapter_tmp->EnumOutputs(y, &output_p) != DXGI_ERROR_NOT_FOUND; ++y) {
++        for (UINT y = 0; ; ++y) {
++          dxgi::output_t::pointer output_p {};
++          status = adapter_tmp->EnumOutputs(y, &output_p);
++          if (status == DXGI_ERROR_NOT_FOUND) {
++            break;
++          }
++          if (FAILED(status) || !output_p) {
++            BOOST_LOG(error) << "[Display Init] Output enumeration failed [0x"sv << util::hex(status).to_string_view() << ']';
++            return -1;
++          }
+           dxgi::output_t output_tmp { output_p };
+ 
+           DXGI_OUTPUT_DESC desc;
+-          output_tmp->GetDesc(&desc);
++          status = output_tmp->GetDesc(&desc);
++          if (FAILED(status)) {
++            BOOST_LOG(error) << "[Display Init] Output description failed [0x"sv << util::hex(status).to_string_view() << ']';
++            return -1;
++          }
+ 
+           if (!is_rdp_session && !output_name.empty() && desc.DeviceName != output_name) {
+             continue;
+           }
++          if (direct_vdd_capture &&
++              output_name.empty() &&
++              !vdd_output_name.empty() &&
++              desc.DeviceName != vdd_output_name) {
++            continue;
++          }
+ 
++          const bool is_selected_vdd_output =
++            direct_vdd_capture &&
++            !vdd_output_name.empty() &&
++            desc.DeviceName == vdd_output_name;
+           const bool output_accepted = is_rdp_session ||
+-                                       (desc.AttachedToDesktop && test_dxgi_duplication(adapter_tmp, output_tmp, false));
++                                       (desc.AttachedToDesktop &&
++                                        (is_selected_vdd_output ||
++                                         test_dxgi_duplication(adapter_tmp, output_tmp, false)));
+ 
+           if (output_accepted) {
++            if (is_selected_vdd_output) {
++              BOOST_LOG(info) << "[vdd] Selected ZakoVDD output without requiring DXGI Desktop Duplication: "
++                              << to_utf8(desc.DeviceName);
++            }
+             BOOST_LOG(is_rdp_session ? info : debug) << "[Display Init] Selected display: " << to_utf8(desc.DeviceName);
+ 
+             output = std::move(output_tmp);
+@@ -1357,6 +1408,14 @@ namespace platf {
+   std::vector<std::string>
+   display_names(mem_type_e) {
+     std::vector<std::string> display_names;
++    const bool direct_vdd_capture = config::video.capture == "vdd";
++    std::string vdd_output_name;
++    if (direct_vdd_capture) {
++      const auto vdd_device_id = display_device::find_device_by_friendlyname(ZAKO_NAME);
++      if (!vdd_device_id.empty()) {
++        vdd_output_name = display_device::get_display_name(vdd_device_id);
++      }
++    }
+ 
+     HRESULT status;
+ 
+@@ -1376,8 +1435,16 @@ namespace platf {
+       return {};
+     }
+ 
+-    dxgi::adapter_t::pointer adapter_p;
+-    for (int x = 0; factory->EnumAdapters1(x, &adapter_p) != DXGI_ERROR_NOT_FOUND; ++x) {
++    for (UINT x = 0; ; ++x) {
++      dxgi::adapter_t::pointer adapter_p {};
++      status = factory->EnumAdapters1(x, &adapter_p);
++      if (status == DXGI_ERROR_NOT_FOUND) {
++        break;
++      }
++      if (FAILED(status) || !adapter_p) {
++        BOOST_LOG(error) << "DXGI adapter enumeration failed [0x"sv << util::hex(status).to_string_view() << ']';
++        return {};
++      }
+       dxgi::adapter_t adapter { adapter_p };
+       DXGI_ADAPTER_DESC1 adapter_desc;
+       adapter->GetDesc1(&adapter_desc);
+@@ -1392,8 +1459,16 @@ namespace platf {
+         << ",Device Sys Mem: "sv << adapter_desc.DedicatedSystemMemory / 1048576 << " MiB"sv
+         << ",Share Sys Mem: "sv << adapter_desc.SharedSystemMemory / 1048576 << " MiB"sv;
+ 
+-      dxgi::output_t::pointer output_p {};
+-      for (int y = 0; adapter->EnumOutputs(y, &output_p) != DXGI_ERROR_NOT_FOUND; ++y) {
++      for (UINT y = 0; ; ++y) {
++        dxgi::output_t::pointer output_p {};
++        status = adapter->EnumOutputs(y, &output_p);
++        if (status == DXGI_ERROR_NOT_FOUND) {
++          break;
++        }
++        if (FAILED(status) || !output_p) {
++          BOOST_LOG(error) << "DXGI output enumeration failed [0x"sv << util::hex(status).to_string_view() << ']';
++          return {};
++        }
+         dxgi::output_t output { output_p };
+ 
+         DXGI_OUTPUT_DESC desc;
+@@ -1415,7 +1490,22 @@ namespace platf {
+ 
+         bool can_capture = false;
+ 
+-        if (is_rdp) {
++        const bool is_selected_vdd_output =
++          direct_vdd_capture &&
++          !vdd_output_name.empty() &&
++          device_name == vdd_output_name;
++
++        if (is_selected_vdd_output && desc.AttachedToDesktop) {
++          can_capture = true;
++          BOOST_LOG(debug) << "[Display] Accepting ZakoVDD output without a DXGI Desktop Duplication test: "
++                           << device_name;
++        }
++        else if (direct_vdd_capture && !vdd_output_name.empty()) {
++          BOOST_LOG(debug) << "[Display] Skipping non-ZakoVDD output while direct VDD capture is configured: "
++                           << device_name;
++          continue;
++        }
++        else if (is_rdp) {
+           // In RDP, accept any enumerated output regardless of AttachedToDesktop status
+           // Virtual displays may not report this correctly
+           can_capture = true;
+@@ -1459,8 +1549,16 @@ namespace platf {
+       return {};
+     }
+ 
+-    dxgi::adapter_t::pointer adapter_p;
+-    for (int x = 0; factory->EnumAdapters1(x, &adapter_p) != DXGI_ERROR_NOT_FOUND; ++x) {
++    for (UINT x = 0; ; ++x) {
++      dxgi::adapter_t::pointer adapter_p {};
++      status = factory->EnumAdapters1(x, &adapter_p);
++      if (status == DXGI_ERROR_NOT_FOUND) {
++        break;
++      }
++      if (FAILED(status) || !adapter_p) {
++        BOOST_LOG(error) << "DXGI adapter enumeration failed [0x"sv << util::hex(status).to_string_view() << ']';
++        return {};
++      }
+       dxgi::adapter_t adapter { adapter_p };
+       DXGI_ADAPTER_DESC1 adapter_desc;
+       adapter->GetDesc1(&adapter_desc);
+diff --git a/src/platform/windows/display_vdd.cpp b/src/platform/windows/display_vdd.cpp
+index 029edbef09d1ec7756cc8245c68eb7cc9a1ee278..a1d1ddd6b390d16fb0c6b9257fdb8981ad952b44 100644
+--- a/src/platform/windows/display_vdd.cpp
++++ b/src/platform/windows/display_vdd.cpp
+@@ -1204,13 +1204,20 @@ namespace platf::dxgi {
+                                  const display_device::vdd_ioctl::frame_channel_caps &sealed_caps,
+                                  unsigned int target_w,
+                                  unsigned int target_h,
+-                                 unsigned int max_probe) {
++                                 unsigned int max_probe,
++                                 bool report_failures = false) {
+     vdd_probe_result_t result;
+ 
+     const UINT32 desired_slots = std::min<UINT32>(vdd_frame_channel::max_shared_slots, sealed_caps.max_shared_slots);
+     for (unsigned int i = 0; i < max_probe; ++i) {
+       display_device::vdd_ioctl::frame_channel_open_response sealed_channel;
+-      const auto open_status = open_sealed_frame_channel(i, device_luid, desired_slots, sealed_channel, false);
++      const auto open_status = open_sealed_frame_channel(i, device_luid, desired_slots, sealed_channel, report_failures);
++      if (report_failures) {
++        BOOST_LOG(warning) << "[vdd] producer discovery: monitor="sv << i
++                           << " status="sv << display_device::vdd_ioctl::frame_channel_open_status_name(open_status)
++                           << " target="sv << target_w << 'x' << target_h
++                           << " device_luid="sv << device_luid.LowPart << ':' << device_luid.HighPart;
++      }
+       if (open_status == display_device::vdd_ioctl::frame_channel_open_status::unsupported ||
+           open_status == display_device::vdd_ioctl::frame_channel_open_status::interface_missing) {
+         close_sealed_frame_channel_handles(sealed_channel);
+@@ -1245,6 +1252,13 @@ namespace platf::dxgi {
+       UnmapViewOfFile(p_meta);
+       close_sealed_frame_channel_handles(sealed_channel);
+       if (!valid) {
++        if (report_failures) {
++          BOOST_LOG(warning) << "[vdd] producer metadata rejected: monitor="sv << i
++                             << " stable="sv << stable << " reason="sv << static_cast<int>(validation.reason)
++                             << " producer_luid="sv << meta_snapshot.AdapterLuidLowPart << ':' << meta_snapshot.AdapterLuidHighPart
++                             << " size="sv << meta_snapshot.Width << 'x' << meta_snapshot.Height
++                             << " metadata_size="sv << meta_snapshot.MetadataSize;
++        }
+         BOOST_LOG(debug) << "[vdd] sealed probe rejected monitor "sv << i
+                          << " stable="sv << stable
+                          << " reason="sv << static_cast<int>(validation.reason);
+@@ -1336,8 +1350,9 @@ namespace platf::dxgi {
+     vdd_probe_result_t last_result;
+     const auto deadline = deadline_override.value_or(std::chrono::steady_clock::now() + vdd_producer_discovery_window);
+ 
++    bool report_failures = false;
+     for (;;) {
+-      last_result = probe_sealed_vdd_monitor_index(*device_luid, sealed_caps, target_w, target_h, max_probe);
++      last_result = probe_sealed_vdd_monitor_index(*device_luid, sealed_caps, target_w, target_h, max_probe, report_failures);
+       const auto selection = vdd_frame_channel::select_producer(
+         last_result.exact,
+         last_result.only_valid,
+@@ -1357,9 +1372,14 @@ namespace platf::dxgi {
+         return selection;
+       }
+ 
+-      if (std::chrono::steady_clock::now() >= deadline) {
++      if (report_failures) {
+         break;
+       }
++      if (std::chrono::steady_clock::now() >= deadline) {
++        // Report one final probe instead of flooding the log on every retry.
++        report_failures = true;
++        continue;
++      }
+ 
+       std::this_thread::sleep_for(vdd_producer_discovery_retry_delay);
+     }
+@@ -1379,6 +1399,18 @@ namespace platf::dxgi {
+ 
+   int
+   display_vdd_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
++    // Direct VDD selection bypasses the DDX retry that normally wakes the
++    // display. After idle power-off, IddCx exposes the output but publishes no
++    // frame channel until the interactive session's display is awake again.
++    // This one-shot request resets the idle timer without changing persistent
++    // thread execution flags or the user's display-sleep policy.
++    if (!SetThreadExecutionState(ES_DISPLAY_REQUIRED)) {
++      BOOST_LOG(warning) << "[vdd] Failed to reset display idle timer before producer discovery"sv;
++    }
++    else {
++      BOOST_LOG(info) << "[vdd] Display wake requested before producer discovery"sv;
++    }
++
+     if (display_base_t::init(config, display_name)) {
+       BOOST_LOG(error) << "[vdd] display_base_t::init failed for "sv << display_name;
+       return -1;
+diff --git a/src/vdd_capture_recovery.h b/src/vdd_capture_recovery.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..5723ab9512861747c1ea52d846015a66e06f02b9
+--- /dev/null
++++ b/src/vdd_capture_recovery.h
+@@ -0,0 +1,39 @@
++#pragma once
++
++#include <string>
++
++namespace video {
++
++  // Used by serialized launch preparation, before an active capture session.
++  // Persist an Auto -> VDD decision only after display and encoder validation.
++  class vdd_capture_recovery_t {
++  public:
++    explicit vdd_capture_recovery_t(std::string &capture, bool may_change = true):
++        capture_ {capture}, original_ {capture},
++        changed_ {may_change && (capture.empty() || capture == "auto")} {
++      if (changed_) {
++        capture_ = "vdd";
++      }
++    }
++
++    ~vdd_capture_recovery_t() {
++      if (changed_ && !committed_) {
++        capture_.swap(original_);
++      }
++    }
++
++    vdd_capture_recovery_t(const vdd_capture_recovery_t &) = delete;
++    vdd_capture_recovery_t &operator=(const vdd_capture_recovery_t &) = delete;
++
++    void commit() noexcept {
++      committed_ = true;
++    }
++
++  private:
++    std::string &capture_;
++    std::string original_;
++    bool changed_;
++    bool committed_ = false;
++  };
++
++}  // namespace video
+diff --git a/src/video.cpp b/src/video.cpp
+index dae6cc0fa80b5572b4b0c0c2e372cf141c516264..e1fcf32a4ea7aade682abf30f48ec893a90f1f97 100644
+--- a/src/video.cpp
++++ b/src/video.cpp
+@@ -68,17 +68,10 @@ namespace video {
+ 
+     std::optional<std::string>
+     capture_override_for_encoder_probe() {
+-#ifdef _WIN32
+-      // VDD shared-texture producer may not be ready (metadata mapping / KeyedMutex
+-      // not yet published) at encoder-probe time. Probing the real VDD backend
+-      // therefore tends to fail on cold start, even though runtime capture works
+-      // fine once the producer comes up. Fall back to ddx for the probe only;
+-      // this override is injected per-display via config_t::capture_backend_override
+-      // so it does not mutate the global config::video.capture used at runtime.
+-      if (config::video.capture == "vdd") {
+-        return std::string { "ddx" };
+-      }
+-#endif
++      // An explicitly configured VDD backend must be probed through VDD itself.
++      // Hyper-V GPU-PV can expose a working ZakoVDD shared-texture producer while
++      // DXGI Desktop Duplication is unavailable, so substituting DDX here makes
++      // the probe reject the only capture path that can actually work.
+       return std::nullopt;
+     }
+ 
+diff --git a/src/video_probe.h b/src/video_probe.h
+index 98eaee58274eb19f81ef082583bacd2acf203669..11e2b728e77d2c43f3d308d1be848dd7c1070c57 100644
+--- a/src/video_probe.h
++++ b/src/video_probe.h
+@@ -23,4 +23,26 @@ namespace video {
+     return {};
+   }
+ 
++  inline bool
++  should_try_vdd_auto_fallback(
++    bool running_as_system,
++    bool output_is_explicit,
++    bool ddx_capture_ready,
++    bool standard_probe_finished,
++    bool standard_probe_succeeded) {
++    if (output_is_explicit) {
++      return false;
++    }
++
++    if (running_as_system) {
++      // WGC is unavailable in service mode. If no output passed the DDX
++      // preflight, VDD is the only remaining Windows capture path.
++      return !ddx_capture_ready;
++    }
++
++    // In an interactive session, preserve the existing DDX -> WGC order first.
++    // Only try VDD after that complete standard probe has actually failed.
++    return standard_probe_finished && !standard_probe_succeeded;
++  }
++
+ }  // namespace video
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index ad0586d50830b3cb080112bfcee96c4c629eea31..b65df060dfe00790ebd4ebd7686ee4806a7427cf 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -606,7 +606,8 @@ target_compile_options(${PROJECT_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSH
+ target_link_options(${PROJECT_NAME} PRIVATE)
+ 
+ # Bound hardware and network waits in the aggregate suite.
+-add_test(NAME ${PROJECT_NAME} COMMAND ${PROJECT_NAME})
++add_test(NAME ${PROJECT_NAME}
++        COMMAND ${PROJECT_NAME} --gtest_output=xml:${CMAKE_CURRENT_BINARY_DIR}/test_sunshine.xml)
+ set_tests_properties(${PROJECT_NAME} PROPERTIES TIMEOUT 600)
+ 
+ add_executable(abr_unit_tests
+diff --git a/tests/unit/test_vdd_capture_recovery.cpp b/tests/unit/test_vdd_capture_recovery.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a44ed92bc3825d72e7a30b06532984c7d0c981a1
+--- /dev/null
++++ b/tests/unit/test_vdd_capture_recovery.cpp
+@@ -0,0 +1,45 @@
++#include <src/vdd_capture_recovery.h>
++
++#include <gtest/gtest.h>
++#include <stdexcept>
++
++TEST(VddCaptureRecovery, FailedRecoveryRestoresEmptyAuto) {
++  std::string capture;
++  { video::vdd_capture_recovery_t recovery {capture}; EXPECT_EQ(capture, "vdd"); }
++  EXPECT_TRUE(capture.empty());
++}
++
++TEST(VddCaptureRecovery, FailedRecoveryPreservesLiteralAuto) {
++  std::string capture = "auto";
++  { video::vdd_capture_recovery_t recovery {capture}; EXPECT_EQ(capture, "vdd"); }
++  EXPECT_EQ(capture, "auto");
++}
++
++TEST(VddCaptureRecovery, SuccessfulRecoveryKeepsTheValidatedBackend) {
++  std::string capture;
++  { video::vdd_capture_recovery_t recovery {capture}; recovery.commit(); }
++  EXPECT_EQ(capture, "vdd");
++}
++
++TEST(VddCaptureRecovery, ExplicitCaptureChoicesArePreserved) {
++  for (const auto *backend : {"ddx", "wgc", "vdd"}) {
++    std::string capture = backend;
++    { video::vdd_capture_recovery_t recovery {capture}; EXPECT_EQ(capture, backend); recovery.commit(); }
++    EXPECT_EQ(capture, backend);
++  }
++}
++
++TEST(VddCaptureRecovery, ExceptionRestoresTheOriginalPreference) {
++  std::string capture = "auto";
++  try {
++    video::vdd_capture_recovery_t recovery {capture};
++    throw std::runtime_error("simulated display preparation failure");
++  } catch (const std::runtime_error &) { }
++  EXPECT_EQ(capture, "auto");
++}
++
++TEST(VddCaptureRecovery, ActiveCaptureDoesNotChangeThePreference) {
++  std::string capture;
++  { video::vdd_capture_recovery_t recovery {capture, false}; EXPECT_TRUE(capture.empty()); recovery.commit(); }
++  EXPECT_TRUE(capture.empty());
++}
+diff --git a/tests/unit/test_vdd_display_intent.cpp b/tests/unit/test_vdd_display_intent.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..4e1f2aa1479a15b65f436daf24c9698fe47bc468
+--- /dev/null
++++ b/tests/unit/test_vdd_display_intent.cpp
+@@ -0,0 +1,111 @@
++#ifdef _WIN32
++#include <src/config.h>
++#include <src/display_device/parsed_config.h>
++#include <src/display_device/vdd_output_state.h>
++#include <src/globals.h>
++#include <src/rtsp.h>
++#include <gtest/gtest.h>
++
++TEST(VddDisplayIntent, AutomaticOutputFollowsTheResolvedVddBackend) {
++  auto config = config::video;
++  config.capture = "vdd";
++  config.output_name.clear();
++  rtsp_stream::launch_session_t session {};
++  const auto intent = display_device::resolve_display_intent(config, session);
++  EXPECT_EQ(intent.target, display_device::display_intent_t::target_e::vdd);
++  EXPECT_FALSE(intent.user_named_display);
++}
++
++TEST(VddDisplayIntent, UnresolvedAutoKeepsTheUpstreamPhysicalDefault) {
++  auto config = config::video;
++  config.capture.clear();
++  config.output_name.clear();
++  rtsp_stream::launch_session_t session {};
++  EXPECT_EQ(display_device::resolve_display_intent(config, session).target,
++            display_device::display_intent_t::target_e::physical);
++}
++
++TEST(VddDisplayIntent, ClientDisplaySelectionIsNeverImplicitlyReplacedByVdd) {
++  auto config = config::video;
++  config.capture = "vdd";
++  config.output_name.clear();
++  rtsp_stream::launch_session_t session {};
++  session.env["SUNSHINE_CLIENT_DISPLAY_NAME"] = "nonexistent-client-physical-display";
++  const auto intent = display_device::resolve_display_intent(config, session);
++  EXPECT_NE(intent.target, display_device::display_intent_t::target_e::vdd);
++  EXPECT_TRUE(intent.user_named_display);
++  EXPECT_EQ(intent.device_id, "nonexistent-client-physical-display");
++}
++
++TEST(VddDisplayIntent, HostDisplaySelectionKeepsTheUpstreamResolutionPolicy) {
++  auto config = config::video;
++  config.capture = "vdd";
++  config.output_name = "nonexistent-host-physical-display";
++  rtsp_stream::launch_session_t session {};
++  EXPECT_NE(display_device::resolve_display_intent(config, session).target,
++            display_device::display_intent_t::target_e::vdd);
++}
++
++TEST(VddDisplayIntent, ClientCanStillExplicitlyRequestTheVddAlias) {
++  auto config = config::video;
++  config.capture.clear();
++  config.output_name = "physical-display";
++  rtsp_stream::launch_session_t session {};
++  session.env["SUNSHINE_CLIENT_DISPLAY_NAME"] = VDD_NAME;
++  EXPECT_EQ(display_device::resolve_display_intent(config, session).target,
++            display_device::display_intent_t::target_e::vdd);
++}
++TEST(VddDisplayIntent, AutoOutputIsRestoredForTheNextVddSession) {
++  auto config = config::video;
++  config.capture = "vdd";
++  config.output_name.clear();
++  display_device::vdd_output_state_t original;
++  ASSERT_TRUE(original.remember(config.output_name));
++  config.output_name = "destroyed-vdd-device-id";
++
++  ASSERT_TRUE(original.restore(config.output_name));
++  EXPECT_TRUE(config.output_name.empty());
++  const auto next = display_device::resolve_display_intent(config, {});
++  EXPECT_EQ(next.target, display_device::display_intent_t::target_e::vdd);
++  EXPECT_FALSE(next.user_named_display);
++}
++
++TEST(VddOutputState, ReconfigurationPreservesTheFirstEmptyAutoSelection) {
++  display_device::vdd_output_state_t original;
++  std::string output;
++  ASSERT_TRUE(original.remember(output));
++  output = "first-vdd";
++  EXPECT_FALSE(original.remember(output));
++  output = "replacement-vdd";
++  ASSERT_TRUE(original.restore(output));
++  EXPECT_TRUE(output.empty());
++}
++
++TEST(VddOutputState, RestoresExplicitSelectionAndConsumesTheSnapshot) {
++  display_device::vdd_output_state_t original;
++  std::string output = "user-selected-physical-display";
++  ASSERT_TRUE(original.remember(output));
++  output = "temporary-vdd";
++  ASSERT_TRUE(original.restore(output));
++  EXPECT_EQ(output, "user-selected-physical-display");
++
++  output = "later-user-selection";
++  EXPECT_FALSE(original.restore(output));
++  EXPECT_EQ(output, "later-user-selection");
++}
++
++TEST(VddOutputState, ANewSessionCanSaveAutoAfterAnExplicitSelection) {
++  display_device::vdd_output_state_t original;
++  std::string output = "first-user-selection";
++  ASSERT_TRUE(original.remember(output));
++  output = "first-vdd";
++  ASSERT_TRUE(original.restore(output));
++
++  output.clear();
++  ASSERT_TRUE(original.remember(output));
++  output = "second-vdd";
++  ASSERT_TRUE(original.restore(output));
++  EXPECT_TRUE(output.empty());
++}
++
++#endif
+diff --git a/tests/unit/test_video.cpp b/tests/unit/test_video.cpp
+index 2beefd07d68fa82820b68060a183569654bca25f..2b3dd683e98c2e7e10918baf9a3ca0feaddac46c 100644
+--- a/tests/unit/test_video.cpp
++++ b/tests/unit/test_video.cpp
+@@ -11,6 +11,9 @@
+ 
+ #include <algorithm>
+ #include <limits>
++#ifdef _WIN32
++  #include <windows.h>
++#endif
+ 
+ namespace {
+ 
+@@ -241,6 +244,12 @@ INSTANTIATE_TEST_SUITE_P(
+   [](const auto &info) { return std::string(info.param->name); });
+ 
+ TEST_P(EncoderTest, ValidateEncoder) {
++#ifdef _WIN32
++  DWORD session_id = 0;
++  if (ProcessIdToSessionId(GetCurrentProcessId(), &session_id) && session_id == 0) {
++    GTEST_SKIP() << "Hardware desktop capture requires an interactive Windows session; Session 0 cannot enumerate DXGI outputs";
++  }
++#endif
+   auto &encoder = *GetParam();
+   const auto probe_display_name = display_device::get_display_name(config::video.output_name);
+   const bool available = video::validate_encoder(encoder, false, std::nullopt, probe_display_name);
+@@ -286,3 +295,27 @@ TEST(HdrPipelineStatus, LiveControlsValidateAndPreserveNewerRequests) {
+   EXPECT_FLOAT_EQ(video::requested_nr_settings(id)->intensity, 0.5f);
+   video::unregister_hdr_pipeline_status(id);
+ }
++
++#ifdef _WIN32
++// EnumOutputs is documented to return NOT_CURRENTLY_AVAILABLE in Session 0.
++// Exercise the real failure path so a capture probe cannot dereference its output.
++TEST_F(PlatformTestSuite, SessionZeroDxgiCaptureReturnsUnavailable) {
++  DWORD session_id = 0;
++  ASSERT_TRUE(ProcessIdToSessionId(GetCurrentProcessId(), &session_id));
++  if (session_id != 0) {
++    GTEST_SKIP() << "This regression requires Session 0";
++  }
++  video::config_t config {1920, 1080, 60, 1000, 1, 1, 1, 0, 0, 0, 0};
++  config.capture_backend_override = "ddx";
++  EXPECT_EQ(platf::display(platf::mem_type_e::dxgi, {}, config), nullptr);
++}
++
++TEST_F(PlatformTestSuite, SessionZeroDxgiDisplayEnumerationReturnsEmpty) {
++  DWORD session_id = 0;
++  ASSERT_TRUE(ProcessIdToSessionId(GetCurrentProcessId(), &session_id));
++  if (session_id != 0) {
++    GTEST_SKIP() << "This regression requires Session 0";
++  }
++  EXPECT_TRUE(platf::display_names(platf::mem_type_e::dxgi).empty());
++}
++#endif
+diff --git a/tests/unit/test_video_probe.cpp b/tests/unit/test_video_probe.cpp
+index 24d155cfbe3bf09a95af840f9576e8b37f7fed05..4711e398b38bd59398ed6b1360cdb2d4f0e8f78a 100644
+--- a/tests/unit/test_video_probe.cpp
++++ b/tests/unit/test_video_probe.cpp
+@@ -26,3 +26,28 @@ TEST(VideoProbe, EmptyCaptureReadyListUsesBackendAutoselection) {
+   const std::array<std::string, 0> displays {};
+   EXPECT_TRUE(video::select_encoder_probe_display(R"(\\.\DISPLAY18)", displays).empty());
+ }
++
++TEST(VideoProbe, AutoServiceUsesVddWhenDdxIsUnavailable) {
++  EXPECT_TRUE(video::should_try_vdd_auto_fallback(true, false, false, false, false));
++}
++
++TEST(VideoProbe, AutoServiceKeepsDdxWhenCaptureIsReady) {
++  EXPECT_FALSE(video::should_try_vdd_auto_fallback(true, false, true, false, false));
++}
++
++TEST(VideoProbe, AutoInteractiveWaitsForStandardProbe) {
++  EXPECT_FALSE(video::should_try_vdd_auto_fallback(false, false, false, false, false));
++}
++
++TEST(VideoProbe, AutoInteractiveUsesVddAfterStandardProbeFails) {
++  EXPECT_TRUE(video::should_try_vdd_auto_fallback(false, false, false, true, false));
++}
++
++TEST(VideoProbe, AutoInteractiveKeepsStandardCaptureAfterProbeSucceeds) {
++  EXPECT_FALSE(video::should_try_vdd_auto_fallback(false, false, false, true, true));
++}
++
++TEST(VideoProbe, ExplicitOutputDisablesAutomaticVddSwitch) {
++  EXPECT_FALSE(video::should_try_vdd_auto_fallback(true, true, false, false, false));
++  EXPECT_FALSE(video::should_try_vdd_auto_fallback(false, true, false, true, false));
++}

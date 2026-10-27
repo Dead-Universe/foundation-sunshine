@@ -1,0 +1,96 @@
+{
+  "SchemaVersion": 1,
+  "UpstreamRepository": "https://github.com/AlkaidLab/foundation-sunshine",
+  "BaseRevision": "880f1efed6bd0c18871a78d0f61185a7381cda5f",
+  "MaintenanceRevision": "051349744dc98e91368e3a8f6562a4f037c4b241",
+  "ExpectedTreeSHA1": "c9cb8e9bb68faa49825274c6d686e83be27ca6d0",
+  "ApplyInOrder": [
+    {
+      "Path": "0001-hyperv-vdd-capture-recovery.patch",
+      "SHA256": "01D69DA48C095CAB31C5A5E6FAED74F94A569B1007C90687252B3DDDEF3FEBE5"
+    },
+    {
+      "Path": "0002-nvenc-delayed-completion.patch",
+      "SHA256": "5BF614DCF475A592059B05B885B3720CA37CFB083C9193A6A4C61562C70B3C1D"
+    },
+    {
+      "Path": "0003-hyperv-console-continuity.patch",
+      "SHA256": "BA8F3848A794D2C80423DB04C7A7A360C7865E6ED2073692B2215B28BEAC5244"
+    },
+    {
+      "Path": "0004-offline-vbcable-installer.patch",
+      "SHA256": "2801D8B9CF1148A0F351E699CDB1F727E9F48E54413DD03501FAD3D81B06D050"
+    }
+  ],
+  "HostUpstreamSnapshotPatched": false,
+  "Policy": "Independent upstream-first patches grouped by concern; source and runtime unchanged by consolidation.",
+  "Consolidation": {
+    "Count": 4,
+    "Date": "2026-10-27",
+    "PreviousCount": 9,
+    "DeletedObsolete": [
+      "0009-persistent-vdd-console-session.patch",
+      "0010-retain-only-active-console-stream.patch",
+      "withdrawn/0009-recoverable-console-handoff.patch",
+      "moonlight/withdrawn/0003-pull-decoder-reconnect-readiness.patch"
+    ],
+    "Groups": [
+      {
+        "Path": "0001-hyperv-vdd-capture-recovery.patch",
+        "Replaces": [
+          "0001-hyperv-vdd-capture.patch",
+          "0002-dxgi-enumeration-failure.patch",
+          "0003-vdd-producer-diagnostics.patch",
+          "0004-vdd-capture-display-recovery.patch",
+          "0006-vdd-display-idle-wake.patch",
+          "0007-vdd-restore-auto-output.patch"
+        ]
+      },
+      {
+        "Path": "0002-nvenc-delayed-completion.patch",
+        "Replaces": [
+          "0005-nvenc-delayed-completion.patch"
+        ]
+      },
+      {
+        "Path": "0003-hyperv-console-continuity.patch",
+        "Replaces": [
+          "0009-persistent-service-vdd.patch"
+        ]
+      },
+      {
+        "Path": "0004-offline-vbcable-installer.patch",
+        "Replaces": [
+          "0008-offline-vbcable-installer.patch"
+        ]
+      }
+    ],
+    "EquivalentTreeVerified": true
+  },
+  "Validation": {
+    "TemporaryIndexReplayPassed": true,
+    "NativeCTest": {
+      "Disabled": 0,
+      "Tests": 34,
+      "Failures": 0
+    },
+    "SourceRevisionUnchanged": true,
+    "RuntimeAcceptance": "Existing limited media acceptance of identical source retained",
+    "FullStabilityValidated": false,
+    "AggregateTests": 569,
+    "RuntimeBinaryUnchanged": true,
+    "Skipped": 21,
+    "PerformanceTargetValidated": false,
+    "ResultTree": "c9cb8e9bb68faa49825274c6d686e83be27ca6d0"
+  },
+  "Publication": {
+    "Sunshine": "051349744dc98e91368e3a8f6562a4f037c4b241",
+    "Branch": "maintenance/hyperv-win11-20261027",
+    "Moonlight": "160246b6a1ff625a34427dc611ed7047ae41783b",
+    "Status": "push-verified",
+    "ForceUsed": false,
+    "SourceOnly": true,
+    "HostToolsPublished": false
+  },
+  "UpdatedAt": "2026-10-27T04:13:46.5283481Z"
+}

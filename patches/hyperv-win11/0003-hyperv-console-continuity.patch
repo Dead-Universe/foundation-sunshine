@@ -1,0 +1,1323 @@
+diff --git a/src/display_device/session.cpp b/src/display_device/session.cpp
+index 04aca30db0c01a712109dc5a377279f9c9505083..ff9176887ce0512a9498b156e145da2db4d7cd86 100644
+--- a/src/display_device/session.cpp
++++ b/src/display_device/session.cpp
+@@ -14,6 +14,7 @@
+ #include "src/platform/windows/display_device/windows_utils.h"
+ #ifdef _WIN32
+   #include "src/platform/windows/vulkan_hdr_bridge_session.h"
++  #include "src/platform/windows/service_vdd.h"
+ #endif
+ #include "src/rtsp.h"
+ #include "to_string.h"
+@@ -416,6 +417,34 @@ namespace display_device {
+       };
+     }
+ 
++    #ifdef _WIN32
++    if (platf::service_vdd::enabled()) {
++      if (!is_reconfigure && rtsp_stream::session_count() > 0) {
++        return {configure_result_t::result_e::success, {}, {}};
++      }
++      const vdd_utils::hdr_brightness_t brightness {session.hdr_capabilities.max_nits,
++          session.hdr_capabilities.min_nits, session.hdr_capabilities.max_full_frame_nits};
++      const auto physical = vdd_utils::get_client_physical_size(session.client_name);
++      if (!platf::service_vdd::prepare_monitor(*parsed_config, session.width, session.height, session.fps, brightness, physical)) {
++        return {configure_result_t::result_e::vdd_create_failed,
++            "Sunshine could not prepare the sealed virtual display.",
++            "Check the virtual display driver and requested display mode, then try again."};
++      }
++      // Session 0 has no console-local CCD device IDs. The following encoder
++      // probe must validate the real sealed producer; do not invent an ID.
++      current_use_vdd = true;
++      current_device_prep = parsed_config->device_prep;
++      current_vdd_prep = parsed_config->vdd_prep;
++      current_vdd_client_id = get_client_id_from_session(session);
++      current_vdd_hdr_brightness = brightness;
++      config::video.output_name.clear();
++      pending_vdd_.reset();
++      timer->setup_timer(nullptr);
++      BOOST_LOG(info) << "[service-vdd] Driver preparation completed; validating the sealed capture producer";
++      return {configure_result_t::result_e::success, {}, {}};
++    }
++    #endif
++
+     // Parsing is side-effect free. From this point on, parsed_config is the
+     // single source of truth for whether this session needs VDD preparation.
+     const bool rdp_session_active = display_device::w_utils::is_any_rdp_session_active();
+@@ -914,6 +943,18 @@ namespace display_device {
+ 
+   void
+   session_t::restore_state_impl(revert_reason_e reason) {
++#ifdef _WIN32
++    if (platf::service_vdd::enabled() && current_use_vdd.has_value()) {
++      platf::service_vdd::single_display.store(false);
++      if (!config::video.vdd_keep_enabled) {
++        vdd_ioctl::send_command(L"DESTROYMONITOR");
++      }
++      current_vdd_client_id.clear();
++      current_vdd_hdr_brightness.reset();
++      stop_timer_and_clear_vdd_state();
++      return;
++    }
++#endif
+ #ifdef _WIN32
+     // Stop exposing the implicit layer before changing HDR state or removing
+     // the VDD. The layer itself is pass-through, but registration must remain
+diff --git a/src/main.cpp b/src/main.cpp
+index 6a65884f0f6ec05a12321348a50fe2b692e3bd55..6350f20129446424fd21b357245672c1307aee8e 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -41,6 +41,8 @@
+ #ifdef _WIN32
+   #include "display_device/vdd_utils.h"
+   #include "platform/windows/misc.h"
++  #include "platform/windows/console_input_bridge.h"
++  #include "platform/windows/service_vdd.h"
+   #include "platform/windows/win_dark_mode.h"
+ #endif
+ 
+@@ -204,6 +206,21 @@ main(int argc, char *argv[]) {
+   lifetime::argv = argv;
+ 
+ #ifdef _WIN32
++  if ((argc == 4 || argc == 5) && std::string_view(argv[1]) == "--service-session-event") {
++    std::uintptr_t parent = 0, event = 0;
++    if (!platf::console_input_bridge::parse_handle(argv[2], parent) || parent > MAXDWORD ||
++        !platf::console_input_bridge::parse_handle(argv[3], event) ||
++        !platf::console_input_bridge::bind_service_event(static_cast<DWORD>(parent), reinterpret_cast<HANDLE>(event))) {
++      return ERROR_INVALID_HANDLE;
++    }
++    if (argc == 5) {
++      DWORD session = MAXDWORD;
++      if (std::string_view(argv[4]) != "--service-vdd-core" ||
++          !ProcessIdToSessionId(GetCurrentProcessId(), &session) || session != 0) return ERROR_ACCESS_DENIED;
++      platf::console_input_bridge::persistent_service_core = true;
++    }
++    argc = 1;
++  }
+   // Note: this only fires on a normal `return` from main. If the program
+   // crashes mid-run (uncaught exception, AV, abort/terminate), atexit is
+   // not invoked, so the service supervisor still observes a non-zero exit
+@@ -251,6 +268,18 @@ main(int argc, char *argv[]) {
+ 
+   // logging can begin at this point
+   // if anything is logged prior to this point, it will appear in stdout, but not in the log viewer in the UI
++#ifdef _WIN32
++  if (platf::service_vdd::enabled()) {
++    if (!config::video.capture.empty() && config::video.capture != "auto" && config::video.capture != "vdd") {
++      BOOST_LOG(warning) << "Persistent service Core requires VDD; retaining the explicitly configured capture backend";
++      g_final_exit_code.store(ERROR_NOT_SUPPORTED);
++      return ERROR_NOT_SUPPORTED;
++    }
++    config::video.capture = "vdd";
++    config::video.output_name.clear();
++    BOOST_LOG(info) << "[service-vdd] Persistent Core is running in Windows service session 0";
++  }
++#endif
+   // the version should be printed to the log before anything else
+   BOOST_LOG(info) << PROJECT_NAME << " version: " << PROJECT_VER;
+ 
+@@ -529,7 +558,14 @@ main(int argc, char *argv[]) {
+   // Direct VDD capture consumes the IddCx target swapchain. Topology-only VDD
+   // activation can restore a desktop source mode with different dimensions,
+   // which is a valid scaled Windows path but invalid for our 1:1 capture path.
+-  if (config::video.capture == "vdd") {
++  if (platf::service_vdd::enabled()) {
++    display_device::parsed_config_t initial {};
++    if (!platf::service_vdd::prepare_monitor(initial, 1280, 720, 60)) {
++      BOOST_LOG(warning) << "[service-vdd] Initial VDD preparation failed; launch will retry the driver channel";
++    }
++    platf::service_vdd::start_display_follower();
++  }
++  else if (config::video.capture == "vdd") {
+     if (!display_device::session_t::get().is_display_on()) {
+       BOOST_LOG(info) << "[vdd] Direct capture requested; creating ZakoVDD before encoder probe"sv;
+       if (!display_device::session_t::get().create_vdd_monitor_noninteractive()) {
+diff --git a/src/platform/windows/console_input_bridge.h b/src/platform/windows/console_input_bridge.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..158b663371e261a0dd053c7b228192be1bb401a0
+--- /dev/null
++++ b/src/platform/windows/console_input_bridge.h
+@@ -0,0 +1,258 @@
++/**
++ * @brief Keep sealed-VDD streaming alive while Windows moves the console.
++ * Input helpers use anonymous duplicated handles; no named listener or credentials.
++ */
++#pragma once
++#include <Windows.h>
++#include <atomic>
++#include <charconv>
++#include <cstdint>
++#include <mutex>
++#include <string>
++#include <string_view>
++#include "console_input_queue.h"
++#include "../../../tools/sunshinesvc_state.h"
++
++#ifndef PROC_THREAD_ATTRIBUTE_HANDLE_LIST
++  #define PROC_THREAD_ATTRIBUTE_HANDLE_LIST 0x00020002
++#endif
++
++namespace platf::console_input_bridge {
++  inline bool persistent_service_core = false;
++  inline std::atomic<std::uintptr_t> service_event {0};
++  inline std::atomic<bool> sealed_capture_ready {false};
++  inline std::atomic<bool> streaming_active {false};
++
++  inline bool system_token() {
++    HANDLE token = nullptr;
++    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
++    alignas(TOKEN_USER) unsigned char buffer[256] {};
++    DWORD bytes = 0;
++    const bool result = GetTokenInformation(token, TokenUser, buffer, sizeof(buffer), &bytes) &&
++                        IsWellKnownSid(reinterpret_cast<TOKEN_USER *>(buffer)->User.Sid, WinLocalSystemSid);
++    CloseHandle(token);
++    return result;
++  }
++
++  inline bool parse_handle(std::string_view text, std::uintptr_t &value) {
++    const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
++    return result.ec == std::errc {} && result.ptr == text.data() + text.size() && value != 0;
++  }
++
++  inline bool bind_service_event(DWORD parent_pid, HANDLE remote_event) {
++    if (!system_token()) return false;
++    auto parent = OpenProcess(PROCESS_DUP_HANDLE, FALSE, parent_pid);
++    if (!parent) return false;
++    HANDLE event = nullptr;
++    const bool copied = DuplicateHandle(parent, remote_event, GetCurrentProcess(), &event, EVENT_MODIFY_STATE, FALSE, 0);
++    CloseHandle(parent);
++    if (copied) service_event.store(reinterpret_cast<std::uintptr_t>(event), std::memory_order_release);
++    return copied;
++  }
++
++  struct helper_status {
++    volatile LONG ready = 0;
++    volatile LONG error = ERROR_SUCCESS;
++    volatile LONG session = -1;
++    input_queue inputs;
++  };
++
++  inline int run_helper(HANDLE remote_event, HANDLE remote_status, DWORD owner_pid) {
++    if (!system_token() || owner_pid == GetCurrentProcessId()) return ERROR_ACCESS_DENIED;
++    auto owner = OpenProcess(PROCESS_DUP_HANDLE | SYNCHRONIZE, FALSE, owner_pid);
++    if (!owner) return GetLastError();
++    HANDLE data_event = nullptr;
++    HANDLE status_handle = nullptr;
++    const bool copied = DuplicateHandle(owner, remote_event, GetCurrentProcess(), &data_event, SYNCHRONIZE, FALSE, 0) &&
++                        DuplicateHandle(owner, remote_status, GetCurrentProcess(), &status_handle, FILE_MAP_READ | FILE_MAP_WRITE, FALSE, 0);
++    if (!copied || WaitForSingleObject(data_event, 0) == WAIT_FAILED) {
++      if (data_event) CloseHandle(data_event);
++      if (status_handle) CloseHandle(status_handle);
++      CloseHandle(owner);
++      return ERROR_INVALID_HANDLE;
++    }
++    auto status = static_cast<helper_status *>(MapViewOfFile(status_handle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(helper_status)));
++    if (!status) { const auto error = GetLastError(); CloseHandle(data_event); CloseHandle(status_handle); CloseHandle(owner); return error; }
++    DWORD session = MAXDWORD;
++    ProcessIdToSessionId(GetCurrentProcessId(), &session);
++    HDESK desktop = nullptr;
++    const auto sync_desktop = [&]() {
++      auto next = OpenInputDesktop(0, FALSE, MAXIMUM_ALLOWED);
++      if (!next) return false;
++      if (!SetThreadDesktop(next)) { CloseDesktop(next); return false; }
++      if (desktop) CloseDesktop(desktop);
++      desktop = next;
++      return true;
++    };
++    const bool ready = owner && sync_desktop();
++    if (ready) SetThreadExecutionState(ES_DISPLAY_REQUIRED);
++    InterlockedExchange(&status->session, static_cast<LONG>(session));
++    InterlockedExchange(&status->error, ready ? ERROR_SUCCESS : static_cast<LONG>(GetLastError()));
++    InterlockedExchange(&status->ready, ready ? 1 : -1);
++    bool active = ready;
++    HANDLE waits[] {owner, data_event};
++    while (active && WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
++      SetThreadExecutionState(ES_DISPLAY_REQUIRED);
++      INPUT input {};
++      while (status->inputs.pop(input)) {
++        // Fail closed if the console changed after the parent selected this helper.
++        if (WTSGetActiveConsoleSessionId() != session ||
++            (input.type != INPUT_KEYBOARD && input.type != INPUT_MOUSE)) { active = false; break; }
++        if (!sync_desktop()) { InterlockedExchange(&status->error, GetLastError()); continue; }
++        if (WTSGetActiveConsoleSessionId() != session) { active = false; break; }
++        if (input.type == INPUT_KEYBOARD) input.ki.dwExtraInfo = 0;
++        else input.mi.dwExtraInfo = 0;
++        InterlockedExchange(&status->error, SendInput(1, &input, sizeof(input)) == 1 ? ERROR_SUCCESS : static_cast<LONG>(GetLastError()));
++      }
++    }
++    if (owner) CloseHandle(owner);
++    UnmapViewOfFile(status);
++    CloseHandle(data_event);
++    CloseHandle(status_handle);
++    // The input desktop is released by process exit; closing the assigned
++    // desktop from this thread would be invalid.
++    return 0;
++  }
++
++  class helper_process {
++    HANDLE event_ = nullptr;
++    HANDLE mapping_ = nullptr;
++    HANDLE job_ = nullptr;
++    HANDLE process_ = nullptr;
++    helper_status *status_ = nullptr;
++    DWORD session_ = MAXDWORD;
++    std::mutex mutex_;
++
++    void close() {
++      if (job_) CloseHandle(job_);
++      if (process_) CloseHandle(process_);
++      if (status_) UnmapViewOfFile(status_);
++      if (mapping_) CloseHandle(mapping_);
++      if (event_) CloseHandle(event_);
++      event_ = mapping_ = job_ = process_ = nullptr;
++      status_ = nullptr;
++      session_ = MAXDWORD;
++    }
++
++    bool open(DWORD session) {
++      close();
++      event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++      if (!event_) return false;
++      mapping_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(helper_status), nullptr);
++      if (!mapping_) return false;
++      status_ = static_cast<helper_status *>(MapViewOfFile(mapping_, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(helper_status)));
++      if (!status_) return false;
++      *status_ = {};
++
++      HANDLE current = nullptr;
++      HANDLE token = nullptr;
++      if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE, &current)) return false;
++      const bool duplicated = DuplicateTokenEx(current, TOKEN_ALL_ACCESS, nullptr, SecurityImpersonation, TokenPrimary, &token);
++      CloseHandle(current);
++      if (!duplicated) return false;
++      if (!SetTokenInformation(token, TokenSessionId, &session, sizeof(session))) { CloseHandle(token); return false; }
++
++      job_ = CreateJobObjectW(nullptr, nullptr);
++      JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits {};
++      limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
++      if (!job_ || !SetInformationJobObject(job_, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) { CloseHandle(token); return false; }
++      wchar_t exe[32768] {};
++      const auto length = GetModuleFileNameW(nullptr, exe, 32768);
++      if (length == 0 || length >= 32768) { CloseHandle(token); return false; }
++      auto helper_exe = std::wstring(exe);
++      const auto separator = helper_exe.find_last_of(L"\\/");
++      if (separator == std::wstring::npos) { CloseHandle(token); return false; }
++      helper_exe.resize(separator + 1);
++      helper_exe += L"tools\\sunshinesvc.exe";
++      auto command = L"\"" + helper_exe + L"\" --console-input-agent " +
++                     std::to_wstring(reinterpret_cast<std::uintptr_t>(event_)) + L" " +
++                     std::to_wstring(reinterpret_cast<std::uintptr_t>(mapping_)) + L" " + std::to_wstring(GetCurrentProcessId());
++      // Cross-session inheritance is unsupported. The child duplicates only
++      // these two anonymous objects from its still-running SYSTEM parent.
++      STARTUPINFOW startup {};
++      startup.cb = sizeof(startup);
++      startup.lpDesktop = const_cast<LPWSTR>(L"winsta0\\default");
++      PROCESS_INFORMATION child {};
++      const bool launched = CreateProcessAsUserW(token, helper_exe.c_str(), command.data(), nullptr, nullptr, FALSE,
++          CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB,
++          nullptr, nullptr, &startup, &child);
++      CloseHandle(token);
++      if (!launched) return false;
++      process_ = child.hProcess;
++      bool assigned = AssignProcessToJobObject(job_, process_) != FALSE;
++      if (!assigned || ResumeThread(child.hThread) == static_cast<DWORD>(-1)) {
++        TerminateProcess(process_, ERROR_PROCESS_ABORTED);
++        CloseHandle(child.hThread);
++        return false;
++      }
++      CloseHandle(child.hThread);
++      const auto deadline = GetTickCount64() + 500;
++      while (InterlockedCompareExchange(&status_->ready, 0, 0) == 0 && GetTickCount64() < deadline && WaitForSingleObject(process_, 0) == WAIT_TIMEOUT) Sleep(1);
++      if (InterlockedCompareExchange(&status_->ready, 0, 0) != 1 || static_cast<DWORD>(status_->session) != session) return false;
++      session_ = session;
++      return true;
++    }
++
++    bool ensure(DWORD session) {
++      if (session == MAXDWORD) return false;
++      if (session_ == session && process_ && WaitForSingleObject(process_, 0) == WAIT_TIMEOUT) return true;
++      if (open(session)) return true;
++      close();
++      return false;
++    }
++
++  public:
++    ~helper_process() { close(); }
++    bool prepare() {
++      std::lock_guard lock(mutex_);
++      return ensure(WTSGetActiveConsoleSessionId()) && SetEvent(event_);
++    }
++    bool send(const INPUT &input) {
++      std::lock_guard lock(mutex_);
++      const auto target = WTSGetActiveConsoleSessionId();
++      if (!ensure(target)) return false;
++      if (WTSGetActiveConsoleSessionId() != target) return false;
++      // Queue publication and event signalling cannot wait on the child's read.
++      // A full queue fails immediately instead of blocking the input thread.
++      return status_->inputs.push(input) && SetEvent(event_);
++    }
++  };
++
++  inline helper_process &helper() { static helper_process instance; return instance; }
++
++  inline bool needs_forwarding() {
++    if (service_event.load(std::memory_order_acquire) == 0) return false;
++    DWORD own_session = MAXDWORD;
++    return ProcessIdToSessionId(GetCurrentProcessId(), &own_session) && WTSGetActiveConsoleSessionId() != own_session;
++  }
++
++  inline bool update_service_event() {
++    const auto event = service_event.load(std::memory_order_acquire);
++    if (!event) return false;
++    const bool active = streaming_active.load(std::memory_order_acquire);
++    const bool sealed = sealed_capture_ready.load(std::memory_order_acquire);
++    const bool input_ready = active && sealed && system_token() && helper().prepare();
++    if (sunshinesvc::should_retain_transport(active, sealed, input_ready)) return SetEvent(reinterpret_cast<HANDLE>(event));
++    ResetEvent(reinterpret_cast<HANDLE>(event));
++    return false;
++  }
++
++  inline bool enable_for_sealed_vdd() {
++    sealed_capture_ready.store(true, std::memory_order_release);
++    if (persistent_service_core) {
++      update_service_event();
++      return system_token() && helper().prepare();
++    }
++    return update_service_event();
++  }
++
++  inline void set_streaming_active(bool active) {
++    streaming_active.store(active, std::memory_order_release);
++    update_service_event();
++  }
++
++  inline void disable_for_standard_capture() {
++    sealed_capture_ready.store(false, std::memory_order_release);
++    update_service_event();
++  }
++}  // namespace platf::console_input_bridge
+diff --git a/src/platform/windows/console_input_queue.h b/src/platform/windows/console_input_queue.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a993f305b363b98746605f5ec03b2b959e344a40
+--- /dev/null
++++ b/src/platform/windows/console_input_queue.h
+@@ -0,0 +1,30 @@
++// Single producer/consumer queue in an anonymous shared mapping. No pipe I/O.
++#pragma once
++#include <Windows.h>
++
++namespace platf::console_input_bridge {
++  struct input_queue {
++    static constexpr ULONG capacity = 128;
++    volatile LONG produced = 0;
++    volatile LONG consumed = 0;
++    INPUT entries[capacity] {};
++
++    bool push(const INPUT &input) {
++      const auto p = static_cast<ULONG>(InterlockedCompareExchange(&produced, 0, 0));
++      const auto c = static_cast<ULONG>(InterlockedCompareExchange(&consumed, 0, 0));
++      if (p - c >= capacity) return false;
++      entries[p % capacity] = input;
++      InterlockedExchange(&produced, static_cast<LONG>(p + 1u));
++      return true;
++    }
++
++    bool pop(INPUT &input) {
++      const auto c = static_cast<ULONG>(InterlockedCompareExchange(&consumed, 0, 0));
++      const auto p = static_cast<ULONG>(InterlockedCompareExchange(&produced, 0, 0));
++      if (p == c) return false;
++      input = entries[c % capacity];
++      InterlockedExchange(&consumed, static_cast<LONG>(c + 1u));
++      return true;
++    }
++  };
++}
+diff --git a/src/platform/windows/display.h b/src/platform/windows/display.h
+index bf387270a386264d1335e0a214160dd46098ff2a..52112e416a9aacbbd13a8b81ece9a65d6ffb3904 100644
+--- a/src/platform/windows/display.h
++++ b/src/platform/windows/display.h
+@@ -200,6 +200,10 @@ namespace platf::dxgi {
+     capture_e
+     capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override;
+ 
++    // Only the sealed VDD backend can provide a target independently of
++    // this process's Windows-session DXGI output list.
++    virtual bool init_headless_target(const ::video::config_t &) { return false; }
++
+     factory1_t factory;
+     adapter_t adapter;
+     output_t output;
+@@ -861,8 +865,10 @@ namespace platf::dxgi {
+    * driver via vdd_capture_t. Mirrors display_amd_vram_t / display_wgc_vram_t.
+    */
+   class display_vdd_vram_t: public display_vram_t {
++    bool init_headless_target(const ::video::config_t &config) override;
+     vdd_capture_t dup;
+     unsigned int monitor_idx = 0;
++    UINT64 service_capture_epoch = 0;
+     ID3D11Texture2D *current_frame = nullptr;  // Owned ref from dup.next_frame (via AddRef), released in release_snapshot
+     bool vdd_borrow_enabled = false;
+     std::chrono::steady_clock::time_point vdd_borrow_cooldown_until {};
+diff --git a/src/platform/windows/display_base.cpp b/src/platform/windows/display_base.cpp
+index 2355df4db32bba553f944d50b6b01dbfdcc874fa..9c753f838b0f505cdb7b88fb96cd280238cba808 100644
+--- a/src/platform/windows/display_base.cpp
++++ b/src/platform/windows/display_base.cpp
+@@ -30,6 +30,7 @@ typedef enum _D3DKMT_GPU_PREFERENCE_QUERY_STATE: DWORD {
+ #include "display.h"
+ #include "display_device/windows_utils.h"
+ #include "misc.h"
++#include "console_input_bridge.h"
+ #include "src/config.h"
+ #include "src/cursor_channel.h"
+ #include "src/display_device/display_device.h"
+@@ -650,6 +651,11 @@ namespace platf::dxgi {
+       BOOST_LOG(debug) << "[Display Init] Initializing display: " << display_name;
+     }
+ 
++    // Service session 0 cannot enumerate interactive DXGI outputs. Resolve
++    // the real sealed producer before entering that session-local API path.
++    const bool service_headless = direct_vdd_capture && console_input_bridge::persistent_service_core;
++    if (service_headless && !init_headless_target(config)) return -1;
++
+     adapter_t::pointer adapter_p;
+     // Tries:
+     //   0 - normal pass with the configured adapter filter (if any).
+@@ -657,7 +663,7 @@ namespace platf::dxgi {
+     //   2 - last resort: if the configured adapter never matched, drop the
+     //       filter and accept any adapter so a misconfigured / stale
+     //       adapter_name doesn't make capture init fail outright.
+-    for (int tries = 0; tries < 3 && !output; ++tries) {
++    for (int tries = 0; tries < 3 && !output && !service_headless; ++tries) {
+       if (tries == 1) {
+         SetThreadExecutionState(ES_DISPLAY_REQUIRED);
+         Sleep(500);
+@@ -768,7 +774,7 @@ namespace platf::dxgi {
+       }
+     }
+ 
+-    if (!output) {
++    if (!output && !service_headless && !init_headless_target(config)) {
+       BOOST_LOG(error) << "Failed to locate an output device"sv;
+       return -1;
+     }
+@@ -919,7 +925,7 @@ namespace platf::dxgi {
+     }
+ 
+     dxgi::output6_t output6 {};
+-    status = output->QueryInterface(IID_IDXGIOutput6, (void **) &output6);
++    status = output ? output->QueryInterface(IID_IDXGIOutput6, (void **) &output6) : E_NOINTERFACE;
+     if (SUCCEEDED(status)) {
+       DXGI_OUTPUT_DESC1 desc1;
+       output6->GetDesc1(&desc1);
+@@ -1391,6 +1397,7 @@ namespace platf {
+       }
+ 
+       if (ret) {
++        if (type != "vdd") console_input_bridge::disable_for_standard_capture();
+         cursor_channel::set_producer_available(type == "ddx" || type == "vdd");
+         return ret;
+       }
+diff --git a/src/platform/windows/display_vdd.cpp b/src/platform/windows/display_vdd.cpp
+index a1d1ddd6b390d16fb0c6b9257fdb8981ad952b44..47d49c9f3fd5aa64e7796dc7d454723be79ebf9f 100644
+--- a/src/platform/windows/display_vdd.cpp
++++ b/src/platform/windows/display_vdd.cpp
+@@ -15,6 +15,8 @@
+ 
+ #include "display.h"
+ #include "misc.h"
++#include "console_input_bridge.h"
++#include "service_vdd.h"
+ #include "src/config.h"
+ #include "src/display_device/vdd_ioctl.h"
+ #include "src/main.h"
+@@ -1397,8 +1399,68 @@ namespace platf::dxgi {
+     return {};
+   }
+ 
++  bool
++  display_vdd_vram_t::init_headless_target(const ::video::config_t &config) {
++    if (!console_input_bridge::needs_forwarding()) return false;
++    display_device::vdd_ioctl::frame_channel_caps caps {};
++    if (probe_sealed_frame_channel(caps) != vdd_frame_channel::channel_selection::unknown) return false;
++    const auto deadline = GetTickCount64() + 5000;
++    for (;;) {
++    adapter_t selected_adapter;
++    SharedFrameMetadata selected {};
++    unsigned int selected_monitor = 0;
++    unsigned int matches = 0;
++    const auto configured_adapter = from_utf8(config::video.adapter_name);
++    for (unsigned int index = 0; index < 32; ++index) {
++      adapter_t candidate;
++      const auto hr = factory->EnumAdapters1(index, &candidate);
++      if (hr != S_OK) break;
++      DXGI_ADAPTER_DESC1 desc {};
++      if (FAILED(candidate->GetDesc1(&desc)) || (!configured_adapter.empty() && configured_adapter != desc.Description)) continue;
++      for (unsigned int monitor = 0; monitor < 16; ++monitor) {
++        display_device::vdd_ioctl::frame_channel_open_response channel {};
++        if (open_sealed_frame_channel(monitor, desc.AdapterLuid, caps.max_shared_slots, channel, false) != display_device::vdd_ioctl::frame_channel_open_status::opened) continue;
++        auto close_channel = util::fail_guard([&]() { close_sealed_frame_channel_handles(channel); });
++        auto view = static_cast<const SharedFrameMetadata *>(MapViewOfFile(reinterpret_cast<HANDLE>(channel.metadata_handle), FILE_MAP_READ, 0, 0, sizeof(SharedFrameMetadata)));
++        if (!view) continue;
++        SharedFrameMetadata meta {};
++        const bool valid = vdd_frame_channel::read_stable_metadata(view, meta) && vdd_metadata_is_attachable(meta, desc.AdapterLuid);
++        UnmapViewOfFile(view);
++        if (!valid) continue;
++        if (++matches != 1) {
++          BOOST_LOG(error) << "[vdd] Multiple sealed producers are visible across sessions; refusing an ambiguous capture target"sv;
++          return false;
++        }
++        selected_adapter = std::move(candidate);
++        selected = meta;
++        selected_monitor = monitor;
++        // Keep enumerating this adapter with a separate COM reference.
++        if (FAILED(selected_adapter->QueryInterface(IID_IDXGIAdapter1, reinterpret_cast<void **>(&candidate)))) return false;
++      }
++    }
++    if (matches != 1) {
++      if (!console_input_bridge::persistent_service_core || GetTickCount64() >= deadline) return false;
++      Sleep(100);
++      continue;
++    }
++    adapter = std::move(selected_adapter);
++    monitor_idx = selected_monitor;
++    width = width_before_rotation = env_width = selected.Width;
++    height = height_before_rotation = env_height = selected.Height;
++    offset_x = offset_y = 0;
++    display_rotation = DXGI_MODE_ROTATION_IDENTITY;
++    display_refresh_rate = {static_cast<UINT>(std::max(config.framerate, 1)), 1};
++    display_refresh_rate_rounded = std::max(config.framerate, 1);
++    BOOST_LOG(info) << "[vdd] Restoring sealed capture across Windows sessions without a session-local DXGI output: monitor="sv
++                    << monitor_idx << " size="sv << width << 'x' << height;
++    return true;
++    }
++  }
++
+   int
+   display_vdd_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
++    if (!service_vdd::refresh_console_producer()) return -1;
++    service_capture_epoch = service_vdd::capture_epoch.load(std::memory_order_acquire);
+     // Direct VDD selection bypasses the DDX retry that normally wakes the
+     // display. After idle power-off, IddCx exposes the output but publishes no
+     // frame channel until the interactive session's display is awake again.
+@@ -1538,6 +1600,10 @@ namespace platf::dxgi {
+                     << " generation="sv << dup.producer_channel_generation()
+                     << " borrowed_texture="sv << vdd_borrow_enabled;
+ 
++    if (!dup.legacy_named_channel() && console_input_bridge::enable_for_sealed_vdd()) {
++      BOOST_LOG(info) << "[vdd] Session-independent capture and console input helper are ready"sv;
++    }
++
+     // Cursor export is optional and older drivers do not expose it. Likewise,
+     // a cursor-only shader failure must not take down otherwise valid capture.
+     if (init_cursor_pipeline(config) != 0) {
+diff --git a/src/platform/windows/display_vdd_vram.cpp b/src/platform/windows/display_vdd_vram.cpp
+index 8e6db62ec8ce2a1ddc592c7b8c9af93d7b910870..b65c09c083712acaf7c70645279e07b431ec3da9 100644
+--- a/src/platform/windows/display_vdd_vram.cpp
++++ b/src/platform/windows/display_vdd_vram.cpp
+@@ -6,6 +6,7 @@
+ #include "display_cursor.h"
+ #include "display_vram_internal.h"
+ #include "misc.h"
++#include "service_vdd.h"
+ 
+ #include <chrono>
+ #include <utility>
+@@ -72,6 +73,16 @@ namespace platf::dxgi {
+       current_frame = nullptr;
+     }
+ 
++    // Windows may replace the sealed mapping and textures when retiring an
++    // anonymous console while reusing the same monitor index/generation value.
++    // Renew capture through the existing reinit path after console preparation;
++    // the service Core, application and RTSP transport stay alive.
++    if (service_vdd::enabled() &&
++        service_capture_epoch != service_vdd::capture_epoch.load(std::memory_order_acquire)) {
++      BOOST_LOG(info) << "[service-vdd] Console capture context changed; renewing sealed resources"sv;
++      return capture_e::reinit;
++    }
++
+     const bool use_local_cursor = local_cursor_mode_active();
+     if (use_local_cursor != vdd_local_cursor_mode_active) {
+       // poll_cursor() normally omits an acknowledged shape. Force a refresh
+diff --git a/src/platform/windows/input.cpp b/src/platform/windows/input.cpp
+index aa2a9e316a75cd29b79905d8beab3378bc4ac96b..1737b02de02b56b3d1d04f52058a7bc44b46b3d8 100644
+--- a/src/platform/windows/input.cpp
++++ b/src/platform/windows/input.cpp
+@@ -20,6 +20,7 @@
+ #include "src/ds5/config.h"
+ #include "keylayout.h"
+ #include "misc.h"
++#include "console_input_bridge.h"
+ #include "virtual_mouse.h"
+ #include "src/config.h"
+ #include "src/globals.h"
+@@ -648,6 +649,17 @@ namespace platf {
+    */
+   void
+   send_input(INPUT &i) {
++    if (console_input_bridge::needs_forwarding()) {
++      if (!console_input_bridge::helper().send(i)) {
++        static std::atomic<ULONGLONG> last_warning {0};
++        const auto now = GetTickCount64();
++        if (now - last_warning.load(std::memory_order_relaxed) > 5000) {
++          last_warning.store(now, std::memory_order_relaxed);
++          BOOST_LOG(warning) << "[console-input] Active-console helper unavailable; input was not sent to the old session"sv;
++        }
++      }
++      return;
++    }
+   retry:
+     auto send = SendInput(1, &i, sizeof(INPUT));
+     if (send != 1) {
+diff --git a/src/platform/windows/misc.cpp b/src/platform/windows/misc.cpp
+index cfd31e6534b30c90908880ba1a33f71e6f71795e..3890955110b3269378deeda3b7e5b2e4d71b871f 100644
+--- a/src/platform/windows/misc.cpp
++++ b/src/platform/windows/misc.cpp
+@@ -42,6 +42,7 @@
+ #include <Shlwapi.h>
+ 
+ #include "misc.h"
++#include "console_input_bridge.h"
+ 
+ #include "src/entry_handler.h"
+ #include "src/globals.h"
+@@ -1390,6 +1391,7 @@ namespace platf {
+ 
+   void
+   streaming_will_start() {
++    console_input_bridge::set_streaming_active(true);
+     static std::once_flag load_wlanapi_once_flag;
+     std::call_once(load_wlanapi_once_flag, []() {
+       // wlanapi.dll is not installed by default on Windows Server, so we load it dynamically
+@@ -1515,6 +1517,7 @@ namespace platf {
+ 
+   void
+   streaming_will_stop() {
++    console_input_bridge::set_streaming_active(false);
+     // Demote ourselves back to normal priority class
+     SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
+ 
+diff --git a/src/platform/windows/service_vdd.h b/src/platform/windows/service_vdd.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..859a9fa897615fefcb36fe0b733cea000e5c44a0
+--- /dev/null
++++ b/src/platform/windows/service_vdd.h
+@@ -0,0 +1,131 @@
++// A sealed VDD Core can live in service session 0; only CCD runs in the console.
++#pragma once
++#include "console_input_bridge.h"
++#include "src/config.h"
++#include "src/logging.h"
++#include "src/display_device/parsed_config.h"
++#include "src/display_device/vdd_ioctl.h"
++#include "src/display_device/vdd_utils.h"
++#include <atomic>
++#include <mutex>
++#include <optional>
++#include <thread>
++#include <WtsApi32.h>
++
++namespace platf::service_vdd {
++  inline std::atomic<bool> single_display {false};
++  inline std::atomic<UINT64> capture_epoch {1};
++  struct monitor_request {
++    display_device::parsed_config_t config;
++    int width, height, fps;
++    display_device::vdd_utils::hdr_brightness_t brightness;
++    display_device::vdd_utils::physical_size_t physical;
++  };
++  inline std::recursive_mutex monitor_mutex;
++  inline std::optional<monitor_request> last_monitor_request;
++  inline DWORD monitor_console = MAXDWORD;
++  inline bool enabled() { return console_input_bridge::persistent_service_core; }
++
++  inline DWORD prepare_console(DWORD session) {
++    HANDLE current=nullptr,token=nullptr;
++    if(!OpenProcessToken(GetCurrentProcess(),TOKEN_DUPLICATE,&current))return GetLastError();
++    const bool copied=DuplicateTokenEx(current,TOKEN_ALL_ACCESS,nullptr,SecurityImpersonation,TokenPrimary,&token);
++    CloseHandle(current);if(!copied)return GetLastError();
++    if(!SetTokenInformation(token,TokenSessionId,&session,sizeof(session))){auto error=GetLastError();CloseHandle(token);return error;}
++    wchar_t executable[32768] {};const auto length=GetModuleFileNameW(nullptr,executable,32768);
++    if(!length||length>=32768){CloseHandle(token);return ERROR_INVALID_NAME;}
++    std::wstring helper(executable);const auto separator=helper.find_last_of(L"\\/");
++    if(separator==std::wstring::npos){CloseHandle(token);return ERROR_INVALID_NAME;}
++    helper.resize(separator+1);helper+=L"tools\\sunshinesvc.exe";
++    auto command=L"\""+helper+L"\" --console-vdd-display";
++    auto job=CreateJobObjectW(nullptr,nullptr);JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits {};
++    limits.BasicLimitInformation.LimitFlags=JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
++    if(!job||!SetInformationJobObject(job,JobObjectExtendedLimitInformation,&limits,sizeof(limits))){if(job)CloseHandle(job);CloseHandle(token);return ERROR_INVALID_HANDLE;}
++    STARTUPINFOW startup {};startup.cb=sizeof(startup);startup.lpDesktop=const_cast<LPWSTR>(L"winsta0\\default");
++    PROCESS_INFORMATION child {};
++    const bool started=CreateProcessAsUserW(token,helper.c_str(),command.data(),nullptr,nullptr,FALSE,
++        CREATE_NO_WINDOW|CREATE_UNICODE_ENVIRONMENT|CREATE_SUSPENDED|CREATE_BREAKAWAY_FROM_JOB,nullptr,nullptr,&startup,&child);
++    CloseHandle(token);if(!started){auto error=GetLastError();CloseHandle(job);return error;}
++    DWORD result=ERROR_PROCESS_ABORTED;
++    if(AssignProcessToJobObject(job,child.hProcess)&&ResumeThread(child.hThread)!=static_cast<DWORD>(-1)) {
++      if(WaitForSingleObject(child.hProcess,3000)==WAIT_OBJECT_0)GetExitCodeProcess(child.hProcess,&result);
++      else result=ERROR_TIMEOUT;
++    }else{TerminateProcess(child.hProcess,ERROR_PROCESS_ABORTED);}
++    CloseHandle(job);CloseHandle(child.hThread);CloseHandle(child.hProcess);return result;
++  }
++
++  inline void start_display_follower() {
++    static std::jthread follower([](std::stop_token stop) {
++      DWORD prepared=MAXDWORD;ULONGLONG retry=0;
++      DWORD observed=MAXDWORD,last_result=ERROR_GEN_FAILURE;
++      while(!stop.stop_requested()) {
++        if(enabled()&&console_input_bridge::streaming_active.load()) {
++          const auto session=WTSGetActiveConsoleSessionId();
++          if(session!=MAXDWORD && (session!=prepared || GetTickCount64()>=retry)) {
++            const auto result=single_display.load()?prepare_console(session):ERROR_SUCCESS;
++            if(observed!=session || last_result!=result) {
++              BOOST_LOG(result==ERROR_SUCCESS?info:warning) << "[service-vdd] Console display preparation: session="
++                  << session << " result=" << result;
++              observed=session;last_result=result;
++            }
++            if(result==ERROR_SUCCESS && prepared!=session)capture_epoch.fetch_add(1,std::memory_order_acq_rel);
++            prepared=result==ERROR_SUCCESS?session:MAXDWORD;
++            retry=GetTickCount64()+(result==ERROR_SUCCESS?30000:2000);
++          }
++        }else{prepared=MAXDWORD;retry=0;}
++        Sleep(250);
++      }
++    });
++  }
++
++  inline bool prepare_monitor(display_device::parsed_config_t config,int width,int height,int fps,
++      const display_device::vdd_utils::hdr_brightness_t &brightness={},
++      const display_device::vdd_utils::physical_size_t &physical={}) {
++    std::lock_guard lock(monitor_mutex);
++    if(!enabled()||width<=0||height<=0||width>16384||height>16384||fps<=0||fps>1000)return false;
++    if(!config.resolution)config.resolution=display_device::resolution_t{static_cast<unsigned>(width),static_cast<unsigned>(height)};
++    if(!config.refresh_rate)config.refresh_rate=display_device::refresh_rate_t{static_cast<unsigned>(fps),1};
++    if(!config.refresh_rate->denominator || !config.resolution->width || !config.resolution->height ||
++        config.resolution->width>16384 || config.resolution->height>16384)return false;
++    const auto hz=(config.refresh_rate->numerator+config.refresh_rate->denominator/2)/config.refresh_rate->denominator;
++    if(!hz||hz>1000)return false;
++    // One advertised mode makes the new IddCx source and target dimensions agree
++    // without querying a DXGI output belonging to another Windows session.
++    const display_device::vdd_utils::VddSettings modes{{*config.resolution},{hz}};
++    // Warm the actual console desktop before waiting for the IddCx producer.
++    // A service-session execution-state request alone cannot replace this.
++    if(!console_input_bridge::helper().prepare())return false;
++    if(display_device::vdd_utils::set_vdd_session_mode(config,modes)!=display_device::vdd_utils::set_vdd_result::ok)return false;
++    if(display_device::vdd_ioctl::send_command(L"DESTROYMONITOR")!=display_device::vdd_ioctl::result::success)return false;
++    Sleep(500);
++    if(!display_device::vdd_utils::create_vdd_monitor("persistent_service_vdd",brightness,physical))return false;
++    capture_epoch.fetch_add(1,std::memory_order_acq_rel);
++    single_display.store(config.device_prep==display_device::parsed_config_t::device_prep_e::ensure_only_display ||
++        config.vdd_prep==display_device::parsed_config_t::vdd_prep_e::display_off);
++    Sleep(200);
++    last_monitor_request=monitor_request{config,width,height,fps,brightness,physical};
++    monitor_console=WTSGetActiveConsoleSessionId();
++    return true;
++  }
++
++  // Called only while creating a replacement capture, after old textures and
++  // encoder resources have been released. A newly created anonymous console
++  // can expose the old channel with valid metadata but no advancing frames.
++  inline bool refresh_console_producer() {
++    if(!enabled()||!console_input_bridge::streaming_active.load())return true;
++    std::lock_guard lock(monitor_mutex);
++    const auto session=WTSGetActiveConsoleSessionId();
++    if(session==MAXDWORD)return false;
++    if(session==monitor_console||!last_monitor_request)return true;
++    LPWSTR user=nullptr;DWORD bytes=0;
++    if(!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE,session,WTSUserName,&user,&bytes))return false;
++    const bool anonymous=bytes>=sizeof(wchar_t)&&user&&!*user;
++    if(user)WTSFreeMemory(user);
++    if(!anonymous){monitor_console=session;return true;}
++    const auto request=*last_monitor_request;
++    BOOST_LOG(info) << "[service-vdd] Rebuilding stopped producer for new anonymous console: session=" << session;
++    if(!prepare_monitor(request.config,request.width,request.height,request.fps,request.brightness,request.physical))return false;
++    if(single_display.load()&&prepare_console(session)!=ERROR_SUCCESS){monitor_console=MAXDWORD;return false;}
++    return WTSGetActiveConsoleSessionId()==session;
++  }
++}
+diff --git a/src/video.cpp b/src/video.cpp
+index e1fcf32a4ea7aade682abf30f48ec893a90f1f97..cf4e6896a634cbbdee696f3904de0a7d5306fb57 100644
+--- a/src/video.cpp
++++ b/src/video.cpp
+@@ -52,6 +52,7 @@ extern "C" {
+   #include "platform/windows/pyrowave/gpu_encoder.h"
+   #include "platform/windows/pyrowave/color_metadata.h"
+   #include "platform/windows/display.h"
++  #include "platform/windows/console_input_bridge.h"
+ extern "C" {
+   #include <libavutil/hwcontext_d3d11va.h>
+ }
+@@ -5043,6 +5044,17 @@ namespace video {
+     const auto cuda_probe_contexts = nvenc_factory ? nvenc_factory->retain_cuda_interop_contexts() : nullptr;
+ #endif
+ 
++#ifdef _WIN32
++    // A sealed service-session producer has no console-local CCD display ID.
++    // Keep the real capture/encoder probe and use its existing auto-selection
++    // policy only for this VDD target; explicit physical targets stay exact.
++    if (target && platf::console_input_bridge::persistent_service_core &&
++        config::video.capture == "vdd" && target->output_name.empty() &&
++        target->policy == probe_target_policy_e::vdd_compatible) {
++      target->policy = probe_target_policy_e::backend_autoselect;
++    }
++#endif
++
+     const auto configured_output_name = target ? target->output_name : config::video.output_name;
+     const bool target_requires_exact_resolution = target && target->policy == probe_target_policy_e::exact;
+     const auto configured_display_name = display_device::get_display_name(configured_output_name);
+diff --git a/tests/unit/platform/windows/test_console_input_queue.cpp b/tests/unit/platform/windows/test_console_input_queue.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..2716c3ca8d7814f52f82f9813c7b59c16d9cd5bb
+--- /dev/null
++++ b/tests/unit/platform/windows/test_console_input_queue.cpp
+@@ -0,0 +1,75 @@
++#ifdef _WIN32
++#define WIN32_LEAN_AND_MEAN
++#include "src/platform/windows/console_input_queue.h"
++#include "../../../tests_common.h"
++#include <atomic>
++#include <thread>
++
++using platf::console_input_bridge::input_queue;
++
++TEST(ConsoleInputQueue, EmptyQueueDoesNotWaitForAReader) {
++  input_queue queue;
++  INPUT input {};
++  EXPECT_FALSE(queue.pop(input));
++}
++
++TEST(ConsoleInputQueue, FullQueueFailsWithoutOverwritingPendingInput) {
++  input_queue queue;
++  for(ULONG i=0;i<input_queue::capacity;++i) {
++    INPUT input {};input.type=INPUT_KEYBOARD;input.ki.dwExtraInfo=i;
++    ASSERT_TRUE(queue.push(input));
++  }
++  INPUT input {};
++  EXPECT_FALSE(queue.push(input));
++  for(ULONG i=0;i<input_queue::capacity;++i) {
++    ASSERT_TRUE(queue.pop(input));EXPECT_EQ(input.ki.dwExtraInfo,i);
++  }
++  EXPECT_FALSE(queue.pop(input));EXPECT_TRUE(queue.push(input));
++}
++
++TEST(ConsoleInputQueue, SequenceWrapPreservesOrderAndCapacity) {
++  input_queue queue;
++  queue.produced=queue.consumed=static_cast<LONG>(0xfffffffdu);
++  for(ULONG i=0;i<8;++i) {
++    INPUT input {};input.ki.dwExtraInfo=i;ASSERT_TRUE(queue.push(input));
++  }
++  for(ULONG i=0;i<8;++i) {
++    INPUT input {};ASSERT_TRUE(queue.pop(input));EXPECT_EQ(input.ki.dwExtraInfo,i);
++  }
++  INPUT input {};EXPECT_FALSE(queue.pop(input));
++}
++
++TEST(ConsoleInputQueue, ConcurrentEventWakeupDrainsEveryPublishedInput) {
++  input_queue queue;
++  HANDLE event=CreateEventW(nullptr,FALSE,FALSE,nullptr);
++  ASSERT_NE(event,nullptr);
++  constexpr ULONG count=20000;
++  std::atomic<bool> stop {false},ordered {true};
++  std::atomic<ULONG> received {0};
++  const auto deadline=GetTickCount64()+10000;
++  std::thread consumer([&] {
++    ULONG expected=0;
++    while(expected<count&&!stop.load()&&GetTickCount64()<deadline) {
++      if(WaitForSingleObject(event,20)!=WAIT_OBJECT_0)continue;
++      INPUT input {};
++      while(queue.pop(input)) {
++        if(input.ki.dwExtraInfo!=expected)ordered=false;
++        ++expected;
++      }
++    }
++    received=expected;
++  });
++  ULONG sent=0;
++  for(;sent<count&&GetTickCount64()<deadline;++sent) {
++    INPUT input {};input.type=INPUT_KEYBOARD;input.ki.dwExtraInfo=sent;
++    while(!queue.push(input)) {
++      if(GetTickCount64()>=deadline){stop=true;break;}
++      std::this_thread::yield();
++    }
++    SetEvent(event);
++    if(stop.load())break;
++  }
++  consumer.join();CloseHandle(event);
++  EXPECT_EQ(sent,count);EXPECT_EQ(received.load(),count);EXPECT_TRUE(ordered.load());
++}
++#endif
+diff --git a/tests/unit/test_sunshinesvc_state.cpp b/tests/unit/test_sunshinesvc_state.cpp
+index 9532144710c51994da155eb0634fd3c2768b2c69..23a00350155be72e2a22203b9095a12948515f16 100644
+--- a/tests/unit/test_sunshinesvc_state.cpp
++++ b/tests/unit/test_sunshinesvc_state.cpp
+@@ -67,3 +67,57 @@ TEST(GuiAgentCrashLogLimiter, LogsStateChangesAndPeriodicReminders) {
+   limiter.reset();
+   EXPECT_TRUE(limiter.should_log_acquisition(false));
+ }
++
++TEST(ConsoleSessionAction, SealedVddSurvivesCapturedConsoleRoundTrip) {
++  using A = sunshinesvc::ConsoleSessionAction;
++  for (auto target : std::array<std::uint32_t, 5>{1, UINT32_MAX, 4, UINT32_MAX, 1}) {
++    EXPECT_NE(sunshinesvc::console_session_action(1, target, true), A::restart_core);
++  }
++}
++
++TEST(ConsoleSessionAction, StandardCaptureStillMovesToAnotherSession) {
++  using A = sunshinesvc::ConsoleSessionAction;
++  EXPECT_EQ(sunshinesvc::console_session_action(1, 1, false), A::keep_core);
++  EXPECT_EQ(sunshinesvc::console_session_action(1, 4, false), A::restart_core);
++}
++
++TEST(ConsoleSessionAction, ServiceCoreSurvivesAnonymousSessionRetirementEvenWhileIdle) {
++  using A = sunshinesvc::ConsoleSessionAction;
++  // Captured terminal-session trace: the anonymous console is retired when
++  // credentials reconnect the existing RDP user. Core must already be in 0.
++  for (bool media_ready : {false, true}) {
++    for (auto target : std::array<std::uint32_t, 5>{2, UINT32_MAX, 4, UINT32_MAX, 2}) {
++      EXPECT_NE(sunshinesvc::console_session_action(0, target, media_ready, true), A::restart_core);
++    }
++  }
++}
++
++TEST(ConsoleSessionAction, PersistentPolicyCannotMakeAnInteractiveCoreDurable) {
++  using A = sunshinesvc::ConsoleSessionAction;
++  EXPECT_EQ(sunshinesvc::console_session_action(4, 2, false, true), A::restart_core);
++  EXPECT_EQ(sunshinesvc::console_session_action(0, 2, false, false), A::restart_core);
++}
++
++TEST(ConsoleSessionAction, InvalidConsoleNeverTerminatesEitherCaptureMode) {
++  using A = sunshinesvc::ConsoleSessionAction;
++  EXPECT_EQ(sunshinesvc::console_session_action(1, UINT32_MAX, false), A::probe_again);
++  EXPECT_EQ(sunshinesvc::console_session_action(1, UINT32_MAX, true), A::probe_again);
++}
++TEST(ConsoleTransportReadiness, EncoderPreflightDoesNotPinAnIdleCore) {
++  using A = sunshinesvc::ConsoleSessionAction;
++  const bool preflight_only = sunshinesvc::should_retain_transport(false, true, true);
++  EXPECT_FALSE(preflight_only);
++  EXPECT_EQ(sunshinesvc::console_session_action(1, 3, preflight_only), A::restart_core);
++  EXPECT_FALSE(sunshinesvc::should_retain_transport(true, false, true));
++  EXPECT_FALSE(sunshinesvc::should_retain_transport(true, true, false));
++}
++
++TEST(ConsoleTransportReadiness, ActiveLoginStreamSurvivesUntilItsLastMediaSessionStops) {
++  using A = sunshinesvc::ConsoleSessionAction;
++  const bool streaming = sunshinesvc::should_retain_transport(true, true, true);
++  EXPECT_TRUE(streaming);
++  EXPECT_EQ(sunshinesvc::console_session_action(3, UINT32_MAX, streaming), A::probe_again);
++  EXPECT_EQ(sunshinesvc::console_session_action(3, 1, streaming), A::keep_core);
++  const bool stopped = sunshinesvc::should_retain_transport(false, true, true);
++  EXPECT_EQ(sunshinesvc::console_session_action(3, 1, stopped), A::restart_core);
++}
+diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
+index f254c04ccea5c916d1ae425bf11c03f3c86ca789..4b802cb60dff49f6a10fc31a22a2d1c616b58c1f 100644
+--- a/tools/CMakeLists.txt
++++ b/tools/CMakeLists.txt
+@@ -24,6 +24,7 @@ target_link_libraries(audio-info
+ target_compile_options(audio-info PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
+ 
+ add_executable(sunshinesvc sunshinesvc.cpp)
++target_link_libraries(sunshinesvc PRIVATE setupapi advapi32)
+ set_target_properties(sunshinesvc PROPERTIES CXX_STANDARD 23)
+ target_link_libraries(sunshinesvc
+         PRIVATE Threads::Threads
+diff --git a/tools/sunshinesvc.cpp b/tools/sunshinesvc.cpp
+index e4f7d7bdeafc479f8c82399c96da1c3e7a9745da..3fcf78caacddb5da9a3998c04983de921e7c7420 100644
+--- a/tools/sunshinesvc.cpp
++++ b/tools/sunshinesvc.cpp
+@@ -17,6 +17,8 @@
+ 
+ #include "sunshinesvc_log.h"
+ #include "sunshinesvc_state.h"
++#include "../src/platform/windows/console_input_bridge.h"
++#include "sunshinesvc_vdd.h"
+ 
+ // PROC_THREAD_ATTRIBUTE_JOB_LIST is currently missing from MinGW headers
+ #ifndef PROC_THREAD_ATTRIBUTE_JOB_LIST
+@@ -577,6 +579,9 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
+     }
+   };
+ 
++  // Anonymous console sessions are destroyed after credential handoff, including
++  // their SYSTEM processes. Only a service-session Core can outlive that event.
++  bool persistent_vdd_mode = sunshinesvc::vdd::persistent_core_supported();
+   // Loop every 3 seconds until the stop event is set or Sunshine.exe is running
+   while (WaitForSingleObject(stop_event, 3000) != WAIT_OBJECT_0) {
+     auto console_session_id = WTSGetActiveConsoleSessionId();
+@@ -595,7 +600,8 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
+       gui_agent_log_limiter.reset();
+     }
+ 
+-    auto console_token = DuplicateTokenForSession(console_session_id);
++    const DWORD core_session_id = persistent_vdd_mode ? 0 : console_session_id;
++    auto console_token = DuplicateTokenForSession(core_session_id);
+     if (console_token == NULL) {
+       continue;
+     }
+@@ -616,10 +622,18 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
+       NULL,
+       NULL);
+ 
++    // The child duplicates this anonymous event from its SYSTEM parent.
++    // Only sealed VDD plus a ready console input helper may signal it.
++    auto continuity_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
++    if (!continuity_event) { CloseHandle(console_token); CloseHandle(job_handle); continue; }
++    auto core_command = L"Sunshine.exe --service-session-event " + std::to_wstring(GetCurrentProcessId()) + L" " +
++                        std::to_wstring(reinterpret_cast<std::uintptr_t>(continuity_event));
++    if (persistent_vdd_mode) core_command += L" --service-vdd-core";
++    WriteServiceLog(log_file_handle, "Starting Core in Windows session " + std::to_string(core_session_id));
+     PROCESS_INFORMATION process_info;
+     if (!CreateProcessAsUserW(console_token,
+           L"Sunshine.exe",
+-          NULL,
++          core_command.data(),
+           NULL,
+           NULL,
+           TRUE,
+@@ -630,6 +644,7 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
+           &process_info)) {
+       CloseHandle(console_token);
+       CloseHandle(job_handle);
++      CloseHandle(continuity_event);
+       continue;
+     }
+ 
+@@ -659,13 +674,18 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
+     }
+ 
+     bool still_running;
++    bool session_probe_pending = false;
++    bool core_detached = false;
++    DWORD last_console = console_session_id;
+     do {
+       // Wait on the exact GUI process while it is managed. After a clean exit,
+       // only a low-frequency lookup runs so externally launched replacements
+       // can be reattached without allowing the service to revive the GUI.
+       const HANDLE wait_objects[] = { stop_event, process_info.hProcess, session_change_event, gui_agent.handle };
+       const DWORD wait_object_count = gui_agent.handle == NULL ? 3 : 4;
+-      const DWORD wait_timeout = gui_agent.handle == NULL ? RetryWaitTimeout(gui_agent_retry_at_ms) : INFINITE;
++      const DWORD gui_wait_timeout = gui_agent.handle == NULL ? RetryWaitTimeout(gui_agent_retry_at_ms) : INFINITE;
++      const DWORD console_poll = session_probe_pending ? 50 : (core_detached ? 500 : INFINITE);
++      const DWORD wait_timeout = std::min(gui_wait_timeout, console_poll);
+       const auto wait_result = WaitForMultipleObjects(wait_object_count, wait_objects, FALSE, wait_timeout);
+       switch (wait_result) {
+         case WAIT_TIMEOUT:
+@@ -677,22 +697,50 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
+             still_running = true;
+             break;
+           }
+-          if (gui_agent_restart_policy.launch_allowed()) {
+-            acquire_gui_agent();
++          if (session_probe_pending || core_detached) {
++            session_probe_pending = false;
++            SetEvent(session_change_event);
+           }
+-          else {
+-            reattach_gui_agent();
++          if (gui_agent.handle == NULL && RetryWaitTimeout(gui_agent_retry_at_ms) == 0) {
++            if (gui_agent_restart_policy.launch_allowed()) acquire_gui_agent();
++            else reattach_gui_agent();
+           }
+           still_running = true;
+           break;
+ 
+-        case WAIT_OBJECT_0 + 2:
+-          if (WTSGetActiveConsoleSessionId() == console_session_id) {
+-            // The active console session didn't actually change. Let Sunshine keep running.
++        case WAIT_OBJECT_0 + 2: {
++          const auto target = WTSGetActiveConsoleSessionId();
++          const bool independent = WaitForSingleObject(continuity_event, 0) == WAIT_OBJECT_0;
++          const auto action = sunshinesvc::console_session_action(core_session_id, target, independent, persistent_vdd_mode);
++          if (action == sunshinesvc::ConsoleSessionAction::probe_again) {
++            session_probe_pending = true;
+             still_running = true;
+-            continue;
++            break;
+           }
+-          // Fall-through to terminate Sunshine.exe and start it again.
++          if (action == sunshinesvc::ConsoleSessionAction::keep_core) {
++            core_detached = target != console_session_id;
++            if (target != last_console) {
++              WriteServiceLog(log_file_handle, "Console moved to session " + std::to_string(target) +
++                  "; preserving sealed-VDD Core PID " + std::to_string(process_info.dwProcessId) +
++                  " in session " + std::to_string(core_session_id));
++            }
++            last_console = target;
++            if (gui_agent_session_id != target) {
++              CloseGuiAgentHandle(gui_agent);
++              gui_agent_session_id = target;
++              gui_agent_last_error = ERROR_SUCCESS;
++              gui_agent_retry_at_ms = 0;
++              gui_agent_backoff.reset();
++              gui_agent_restart_policy.resume_supervision();
++              gui_agent_log_limiter.reset();
++            }
++            still_running = true;
++            break;
++          }
++          WriteServiceLog(log_file_handle, "Console moved from session " + std::to_string(console_session_id) +
++              " to " + std::to_string(target) + "; Core capture is not session-independent; restarting");
++          // Standard capture still requires a process in the new session.
++        }
+           [[fallthrough]];
+         case WAIT_OBJECT_0:
+           // The service is shutting down, so try to gracefully terminate Sunshine.exe.
+@@ -715,8 +763,13 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
+         case WAIT_OBJECT_0 + 1: {
+           // Sunshine terminated itself.
+ 
+-          DWORD exit_code;
+-          if (GetExitCodeProcess(process_info.hProcess, &exit_code) && exit_code == ERROR_SHUTDOWN_IN_PROGRESS) {
++          DWORD exit_code = ERROR_PROCESS_ABORTED;
++          if (GetExitCodeProcess(process_info.hProcess, &exit_code)) {
++            WriteServiceLog(log_file_handle, "Core PID " + std::to_string(process_info.dwProcessId) +
++                " exited with code " + std::to_string(exit_code) + " from session " + std::to_string(core_session_id));
++            if (persistent_vdd_mode && exit_code == ERROR_NOT_SUPPORTED) persistent_vdd_mode = false;
++          }
++          if (exit_code == ERROR_SHUTDOWN_IN_PROGRESS) {
+             // Sunshine is asking for us to shut down, so gracefully stop ourselves.
+             SetEvent(stop_event);
+           }
+@@ -739,6 +792,7 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
+ 
+     CloseHandle(process_info.hThread);
+     CloseHandle(process_info.hProcess);
++    CloseHandle(continuity_event);
+     CloseHandle(console_token);
+     CloseHandle(job_handle);
+   }
+@@ -771,6 +825,17 @@ DoGracefulTermination(DWORD pid) {
+ 
+ int
+ main(int argc, char *argv[]) {
++  if (argc == 2 && strcmp(argv[1], "--console-vdd-display") == 0) {
++    if (!platf::console_input_bridge::system_token()) return ERROR_ACCESS_DENIED;
++    return sunshinesvc::vdd::configure_console_display();
++  }
++  if (argc == 5 && strcmp(argv[1], "--console-input-agent") == 0) {
++    std::uintptr_t pipe = 0, status = 0, owner = 0;
++    if (!platf::console_input_bridge::parse_handle(argv[2], pipe) ||
++        !platf::console_input_bridge::parse_handle(argv[3], status) ||
++        !platf::console_input_bridge::parse_handle(argv[4], owner) || owner > MAXDWORD) return ERROR_INVALID_PARAMETER;
++    return platf::console_input_bridge::run_helper(reinterpret_cast<HANDLE>(pipe), reinterpret_cast<HANDLE>(status), static_cast<DWORD>(owner));
++  }
+   static const SERVICE_TABLE_ENTRY service_table[] = {
+     { (LPSTR) SERVICE_NAME, ServiceMain },
+     { NULL, NULL }
+diff --git a/tools/sunshinesvc_state.h b/tools/sunshinesvc_state.h
+index a4d5621c1195069882cf3a2161bd6d5d4e9b5ca8..6bafe89168a0b70b7f5192a4b79d8ffe9c62ccf2 100644
+--- a/tools/sunshinesvc_state.h
++++ b/tools/sunshinesvc_state.h
+@@ -9,6 +9,22 @@
+ 
+ namespace sunshinesvc {
+ 
++  constexpr bool should_retain_transport(bool streaming_active, bool sealed_capture_ready, bool console_input_ready) {
++    return streaming_active && sealed_capture_ready && console_input_ready;
++  }
++
++  enum class ConsoleSessionAction { keep_core, probe_again, restart_core };
++
++  constexpr ConsoleSessionAction console_session_action(std::uint32_t core_session,
++                                                       std::uint32_t active_console,
++                                                       bool sealed_capture_and_input_ready,
++                                                       bool persistent_service_core = false) {
++    if (active_console == UINT32_MAX) return ConsoleSessionAction::probe_again;
++    if (persistent_service_core && core_session == 0) return ConsoleSessionAction::keep_core;
++    if (active_console == core_session || sealed_capture_and_input_ready) return ConsoleSessionAction::keep_core;
++    return ConsoleSessionAction::restart_core;
++  }
++
+   constexpr std::uint32_t GUI_RESTART_INITIAL_DELAY_MS = 1000;
+   constexpr std::uint32_t GUI_RESTART_MAX_DELAY_MS = 30000;
+   constexpr std::uint64_t GUI_RESTART_STABLE_RUNTIME_MS = 60000;
+diff --git a/tools/sunshinesvc_vdd.h b/tools/sunshinesvc_vdd.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..00a1d523cd6b4946081365b82c35a5d03be2be06
+--- /dev/null
++++ b/tools/sunshinesvc_vdd.h
+@@ -0,0 +1,84 @@
++// Hyper-V service-session selection and transient console-local VDD topology.
++#pragma once
++#include <Windows.h>
++#include <SetupAPI.h>
++#include <cwchar>
++#include <string>
++#include <vector>
++#include "../src/display_device/vdd_control_ioctl.h"
++
++namespace sunshinesvc::vdd {
++  inline bool registry_string(const wchar_t *name,const wchar_t *expected) {
++    wchar_t value[256] {};DWORD bytes=sizeof(value);
++    return RegGetValueW(HKEY_LOCAL_MACHINE,L"HARDWARE\\DESCRIPTION\\System\\BIOS",name,
++        RRF_RT_REG_SZ,nullptr,value,&bytes)==ERROR_SUCCESS && _wcsicmp(value,expected)==0;
++  }
++
++  inline bool persistent_core_supported() {
++    if(!registry_string(L"SystemManufacturer",L"Microsoft Corporation") ||
++       !registry_string(L"SystemProductName",L"Virtual Machine")) return false;
++    constexpr GUID control=ZAKO_VDD_CONTROL_GUID_INIT;
++    auto devices=SetupDiGetClassDevsW(&control,nullptr,nullptr,DIGCF_PRESENT|DIGCF_DEVICEINTERFACE);
++    if(devices==INVALID_HANDLE_VALUE)return false;
++    SP_DEVICE_INTERFACE_DATA iface {};iface.cbSize=sizeof(iface);
++    bool supported=false;
++    if(SetupDiEnumDeviceInterfaces(devices,nullptr,&control,0,&iface)) {
++      DWORD required=0;SetupDiGetDeviceInterfaceDetailW(devices,&iface,nullptr,0,&required,nullptr);
++      if(required>=sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W)&&required<=65536) {
++        std::vector<BYTE> buffer(required);auto detail=reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(buffer.data());
++        detail->cbSize=sizeof(*detail);
++        if(SetupDiGetDeviceInterfaceDetailW(devices,&iface,detail,required,nullptr,nullptr)) {
++          auto device=CreateFileW(detail->DevicePath,GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,0,nullptr);
++          if(device!=INVALID_HANDLE_VALUE) {
++            VDD_FRAME_CHANNEL_CAPS caps {};caps.Size=sizeof(caps);DWORD bytes=0;
++            supported=DeviceIoControl(device,IOCTL_VDD_QUERY_FRAME_CHANNEL_CAPS,nullptr,0,&caps,sizeof(caps),&bytes,nullptr) &&
++                bytes>=sizeof(caps) && caps.Size>=sizeof(caps) && caps.Version==VDD_FRAME_CHANNEL_CAPS_VERSION &&
++                (caps.Flags&7u)==7u && caps.MaxSharedSlots>0 && caps.MaxSharedSlots<=VDD_FRAME_CHANNEL_MAX_SLOTS && caps.MetadataSize>=128;
++            CloseHandle(device);
++          }
++        }
++      }
++    }
++    SetupDiDestroyDeviceInfoList(devices);return supported;
++  }
++
++  inline DWORD configure_console_display() {
++    DWORD own=MAXDWORD;ProcessIdToSessionId(GetCurrentProcessId(),&own);
++    if(own==0 || own!=WTSGetActiveConsoleSessionId())return ERROR_RETRY;
++    auto desktop=OpenInputDesktop(0,FALSE,MAXIMUM_ALLOWED);
++    if(!desktop)return GetLastError();
++    if(!SetThreadDesktop(desktop)){auto error=GetLastError();CloseDesktop(desktop);return error;}
++    // This bounded helper exits immediately; the assigned desktop closes then.
++    for(unsigned attempt=0;attempt<3;++attempt) {
++      UINT32 path_count=0,mode_count=0;
++      auto result=GetDisplayConfigBufferSizes(QDC_ALL_PATHS,&path_count,&mode_count);
++      if(result!=ERROR_SUCCESS)return result;
++      std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count);
++      result=QueryDisplayConfig(QDC_ALL_PATHS,&path_count,paths.data(),&mode_count,modes.data(),nullptr);
++      if(result==ERROR_INSUFFICIENT_BUFFER)continue;
++      if(result!=ERROR_SUCCESS)return result;
++      DISPLAYCONFIG_PATH_INFO selected {};bool found=false;unsigned active=0;
++      for(UINT32 i=0;i<path_count;++i) {
++        const auto &path=paths[i];if(path.flags&DISPLAYCONFIG_PATH_ACTIVE)++active;
++        DISPLAYCONFIG_TARGET_DEVICE_NAME name {};name.header.type=DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
++        name.header.size=sizeof(name);name.header.adapterId=path.targetInfo.adapterId;name.header.id=path.targetInfo.id;
++        if(!path.targetInfo.targetAvailable || DisplayConfigGetDeviceInfo(&name.header)!=ERROR_SUCCESS ||
++           _wcsicmp(name.monitorFriendlyDeviceName,L"Zako HDR")!=0)continue;
++        if(found && (selected.targetInfo.id!=path.targetInfo.id ||
++           selected.targetInfo.adapterId.LowPart!=path.targetInfo.adapterId.LowPart ||
++           selected.targetInfo.adapterId.HighPart!=path.targetInfo.adapterId.HighPart))return ERROR_DUP_NAME;
++        if(!found || (path.flags&DISPLAYCONFIG_PATH_ACTIVE))selected=path;
++        found=true;
++      }
++      if(!found)return ERROR_NOT_FOUND;
++      if(active==1 && (selected.flags&DISPLAYCONFIG_PATH_ACTIVE))return ERROR_SUCCESS;
++      if(own!=WTSGetActiveConsoleSessionId())return ERROR_RETRY;
++      selected.flags=DISPLAYCONFIG_PATH_ACTIVE;
++      selected.sourceInfo.modeInfoIdx=DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
++      selected.targetInfo.modeInfoIdx=DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
++      // Apply only to this live console. Do not save a permanent display layout.
++      return SetDisplayConfig(1,&selected,0,nullptr,SDC_APPLY|SDC_USE_SUPPLIED_DISPLAY_CONFIG|SDC_ALLOW_CHANGES);
++    }
++    return ERROR_INSUFFICIENT_BUFFER;
++  }
++}
