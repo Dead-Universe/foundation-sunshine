@@ -273,6 +273,16 @@ namespace display_device::vdd_utils {
   bool
   create_vdd_monitor_noninteractive();
 
+  /**
+   * @brief Normalize the active VDD desktop/source mode to the committed target mode.
+   * @details Direct VDD capture consumes the IddCx target swapchain directly and
+   *          therefore requires identity scaling between the Windows desktop source
+   *          and target signal. Cold topology activation may otherwise restore a
+   *          persisted source mode whose dimensions differ from the target mode.
+   */
+  bool
+  normalize_vdd_source_mode_for_direct_capture();
+
   bool
   destroy_vdd_monitor();
 

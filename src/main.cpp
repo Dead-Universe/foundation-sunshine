@@ -32,12 +32,14 @@
 #include "upnp.h"
 #include "version.h"
 #include "video.h"
+#include "video_probe.h"
 #include "webhook/webhook.h"
 #include "webhook/webhook_auth.h"
 #include "ds5/config.h"
 #include "image_enhancement/config.h"
 
 #ifdef _WIN32
+  #include "display_device/vdd_utils.h"
   #include "platform/windows/misc.h"
   #include "platform/windows/win_dark_mode.h"
 #endif
@@ -158,7 +160,7 @@ mainThreadLoop(const std::shared_ptr<safe::event_t<bool>> &shutdown_event) {
  * never works and nobody knows why" into a timestamped line naming the phase
  * that is stuck.
  */
-void
+bool
 probe_encoders_with_watchdog() {
   constexpr auto report_interval = 30s;
 
@@ -193,6 +195,8 @@ probe_encoders_with_watchdog() {
   else {
     BOOST_LOG(info) << "Encoder probe completed in "sv << elapsed.count() << "ms"sv;
   }
+
+  return !probe_failed;
 }
 
 int
@@ -466,12 +470,6 @@ main(int argc, char *argv[]) {
 
   std::unique_ptr<platf::deinit_t> mDNS;
   std::future<void> sync_mDNS;
-  if (config::sunshine.flags[config::flag::MDNS_BROADCAST]) {
-    BOOST_LOG(info) << "mDNS broadcast enabled"sv;
-    sync_mDNS = std::async(std::launch::async, [&mDNS]() {
-      mDNS = platf::publish::start();
-    });
-  }
 
   std::unique_ptr<platf::deinit_t> upnp_unmap;
   auto sync_upnp = std::async(std::launch::async, [&upnp_unmap]() {
@@ -522,10 +520,132 @@ main(int argc, char *argv[]) {
   // so they stay behind it.
   std::thread configThread { confighttp::start };
 
-  probe_encoders_with_watchdog();
+#ifdef _WIN32
+  // Treat a literal "auto" the same as the UI/default empty value.
+  if (config::video.capture == "auto") {
+    config::video.capture.clear();
+  }
+
+  // Direct VDD capture consumes the IddCx target swapchain. Topology-only VDD
+  // activation can restore a desktop source mode with different dimensions,
+  // which is a valid scaled Windows path but invalid for our 1:1 capture path.
+  if (config::video.capture == "vdd") {
+    if (!display_device::session_t::get().is_display_on()) {
+      BOOST_LOG(info) << "[vdd] Direct capture requested; creating ZakoVDD before encoder probe"sv;
+      if (!display_device::session_t::get().create_vdd_monitor_noninteractive()) {
+        BOOST_LOG(error) << "[vdd] Failed to create ZakoVDD before encoder probe"sv;
+      }
+    }
+
+    if (display_device::session_t::get().is_display_on() &&
+        !display_device::vdd_utils::normalize_vdd_source_mode_for_direct_capture()) {
+      BOOST_LOG(error) << "[vdd] Failed to establish source=target mode before encoder probe"sv;
+    }
+  }
+
+  const bool auto_capture_requested = config::video.capture.empty();
+  const auto auto_vdd_device_id = display_device::find_device_by_friendlyname(ZAKO_NAME);
+  const bool auto_output_targets_vdd =
+    config::video.output_name == VDD_NAME ||
+    (!auto_vdd_device_id.empty() && config::video.output_name == auto_vdd_device_id);
+  const bool auto_output_is_explicit =
+    !config::video.output_name.empty() && !auto_output_targets_vdd;
+  bool auto_vdd_created = false;
+  bool auto_resolved_to_vdd = false;
+
+  const auto prepare_auto_vdd_fallback = [&]() -> bool {
+    auto &display_session = display_device::session_t::get();
+    const bool vdd_was_on = display_session.is_display_on();
+
+    if (!vdd_was_on) {
+      BOOST_LOG(info) << "[capture-auto] Standard Windows capture unavailable; creating ZakoVDD fallback"sv;
+      if (!display_session.create_vdd_monitor_noninteractive()) {
+        BOOST_LOG(warning) << "[capture-auto] ZakoVDD fallback could not be created"sv;
+        return false;
+      }
+      auto_vdd_created = true;
+    }
+    else {
+      BOOST_LOG(info) << "[capture-auto] Reusing active ZakoVDD as fallback candidate"sv;
+    }
+
+    if (!display_session.is_display_on() ||
+        !display_device::vdd_utils::normalize_vdd_source_mode_for_direct_capture()) {
+      BOOST_LOG(warning) << "[capture-auto] ZakoVDD fallback could not establish source=target mode"sv;
+      if (auto_vdd_created) {
+        display_session.destroy_vdd_monitor();
+        auto_vdd_created = false;
+      }
+      return false;
+    }
+
+    config::video.capture = "vdd";
+    auto_resolved_to_vdd = true;
+    BOOST_LOG(info) << "[capture-auto] Resolved capture backend to VDD for this Sunshine process"sv;
+    return true;
+  };
+
+  if (auto_capture_requested && auto_output_targets_vdd) {
+    BOOST_LOG(info) << "[capture-auto] Configured output is ZakoVDD; using VDD capture candidate"sv;
+    prepare_auto_vdd_fallback();
+  }
+  else if (auto_capture_requested && is_running_as_system_user && !auto_output_is_explicit) {
+    const auto ddx_capture_ready_displays = platf::display_names(platf::mem_type_e::dxgi);
+    const bool ddx_capture_ready = !ddx_capture_ready_displays.empty();
+
+    if (video::should_try_vdd_auto_fallback(
+          true,
+          false,
+          ddx_capture_ready,
+          false,
+          false)) {
+      BOOST_LOG(info) << "[capture-auto] No DDX-capable output found in service mode; trying ZakoVDD fallback"sv;
+      prepare_auto_vdd_fallback();
+    }
+  }
+#endif
+
+  [[maybe_unused]] bool encoder_probe_succeeded = probe_encoders_with_watchdog();
+
+#ifdef _WIN32
+  if (auto_capture_requested &&
+      !is_running_as_system_user &&
+      !auto_resolved_to_vdd &&
+      video::should_try_vdd_auto_fallback(
+        false,
+        auto_output_is_explicit,
+        false,
+        true,
+        encoder_probe_succeeded)) {
+    BOOST_LOG(info) << "[capture-auto] DDX/WGC probe failed in interactive mode; trying ZakoVDD fallback"sv;
+    if (prepare_auto_vdd_fallback()) {
+      encoder_probe_succeeded = probe_encoders_with_watchdog();
+    }
+  }
+
+  if (auto_capture_requested && auto_resolved_to_vdd && !encoder_probe_succeeded) {
+    BOOST_LOG(warning) << "[capture-auto] VDD fallback probe failed; restoring Auto capture state"sv;
+    config::video.capture.clear();
+    auto_resolved_to_vdd = false;
+    if (auto_vdd_created) {
+      display_device::session_t::get().destroy_vdd_monitor();
+      auto_vdd_created = false;
+    }
+  }
+#endif
 
   std::thread httpThread { nvhttp::start };
   std::thread rtspThread { rtsp_stream::start };
+
+  // Moonlight requests /serverinfo immediately after mDNS discovery. Advertise
+  // only after the GameStream server threads have been started so a slow graphics
+  // probe cannot publish a host whose advertised HTTP endpoint is not listening.
+  if (config::sunshine.flags[config::flag::MDNS_BROADCAST]) {
+    BOOST_LOG(info) << "mDNS broadcast enabled"sv;
+    sync_mDNS = std::async(std::launch::async, [&mDNS]() {
+      mDNS = platf::publish::start();
+    });
+  }
 
 #if defined(_WIN32) && defined(SUNSHINE_GUI_TRAY) && SUNSHINE_GUI_TRAY >= 1
   // The service wrapper owns user-session agent startup in service mode.

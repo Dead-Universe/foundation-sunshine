@@ -68,17 +68,10 @@ namespace video {
 
     std::optional<std::string>
     capture_override_for_encoder_probe() {
-#ifdef _WIN32
-      // VDD shared-texture producer may not be ready (metadata mapping / KeyedMutex
-      // not yet published) at encoder-probe time. Probing the real VDD backend
-      // therefore tends to fail on cold start, even though runtime capture works
-      // fine once the producer comes up. Fall back to ddx for the probe only;
-      // this override is injected per-display via config_t::capture_backend_override
-      // so it does not mutate the global config::video.capture used at runtime.
-      if (config::video.capture == "vdd") {
-        return std::string { "ddx" };
-      }
-#endif
+      // An explicitly configured VDD backend must be probed through VDD itself.
+      // Hyper-V GPU-PV can expose a working ZakoVDD shared-texture producer while
+      // DXGI Desktop Duplication is unavailable, so substituting DDX here makes
+      // the probe reject the only capture path that can actually work.
       return std::nullopt;
     }
 
