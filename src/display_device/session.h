@@ -8,6 +8,7 @@
 #include <boost/atomic.hpp>
 // local includes
 #include "settings.h"
+#include "vdd_output_state.h"
 #include "vdd_utils.h"
 
 namespace display_device {
@@ -283,7 +284,7 @@ namespace display_device {
     std::mutex mutex; /**< A mutex for ensuring thread-safety. */
     std::string current_vdd_client_id; /**< Current client ID associated with VDD monitor. */
     std::optional<vdd_utils::hdr_brightness_t> current_vdd_hdr_brightness; /**< HDR capabilities currently programmed into VDD. */
-    std::string original_output_name; /**< Original output_name value before VDD device ID was set. */
+    vdd_output_state_t original_output_name; /**< Original output_name, including an empty Auto selection. */
     boost::optional<parsed_config_t::device_prep_e> current_device_prep; /**< Current device preparation mode, respecting client overrides. */
     boost::optional<parsed_config_t::vdd_prep_e> current_vdd_prep; /**< Current VDD preparation mode for VDD mode sessions. */
     boost::optional<bool> current_use_vdd; /**< Whether current session is using VDD mode. */

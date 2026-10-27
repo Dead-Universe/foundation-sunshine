@@ -175,10 +175,8 @@ namespace display_device {
     current_vdd_prep.reset();
     current_use_vdd.reset();
     pending_vdd_.reset();
-    // 恢复原始的 output_name，避免下一个会话使用已销毁的 VDD 设备 ID
-    if (!original_output_name.empty()) {
-      config::video.output_name = original_output_name;
-      original_output_name.clear();
+    // Restore Auto too, so the next session cannot retain a destroyed VDD ID.
+    if (original_output_name.restore(config::video.output_name)) {
       BOOST_LOG(debug) << "已恢复原始 output_name: " << config::video.output_name;
     }
   }
@@ -886,9 +884,8 @@ namespace display_device {
       settings.replace_vdd_id(rebuild_old_vdd_id, device_zako);
     }
 
-    if (original_output_name.empty()) {
-      original_output_name = config::video.output_name;
-      BOOST_LOG(debug) << "保存原始 output_name: " << original_output_name;
+    if (original_output_name.remember(config::video.output_name)) {
+      BOOST_LOG(debug) << "保存原始 output_name: " << config::video.output_name;
     }
 
     // Update configuration and state
