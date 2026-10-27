@@ -11,6 +11,7 @@
 
 namespace platf::service_vdd {
   inline std::atomic<bool> single_display {false};
+  inline std::atomic<UINT64> capture_epoch {1};
   inline bool enabled() { return console_input_bridge::persistent_service_core; }
 
   inline DWORD prepare_console(DWORD session) {
@@ -46,15 +47,16 @@ namespace platf::service_vdd {
       DWORD prepared=MAXDWORD;ULONGLONG retry=0;
       DWORD observed=MAXDWORD,last_result=ERROR_GEN_FAILURE;
       while(!stop.stop_requested()) {
-        if(enabled()&&single_display.load()&&console_input_bridge::streaming_active.load()) {
+        if(enabled()&&console_input_bridge::streaming_active.load()) {
           const auto session=WTSGetActiveConsoleSessionId();
           if(session!=MAXDWORD && (session!=prepared || GetTickCount64()>=retry)) {
-            const auto result=prepare_console(session);
+            const auto result=single_display.load()?prepare_console(session):ERROR_SUCCESS;
             if(observed!=session || last_result!=result) {
               BOOST_LOG(result==ERROR_SUCCESS?info:warning) << "[service-vdd] Console display preparation: session="
                   << session << " result=" << result;
               observed=session;last_result=result;
             }
+            if(result==ERROR_SUCCESS && prepared!=session)capture_epoch.fetch_add(1,std::memory_order_acq_rel);
             prepared=result==ERROR_SUCCESS?session:MAXDWORD;
             retry=GetTickCount64()+(result==ERROR_SUCCESS?30000:2000);
           }
@@ -84,6 +86,7 @@ namespace platf::service_vdd {
     if(display_device::vdd_ioctl::send_command(L"DESTROYMONITOR")!=display_device::vdd_ioctl::result::success)return false;
     Sleep(500);
     if(!display_device::vdd_utils::create_vdd_monitor("persistent_service_vdd",brightness,physical))return false;
+    capture_epoch.fetch_add(1,std::memory_order_acq_rel);
     single_display.store(config.device_prep==display_device::parsed_config_t::device_prep_e::ensure_only_display ||
         config.vdd_prep==display_device::parsed_config_t::vdd_prep_e::display_off);
     Sleep(200);return true;

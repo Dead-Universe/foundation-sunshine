@@ -16,6 +16,7 @@
 #include "display.h"
 #include "misc.h"
 #include "console_input_bridge.h"
+#include "service_vdd.h"
 #include "src/config.h"
 #include "src/display_device/vdd_ioctl.h"
 #include "src/main.h"
@@ -1458,6 +1459,7 @@ namespace platf::dxgi {
 
   int
   display_vdd_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
+    service_capture_epoch = service_vdd::capture_epoch.load(std::memory_order_acquire);
     // Direct VDD selection bypasses the DDX retry that normally wakes the
     // display. After idle power-off, IddCx exposes the output but publishes no
     // frame channel until the interactive session's display is awake again.
