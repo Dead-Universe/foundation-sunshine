@@ -1399,6 +1399,18 @@ namespace platf::dxgi {
 
   int
   display_vdd_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
+    // Direct VDD selection bypasses the DDX retry that normally wakes the
+    // display. After idle power-off, IddCx exposes the output but publishes no
+    // frame channel until the interactive session's display is awake again.
+    // This one-shot request resets the idle timer without changing persistent
+    // thread execution flags or the user's display-sleep policy.
+    if (!SetThreadExecutionState(ES_DISPLAY_REQUIRED)) {
+      BOOST_LOG(warning) << "[vdd] Failed to reset display idle timer before producer discovery"sv;
+    }
+    else {
+      BOOST_LOG(info) << "[vdd] Display wake requested before producer discovery"sv;
+    }
+
     if (display_base_t::init(config, display_name)) {
       BOOST_LOG(error) << "[vdd] display_base_t::init failed for "sv << display_name;
       return -1;
