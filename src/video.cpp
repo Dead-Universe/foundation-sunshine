@@ -52,6 +52,7 @@ extern "C" {
   #include "platform/windows/pyrowave/gpu_encoder.h"
   #include "platform/windows/pyrowave/color_metadata.h"
   #include "platform/windows/display.h"
+  #include "platform/windows/console_input_bridge.h"
 extern "C" {
   #include <libavutil/hwcontext_d3d11va.h>
 }
@@ -5041,6 +5042,17 @@ namespace video {
     // The token itself does not initialize CUDA or create a GPU context.
     const auto nvenc_factory = nvenc::nvenc_dynamic_factory::get();
     const auto cuda_probe_contexts = nvenc_factory ? nvenc_factory->retain_cuda_interop_contexts() : nullptr;
+#endif
+
+#ifdef _WIN32
+    // A sealed service-session producer has no console-local CCD display ID.
+    // Keep the real capture/encoder probe and use its existing auto-selection
+    // policy only for this VDD target; explicit physical targets stay exact.
+    if (target && platf::console_input_bridge::persistent_service_core &&
+        config::video.capture == "vdd" && target->output_name.empty() &&
+        target->policy == probe_target_policy_e::vdd_compatible) {
+      target->policy = probe_target_policy_e::backend_autoselect;
+    }
 #endif
 
     const auto configured_output_name = target ? target->output_name : config::video.output_name;
