@@ -52,7 +52,6 @@ namespace platf::console_input_bridge {
 
   struct helper_status {
     volatile LONG ready = 0;
-    volatile LONG error = ERROR_SUCCESS;
     volatile LONG session = -1;
     input_queue inputs;
   };
@@ -87,7 +86,6 @@ namespace platf::console_input_bridge {
     const bool ready = owner && sync_desktop();
     if (ready) SetThreadExecutionState(ES_DISPLAY_REQUIRED);
     InterlockedExchange(&status->session, static_cast<LONG>(session));
-    InterlockedExchange(&status->error, ready ? ERROR_SUCCESS : static_cast<LONG>(GetLastError()));
     InterlockedExchange(&status->ready, ready ? 1 : -1);
     bool active = ready;
     HANDLE waits[] {owner, data_event};
@@ -98,11 +96,11 @@ namespace platf::console_input_bridge {
         // Fail closed if the console changed after the parent selected this helper.
         if (WTSGetActiveConsoleSessionId() != session ||
             (input.type != INPUT_KEYBOARD && input.type != INPUT_MOUSE)) { active = false; break; }
-        if (!sync_desktop()) { InterlockedExchange(&status->error, GetLastError()); continue; }
+        if (!sync_desktop()) continue;
         if (WTSGetActiveConsoleSessionId() != session) { active = false; break; }
         if (input.type == INPUT_KEYBOARD) input.ki.dwExtraInfo = 0;
         else input.mi.dwExtraInfo = 0;
-        InterlockedExchange(&status->error, SendInput(1, &input, sizeof(input)) == 1 ? ERROR_SUCCESS : static_cast<LONG>(GetLastError()));
+        SendInput(1, &input, sizeof(input));
       }
     }
     if (owner) CloseHandle(owner);

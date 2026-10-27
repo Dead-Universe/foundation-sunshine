@@ -67,14 +67,6 @@ namespace video {
     std::map<std::uint64_t, hdr_pipeline_status_t> hdr_pipeline_statuses;
     std::atomic<std::uint64_t> next_hdr_pipeline_status_id { 1 };
 
-    std::optional<std::string>
-    capture_override_for_encoder_probe() {
-      // An explicitly configured VDD backend must be probed through VDD itself.
-      // Hyper-V GPU-PV can expose a working ZakoVDD shared-texture producer while
-      // DXGI Desktop Duplication is unavailable, so substituting DDX here makes
-      // the probe reject the only capture path that can actually work.
-      return std::nullopt;
-    }
 
     /**
      * @brief Check if we can allow probing for the encoders.
@@ -1808,6 +1800,13 @@ namespace video {
   }
 
   void
+  publish_capture_target(const config_t &config, const platf::display_t &disp) {
+    if (config.capture_target) {
+      config.capture_target->set(disp.captured_display_name());
+    }
+  }
+
+  void
   captureThread(
     std::shared_ptr<safe::queue_t<capture_ctx_t>> capture_ctx_queue,
     sync_util::sync_t<std::weak_ptr<platf::display_t>> &display_wp,
@@ -1912,6 +1911,7 @@ namespace video {
     if (!disp) {
       return;
     }
+    publish_capture_target(config, *disp);
     active_display_event->raise(target_display_name);
     display_wp = disp;
 
@@ -1929,6 +1929,7 @@ namespace video {
         // 同一个捕获线程中的会话共享当前显示器。手动切换显示器后加入的会话
         // 必须继承当前目标，避免后续重新初始化跳回它启动时选择的显示器。
         capture_ctx->config.display_name = target_display_name;
+        publish_capture_target(capture_ctx->config, *disp);
         if (initial_img) {
           // 锁屏或静态桌面可能长时间没有新的 Desktop Duplication 帧。
           // 新会话必须先取得当前画面，不能一直编码初始化用的黑色占位帧。
@@ -2187,6 +2188,9 @@ namespace video {
             // reset_display() will sleep between retries
             reset_capture_display(disp, target_display_name, config);
             if (disp) {
+              for (auto &capture_ctx : capture_ctxs) {
+                publish_capture_target(capture_ctx.config, *disp);
+              }
               active_display_event->raise(target_display_name);
               break;
             }
@@ -4056,6 +4060,9 @@ namespace video {
       reset_display(disp, encoder.platform_formats->dev_type, target_display_name, config);
       if (disp) {
         active_display_name = target_display_name;
+        for (auto &ctx : synced_session_ctxs) {
+          publish_capture_target(ctx->config, *disp);
+        }
         active_display_event->raise(target_display_name);
         break;
       }
@@ -4093,6 +4100,7 @@ namespace video {
           // active target in newly joined contexts so the next reinit does not
           // restore their stale launch-time display selection.
           encode_session_ctx->config.display_name = active_display_name;
+          publish_capture_target(encode_session_ctx->config, *disp);
           synced_session_ctxs.emplace_back(std::make_unique<sync_session_ctx_t>(std::move(*encode_session_ctx)));
 
           auto encode_session = make_synced_session(disp.get(), encoder, *img, *synced_session_ctxs.back());
@@ -5034,8 +5042,6 @@ namespace video {
       return 0;
     }
 
-    const auto probe_capture_override = capture_override_for_encoder_probe();
-
 #ifdef _WIN32
     // Reuse CUDA interop across this probe's short-lived 10-bit 4:4:4
     // candidates, but release it on every exit when no real encoder needs it.
@@ -5069,42 +5075,7 @@ namespace video {
       return -1;
     }
     auto probe_display_name = configured_display_name;
-    if (probe_capture_override) {
-      // The Windows implementation enumerates all DXGI capture-ready outputs
-      // regardless of memory type, so one pass serves every encoder candidate.
-      const auto capture_ready_displays = encoder_list.empty() ?
-                                            std::vector<std::string> {} :
-                                            platf::display_names(encoder_list.front()->platform_formats->dev_type);
-      const bool exact_target_unavailable = target_requires_exact_resolution &&
-                                            std::ranges::find(capture_ready_displays, configured_display_name) == capture_ready_displays.end();
-      if (exact_target_unavailable) {
-        last_encoder_probe_result = {
-          probe_error_e::no_active_display,
-          "The requested display is not available to the encoder probe capture backend.",
-          "Connect or enable the selected display, then try again."
-        };
-        BOOST_LOG(error) << "Requested output ["sv << configured_output_name
-                         << "] is unavailable to temporary capture backend ["sv
-                         << *probe_capture_override << "]"sv;
-        return -1;
-      }
-      probe_display_name = select_encoder_probe_display(configured_display_name, capture_ready_displays);
-      if (target && target->policy != probe_target_policy_e::backend_autoselect &&
-          !configured_output_name.empty() && configured_display_name.empty()) {
-        BOOST_LOG(warning) << "Configured output ["sv << configured_output_name
-                           << "] could not be resolved for temporary capture backend ["sv
-                           << *probe_capture_override
-                           << "]; encoder probing will use backend display auto-selection"sv;
-      }
-      else if (target && target->policy != probe_target_policy_e::backend_autoselect &&
-               !configured_display_name.empty() && probe_display_name.empty()) {
-        BOOST_LOG(warning) << "Configured output ["sv << configured_display_name
-                           << "] is unavailable to temporary capture backend ["sv
-                           << *probe_capture_override
-                           << "]; encoder probing will use backend display auto-selection"sv;
-      }
-    }
-    else if (target && target->policy == probe_target_policy_e::vdd_compatible && configured_display_name.empty()) {
+    if (target && target->policy == probe_target_policy_e::vdd_compatible && configured_display_name.empty()) {
       last_encoder_probe_result = {
         probe_error_e::no_active_display,
         "The requested display is not connected or active for encoder probing.",
@@ -5154,7 +5125,7 @@ namespace video {
           if (!validate_encoder(
                 *encoder,
                 previous_encoder && previous_encoder != encoder,
-                probe_capture_override,
+                std::nullopt,
                 probe_display_name)) {
             pos = encoder_list.erase(pos);
             break;
@@ -5186,7 +5157,7 @@ namespace video {
         if (!validate_encoder(
               *encoder,
               previous_encoder && previous_encoder != encoder,
-              probe_capture_override,
+              std::nullopt,
               probe_display_name)) {
           pos = encoder_list.erase(pos);
           continue;
@@ -5227,7 +5198,7 @@ namespace video {
         if (!validate_encoder(
               *encoder,
               previous_encoder && previous_encoder != encoder,
-              probe_capture_override,
+              std::nullopt,
               probe_display_name)) {
           pos = encoder_list.erase(pos);
           continue;

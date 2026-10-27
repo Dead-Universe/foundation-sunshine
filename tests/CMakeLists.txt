@@ -7,6 +7,32 @@ include_directories("${CMAKE_SOURCE_DIR}")
 
 enable_testing()
 
+if (WIN32)
+    # Standalone MAT sender tests use a mock consumer, never an audio device.
+    set(MAT_RECEIVER_TEST_SOURCES
+            ${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/MatLivePlayback.c
+            ${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/MatReceiver.c
+            ${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src/MatDepacketizer.c)
+    add_executable(mat_live_host_tests mat-live/host_test.cpp ${MAT_RECEIVER_TEST_SOURCES})
+    target_link_libraries(mat_live_host_tests PRIVATE OpenSSL::Crypto bcrypt advapi32 shell32 ole32 uuid)
+    set_target_properties(mat_live_host_tests PROPERTIES CXX_STANDARD 23 LINK_SEARCH_START_STATIC 1)
+    add_test(NAME mat_live_host_tests COMMAND mat_live_host_tests)
+    set_tests_properties(mat_live_host_tests PROPERTIES TIMEOUT 15)
+    # Reuse the dependency's authentication/tamper cases without duplicating them.
+    add_executable(mat_live_crypto_tests
+            ${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/tests/MatLiveTest.c
+            ${MAT_RECEIVER_TEST_SOURCES})
+    target_include_directories(mat_live_crypto_tests PRIVATE ${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src)
+    target_link_libraries(mat_live_crypto_tests PRIVATE OpenSSL::Crypto)
+    add_test(NAME mat_live_crypto_tests COMMAND mat_live_crypto_tests)
+    set_tests_properties(mat_live_crypto_tests PROPERTIES TIMEOUT 15)
+    add_executable(mat_mock_output_tests mat-live/mock_output_test.c ${MAT_RECEIVER_TEST_SOURCES})
+    target_include_directories(mat_mock_output_tests PRIVATE ${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/src)
+    target_link_libraries(mat_mock_output_tests PRIVATE OpenSSL::Crypto)
+    add_test(NAME mat_mock_output_tests COMMAND mat_mock_output_tests)
+    set_tests_properties(mat_mock_output_tests PROPERTIES TIMEOUT 15)
+endif ()
+
 # Add GoogleTest directory to the project
 set(GTEST_SOURCE_DIR "${CMAKE_SOURCE_DIR}/third-party/googletest")
 set(INSTALL_GTEST OFF)
@@ -37,6 +63,20 @@ target_include_directories(display_scale_steps_unit_tests PRIVATE "${CMAKE_SOURC
 target_link_libraries(display_scale_steps_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
 set_target_properties(display_scale_steps_unit_tests PROPERTIES CXX_STANDARD 23)
 add_test(NAME display_scale_steps_unit_tests COMMAND display_scale_steps_unit_tests)
+
+add_executable(vdd_mode_list_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_vdd_mode_list.cpp)
+target_include_directories(vdd_mode_list_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(vdd_mode_list_unit_tests PRIVATE gtest_main nlohmann_json::nlohmann_json
+        Boost::optional
+        sunshine_project_options sunshine_coverage)
+set_target_properties(vdd_mode_list_unit_tests PROPERTIES CXX_STANDARD 23)
+add_test(NAME vdd_mode_list_unit_tests COMMAND vdd_mode_list_unit_tests)
+
+add_executable(current_capture_target_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_current_capture_target.cpp)
+target_include_directories(current_capture_target_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(current_capture_target_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
+set_target_properties(current_capture_target_unit_tests PROPERTIES CXX_STANDARD 23)
+add_test(NAME current_capture_target_unit_tests COMMAND current_capture_target_unit_tests)
 
 add_executable(pen_barrel_roll_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_pen_barrel_roll.cpp)
 target_include_directories(pen_barrel_roll_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}/third-party")
@@ -524,12 +564,15 @@ file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS
 # Standalone diagnostic programs under tests/tools have their own targets and
 # must not be linked into the aggregate GoogleTest executable.
 list(FILTER TEST_SOURCES EXCLUDE REGEX "/tests/tools/")
+# MAT harnesses have independent entrypoints and explicit test targets.
+list(FILTER TEST_SOURCES EXCLUDE REGEX "/tests/mat-live/")
 # These files already run in registered standalone suites. Keep one copy of
 # their assertions and isolate their fixtures from the aggregate host state.
 list(REMOVE_ITEM TEST_SOURCES
         ${CMAKE_SOURCE_DIR}/tests/unit/test_ai_provider.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_client_fingerprint.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_config_overrides.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_current_capture_target.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_display_scale_steps.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_frame_contract.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_http_util.cpp

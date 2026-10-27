@@ -662,10 +662,8 @@ main(int argc, char *argv[]) {
   if (auto_capture_requested && auto_resolved_to_vdd && !encoder_probe_succeeded) {
     BOOST_LOG(warning) << "[capture-auto] VDD fallback probe failed; restoring Auto capture state"sv;
     config::video.capture.clear();
-    auto_resolved_to_vdd = false;
     if (auto_vdd_created) {
       display_device::session_t::get().destroy_vdd_monitor();
-      auto_vdd_created = false;
     }
   }
 #endif
