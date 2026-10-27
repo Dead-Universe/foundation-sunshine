@@ -17,6 +17,8 @@
 
 #include "sunshinesvc_log.h"
 #include "sunshinesvc_state.h"
+#include "../src/platform/windows/console_input_bridge.h"
+#include "sunshinesvc_vdd.h"
 
 // PROC_THREAD_ATTRIBUTE_JOB_LIST is currently missing from MinGW headers
 #ifndef PROC_THREAD_ATTRIBUTE_JOB_LIST
@@ -577,6 +579,9 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
     }
   };
 
+  // Anonymous console sessions are destroyed after credential handoff, including
+  // their SYSTEM processes. Only a service-session Core can outlive that event.
+  bool persistent_vdd_mode = sunshinesvc::vdd::persistent_core_supported();
   // Loop every 3 seconds until the stop event is set or Sunshine.exe is running
   while (WaitForSingleObject(stop_event, 3000) != WAIT_OBJECT_0) {
     auto console_session_id = WTSGetActiveConsoleSessionId();
@@ -595,7 +600,8 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
       gui_agent_log_limiter.reset();
     }
 
-    auto console_token = DuplicateTokenForSession(console_session_id);
+    const DWORD core_session_id = persistent_vdd_mode ? 0 : console_session_id;
+    auto console_token = DuplicateTokenForSession(core_session_id);
     if (console_token == NULL) {
       continue;
     }
@@ -616,10 +622,18 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
       NULL,
       NULL);
 
+    // The child duplicates this anonymous event from its SYSTEM parent.
+    // Only sealed VDD plus a ready console input helper may signal it.
+    auto continuity_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!continuity_event) { CloseHandle(console_token); CloseHandle(job_handle); continue; }
+    auto core_command = L"Sunshine.exe --service-session-event " + std::to_wstring(GetCurrentProcessId()) + L" " +
+                        std::to_wstring(reinterpret_cast<std::uintptr_t>(continuity_event));
+    if (persistent_vdd_mode) core_command += L" --service-vdd-core";
+    WriteServiceLog(log_file_handle, "Starting Core in Windows session " + std::to_string(core_session_id));
     PROCESS_INFORMATION process_info;
     if (!CreateProcessAsUserW(console_token,
           L"Sunshine.exe",
-          NULL,
+          core_command.data(),
           NULL,
           NULL,
           TRUE,
@@ -630,6 +644,7 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
           &process_info)) {
       CloseHandle(console_token);
       CloseHandle(job_handle);
+      CloseHandle(continuity_event);
       continue;
     }
 
@@ -659,13 +674,18 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
     }
 
     bool still_running;
+    bool session_probe_pending = false;
+    bool core_detached = false;
+    DWORD last_console = console_session_id;
     do {
       // Wait on the exact GUI process while it is managed. After a clean exit,
       // only a low-frequency lookup runs so externally launched replacements
       // can be reattached without allowing the service to revive the GUI.
       const HANDLE wait_objects[] = { stop_event, process_info.hProcess, session_change_event, gui_agent.handle };
       const DWORD wait_object_count = gui_agent.handle == NULL ? 3 : 4;
-      const DWORD wait_timeout = gui_agent.handle == NULL ? RetryWaitTimeout(gui_agent_retry_at_ms) : INFINITE;
+      const DWORD gui_wait_timeout = gui_agent.handle == NULL ? RetryWaitTimeout(gui_agent_retry_at_ms) : INFINITE;
+      const DWORD console_poll = session_probe_pending ? 50 : (core_detached ? 500 : INFINITE);
+      const DWORD wait_timeout = std::min(gui_wait_timeout, console_poll);
       const auto wait_result = WaitForMultipleObjects(wait_object_count, wait_objects, FALSE, wait_timeout);
       switch (wait_result) {
         case WAIT_TIMEOUT:
@@ -677,22 +697,50 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
             still_running = true;
             break;
           }
-          if (gui_agent_restart_policy.launch_allowed()) {
-            acquire_gui_agent();
+          if (session_probe_pending || core_detached) {
+            session_probe_pending = false;
+            SetEvent(session_change_event);
           }
-          else {
-            reattach_gui_agent();
+          if (gui_agent.handle == NULL && RetryWaitTimeout(gui_agent_retry_at_ms) == 0) {
+            if (gui_agent_restart_policy.launch_allowed()) acquire_gui_agent();
+            else reattach_gui_agent();
           }
           still_running = true;
           break;
 
-        case WAIT_OBJECT_0 + 2:
-          if (WTSGetActiveConsoleSessionId() == console_session_id) {
-            // The active console session didn't actually change. Let Sunshine keep running.
+        case WAIT_OBJECT_0 + 2: {
+          const auto target = WTSGetActiveConsoleSessionId();
+          const bool independent = WaitForSingleObject(continuity_event, 0) == WAIT_OBJECT_0;
+          const auto action = sunshinesvc::console_session_action(core_session_id, target, independent, persistent_vdd_mode);
+          if (action == sunshinesvc::ConsoleSessionAction::probe_again) {
+            session_probe_pending = true;
             still_running = true;
-            continue;
+            break;
           }
-          // Fall-through to terminate Sunshine.exe and start it again.
+          if (action == sunshinesvc::ConsoleSessionAction::keep_core) {
+            core_detached = target != console_session_id;
+            if (target != last_console) {
+              WriteServiceLog(log_file_handle, "Console moved to session " + std::to_string(target) +
+                  "; preserving sealed-VDD Core PID " + std::to_string(process_info.dwProcessId) +
+                  " in session " + std::to_string(core_session_id));
+            }
+            last_console = target;
+            if (gui_agent_session_id != target) {
+              CloseGuiAgentHandle(gui_agent);
+              gui_agent_session_id = target;
+              gui_agent_last_error = ERROR_SUCCESS;
+              gui_agent_retry_at_ms = 0;
+              gui_agent_backoff.reset();
+              gui_agent_restart_policy.resume_supervision();
+              gui_agent_log_limiter.reset();
+            }
+            still_running = true;
+            break;
+          }
+          WriteServiceLog(log_file_handle, "Console moved from session " + std::to_string(console_session_id) +
+              " to " + std::to_string(target) + "; Core capture is not session-independent; restarting");
+          // Standard capture still requires a process in the new session.
+        }
           [[fallthrough]];
         case WAIT_OBJECT_0:
           // The service is shutting down, so try to gracefully terminate Sunshine.exe.
@@ -715,8 +763,13 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
         case WAIT_OBJECT_0 + 1: {
           // Sunshine terminated itself.
 
-          DWORD exit_code;
-          if (GetExitCodeProcess(process_info.hProcess, &exit_code) && exit_code == ERROR_SHUTDOWN_IN_PROGRESS) {
+          DWORD exit_code = ERROR_PROCESS_ABORTED;
+          if (GetExitCodeProcess(process_info.hProcess, &exit_code)) {
+            WriteServiceLog(log_file_handle, "Core PID " + std::to_string(process_info.dwProcessId) +
+                " exited with code " + std::to_string(exit_code) + " from session " + std::to_string(core_session_id));
+            if (persistent_vdd_mode && exit_code == ERROR_NOT_SUPPORTED) persistent_vdd_mode = false;
+          }
+          if (exit_code == ERROR_SHUTDOWN_IN_PROGRESS) {
             // Sunshine is asking for us to shut down, so gracefully stop ourselves.
             SetEvent(stop_event);
           }
@@ -739,6 +792,7 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
 
     CloseHandle(process_info.hThread);
     CloseHandle(process_info.hProcess);
+    CloseHandle(continuity_event);
     CloseHandle(console_token);
     CloseHandle(job_handle);
   }
@@ -771,6 +825,17 @@ DoGracefulTermination(DWORD pid) {
 
 int
 main(int argc, char *argv[]) {
+  if (argc == 2 && strcmp(argv[1], "--console-vdd-display") == 0) {
+    if (!platf::console_input_bridge::system_token()) return ERROR_ACCESS_DENIED;
+    return sunshinesvc::vdd::configure_console_display();
+  }
+  if (argc == 5 && strcmp(argv[1], "--console-input-agent") == 0) {
+    std::uintptr_t pipe = 0, status = 0, owner = 0;
+    if (!platf::console_input_bridge::parse_handle(argv[2], pipe) ||
+        !platf::console_input_bridge::parse_handle(argv[3], status) ||
+        !platf::console_input_bridge::parse_handle(argv[4], owner) || owner > MAXDWORD) return ERROR_INVALID_PARAMETER;
+    return platf::console_input_bridge::run_helper(reinterpret_cast<HANDLE>(pipe), reinterpret_cast<HANDLE>(status), static_cast<DWORD>(owner));
+  }
   static const SERVICE_TABLE_ENTRY service_table[] = {
     { (LPSTR) SERVICE_NAME, ServiceMain },
     { NULL, NULL }

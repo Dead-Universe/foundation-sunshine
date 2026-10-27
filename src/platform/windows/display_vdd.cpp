@@ -15,6 +15,7 @@
 
 #include "display.h"
 #include "misc.h"
+#include "console_input_bridge.h"
 #include "src/config.h"
 #include "src/display_device/vdd_ioctl.h"
 #include "src/main.h"
@@ -1397,6 +1398,64 @@ namespace platf::dxgi {
     return {};
   }
 
+  bool
+  display_vdd_vram_t::init_headless_target(const ::video::config_t &config) {
+    if (!console_input_bridge::needs_forwarding()) return false;
+    display_device::vdd_ioctl::frame_channel_caps caps {};
+    if (probe_sealed_frame_channel(caps) != vdd_frame_channel::channel_selection::unknown) return false;
+    const auto deadline = GetTickCount64() + 5000;
+    for (;;) {
+    adapter_t selected_adapter;
+    SharedFrameMetadata selected {};
+    unsigned int selected_monitor = 0;
+    unsigned int matches = 0;
+    const auto configured_adapter = from_utf8(config::video.adapter_name);
+    for (unsigned int index = 0; index < 32; ++index) {
+      adapter_t candidate;
+      const auto hr = factory->EnumAdapters1(index, &candidate);
+      if (hr != S_OK) break;
+      DXGI_ADAPTER_DESC1 desc {};
+      if (FAILED(candidate->GetDesc1(&desc)) || (!configured_adapter.empty() && configured_adapter != desc.Description)) continue;
+      for (unsigned int monitor = 0; monitor < 16; ++monitor) {
+        display_device::vdd_ioctl::frame_channel_open_response channel {};
+        if (open_sealed_frame_channel(monitor, desc.AdapterLuid, caps.max_shared_slots, channel, false) != display_device::vdd_ioctl::frame_channel_open_status::opened) continue;
+        auto close_channel = util::fail_guard([&]() { close_sealed_frame_channel_handles(channel); });
+        auto view = static_cast<const SharedFrameMetadata *>(MapViewOfFile(reinterpret_cast<HANDLE>(channel.metadata_handle), FILE_MAP_READ, 0, 0, sizeof(SharedFrameMetadata)));
+        if (!view) continue;
+        SharedFrameMetadata meta {};
+        const bool valid = vdd_frame_channel::read_stable_metadata(view, meta) && vdd_metadata_is_attachable(meta, desc.AdapterLuid);
+        UnmapViewOfFile(view);
+        if (!valid) continue;
+        if (++matches != 1) {
+          BOOST_LOG(error) << "[vdd] Multiple sealed producers are visible across sessions; refusing an ambiguous capture target"sv;
+          return false;
+        }
+        selected_adapter = std::move(candidate);
+        selected = meta;
+        selected_monitor = monitor;
+        // Keep enumerating this adapter with a separate COM reference.
+        if (FAILED(selected_adapter->QueryInterface(IID_IDXGIAdapter1, reinterpret_cast<void **>(&candidate)))) return false;
+      }
+    }
+    if (matches != 1) {
+      if (!console_input_bridge::persistent_service_core || GetTickCount64() >= deadline) return false;
+      Sleep(100);
+      continue;
+    }
+    adapter = std::move(selected_adapter);
+    monitor_idx = selected_monitor;
+    width = width_before_rotation = env_width = selected.Width;
+    height = height_before_rotation = env_height = selected.Height;
+    offset_x = offset_y = 0;
+    display_rotation = DXGI_MODE_ROTATION_IDENTITY;
+    display_refresh_rate = {static_cast<UINT>(std::max(config.framerate, 1)), 1};
+    display_refresh_rate_rounded = std::max(config.framerate, 1);
+    BOOST_LOG(info) << "[vdd] Restoring sealed capture across Windows sessions without a session-local DXGI output: monitor="sv
+                    << monitor_idx << " size="sv << width << 'x' << height;
+    return true;
+    }
+  }
+
   int
   display_vdd_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
     // Direct VDD selection bypasses the DDX retry that normally wakes the
@@ -1537,6 +1596,10 @@ namespace platf::dxgi {
                     << " producer_slots="sv << dup.producer_slot_count()
                     << " generation="sv << dup.producer_channel_generation()
                     << " borrowed_texture="sv << vdd_borrow_enabled;
+
+    if (!dup.legacy_named_channel() && console_input_bridge::enable_for_sealed_vdd()) {
+      BOOST_LOG(info) << "[vdd] Session-independent capture and console input helper are ready"sv;
+    }
 
     // Cursor export is optional and older drivers do not expose it. Likewise,
     // a cursor-only shader failure must not take down otherwise valid capture.

@@ -41,6 +41,8 @@
 #ifdef _WIN32
   #include "display_device/vdd_utils.h"
   #include "platform/windows/misc.h"
+  #include "platform/windows/console_input_bridge.h"
+  #include "platform/windows/service_vdd.h"
   #include "platform/windows/win_dark_mode.h"
 #endif
 
@@ -204,6 +206,21 @@ main(int argc, char *argv[]) {
   lifetime::argv = argv;
 
 #ifdef _WIN32
+  if ((argc == 4 || argc == 5) && std::string_view(argv[1]) == "--service-session-event") {
+    std::uintptr_t parent = 0, event = 0;
+    if (!platf::console_input_bridge::parse_handle(argv[2], parent) || parent > MAXDWORD ||
+        !platf::console_input_bridge::parse_handle(argv[3], event) ||
+        !platf::console_input_bridge::bind_service_event(static_cast<DWORD>(parent), reinterpret_cast<HANDLE>(event))) {
+      return ERROR_INVALID_HANDLE;
+    }
+    if (argc == 5) {
+      DWORD session = MAXDWORD;
+      if (std::string_view(argv[4]) != "--service-vdd-core" ||
+          !ProcessIdToSessionId(GetCurrentProcessId(), &session) || session != 0) return ERROR_ACCESS_DENIED;
+      platf::console_input_bridge::persistent_service_core = true;
+    }
+    argc = 1;
+  }
   // Note: this only fires on a normal `return` from main. If the program
   // crashes mid-run (uncaught exception, AV, abort/terminate), atexit is
   // not invoked, so the service supervisor still observes a non-zero exit
@@ -251,6 +268,18 @@ main(int argc, char *argv[]) {
 
   // logging can begin at this point
   // if anything is logged prior to this point, it will appear in stdout, but not in the log viewer in the UI
+#ifdef _WIN32
+  if (platf::service_vdd::enabled()) {
+    if (!config::video.capture.empty() && config::video.capture != "auto" && config::video.capture != "vdd") {
+      BOOST_LOG(warning) << "Persistent service Core requires VDD; retaining the explicitly configured capture backend";
+      g_final_exit_code.store(ERROR_NOT_SUPPORTED);
+      return ERROR_NOT_SUPPORTED;
+    }
+    config::video.capture = "vdd";
+    config::video.output_name.clear();
+    BOOST_LOG(info) << "[service-vdd] Persistent Core is running in Windows service session 0";
+  }
+#endif
   // the version should be printed to the log before anything else
   BOOST_LOG(info) << PROJECT_NAME << " version: " << PROJECT_VER;
 
@@ -529,7 +558,14 @@ main(int argc, char *argv[]) {
   // Direct VDD capture consumes the IddCx target swapchain. Topology-only VDD
   // activation can restore a desktop source mode with different dimensions,
   // which is a valid scaled Windows path but invalid for our 1:1 capture path.
-  if (config::video.capture == "vdd") {
+  if (platf::service_vdd::enabled()) {
+    display_device::parsed_config_t initial {};
+    if (!platf::service_vdd::prepare_monitor(initial, 1280, 720, 60)) {
+      BOOST_LOG(warning) << "[service-vdd] Initial VDD preparation failed; launch will retry the driver channel";
+    }
+    platf::service_vdd::start_display_follower();
+  }
+  else if (config::video.capture == "vdd") {
     if (!display_device::session_t::get().is_display_on()) {
       BOOST_LOG(info) << "[vdd] Direct capture requested; creating ZakoVDD before encoder probe"sv;
       if (!display_device::session_t::get().create_vdd_monitor_noninteractive()) {

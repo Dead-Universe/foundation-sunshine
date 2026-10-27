@@ -200,6 +200,10 @@ namespace platf::dxgi {
     capture_e
     capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) override;
 
+    // Only the sealed VDD backend can provide a target independently of
+    // this process's Windows-session DXGI output list.
+    virtual bool init_headless_target(const ::video::config_t &) { return false; }
+
     factory1_t factory;
     adapter_t adapter;
     output_t output;
@@ -861,6 +865,7 @@ namespace platf::dxgi {
    * driver via vdd_capture_t. Mirrors display_amd_vram_t / display_wgc_vram_t.
    */
   class display_vdd_vram_t: public display_vram_t {
+    bool init_headless_target(const ::video::config_t &config) override;
     vdd_capture_t dup;
     unsigned int monitor_idx = 0;
     ID3D11Texture2D *current_frame = nullptr;  // Owned ref from dup.next_frame (via AddRef), released in release_snapshot
