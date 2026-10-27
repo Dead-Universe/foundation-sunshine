@@ -1204,13 +1204,20 @@ namespace platf::dxgi {
                                  const display_device::vdd_ioctl::frame_channel_caps &sealed_caps,
                                  unsigned int target_w,
                                  unsigned int target_h,
-                                 unsigned int max_probe) {
+                                 unsigned int max_probe,
+                                 bool report_failures = false) {
     vdd_probe_result_t result;
 
     const UINT32 desired_slots = std::min<UINT32>(vdd_frame_channel::max_shared_slots, sealed_caps.max_shared_slots);
     for (unsigned int i = 0; i < max_probe; ++i) {
       display_device::vdd_ioctl::frame_channel_open_response sealed_channel;
-      const auto open_status = open_sealed_frame_channel(i, device_luid, desired_slots, sealed_channel, false);
+      const auto open_status = open_sealed_frame_channel(i, device_luid, desired_slots, sealed_channel, report_failures);
+      if (report_failures) {
+        BOOST_LOG(warning) << "[vdd] producer discovery: monitor="sv << i
+                           << " status="sv << display_device::vdd_ioctl::frame_channel_open_status_name(open_status)
+                           << " target="sv << target_w << 'x' << target_h
+                           << " device_luid="sv << device_luid.LowPart << ':' << device_luid.HighPart;
+      }
       if (open_status == display_device::vdd_ioctl::frame_channel_open_status::unsupported ||
           open_status == display_device::vdd_ioctl::frame_channel_open_status::interface_missing) {
         close_sealed_frame_channel_handles(sealed_channel);
@@ -1245,6 +1252,13 @@ namespace platf::dxgi {
       UnmapViewOfFile(p_meta);
       close_sealed_frame_channel_handles(sealed_channel);
       if (!valid) {
+        if (report_failures) {
+          BOOST_LOG(warning) << "[vdd] producer metadata rejected: monitor="sv << i
+                             << " stable="sv << stable << " reason="sv << static_cast<int>(validation.reason)
+                             << " producer_luid="sv << meta_snapshot.AdapterLuidLowPart << ':' << meta_snapshot.AdapterLuidHighPart
+                             << " size="sv << meta_snapshot.Width << 'x' << meta_snapshot.Height
+                             << " metadata_size="sv << meta_snapshot.MetadataSize;
+        }
         BOOST_LOG(debug) << "[vdd] sealed probe rejected monitor "sv << i
                          << " stable="sv << stable
                          << " reason="sv << static_cast<int>(validation.reason);
@@ -1336,8 +1350,9 @@ namespace platf::dxgi {
     vdd_probe_result_t last_result;
     const auto deadline = deadline_override.value_or(std::chrono::steady_clock::now() + vdd_producer_discovery_window);
 
+    bool report_failures = false;
     for (;;) {
-      last_result = probe_sealed_vdd_monitor_index(*device_luid, sealed_caps, target_w, target_h, max_probe);
+      last_result = probe_sealed_vdd_monitor_index(*device_luid, sealed_caps, target_w, target_h, max_probe, report_failures);
       const auto selection = vdd_frame_channel::select_producer(
         last_result.exact,
         last_result.only_valid,
@@ -1357,8 +1372,13 @@ namespace platf::dxgi {
         return selection;
       }
 
-      if (std::chrono::steady_clock::now() >= deadline) {
+      if (report_failures) {
         break;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        // Report one final probe instead of flooding the log on every retry.
+        report_failures = true;
+        continue;
       }
 
       std::this_thread::sleep_for(vdd_producer_discovery_retry_delay);
