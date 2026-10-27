@@ -1459,6 +1459,7 @@ namespace platf::dxgi {
 
   int
   display_vdd_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
+    if (!service_vdd::refresh_console_producer()) return -1;
     service_capture_epoch = service_vdd::capture_epoch.load(std::memory_order_acquire);
     // Direct VDD selection bypasses the DDX retry that normally wakes the
     // display. After idle power-off, IddCx exposes the output but publishes no

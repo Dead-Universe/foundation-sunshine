@@ -7,11 +7,23 @@
 #include "src/display_device/vdd_ioctl.h"
 #include "src/display_device/vdd_utils.h"
 #include <atomic>
+#include <mutex>
+#include <optional>
 #include <thread>
+#include <WtsApi32.h>
 
 namespace platf::service_vdd {
   inline std::atomic<bool> single_display {false};
   inline std::atomic<UINT64> capture_epoch {1};
+  struct monitor_request {
+    display_device::parsed_config_t config;
+    int width, height, fps;
+    display_device::vdd_utils::hdr_brightness_t brightness;
+    display_device::vdd_utils::physical_size_t physical;
+  };
+  inline std::recursive_mutex monitor_mutex;
+  inline std::optional<monitor_request> last_monitor_request;
+  inline DWORD monitor_console = MAXDWORD;
   inline bool enabled() { return console_input_bridge::persistent_service_core; }
 
   inline DWORD prepare_console(DWORD session) {
@@ -69,6 +81,7 @@ namespace platf::service_vdd {
   inline bool prepare_monitor(display_device::parsed_config_t config,int width,int height,int fps,
       const display_device::vdd_utils::hdr_brightness_t &brightness={},
       const display_device::vdd_utils::physical_size_t &physical={}) {
+    std::lock_guard lock(monitor_mutex);
     if(!enabled()||width<=0||height<=0||width>16384||height>16384||fps<=0||fps>1000)return false;
     if(!config.resolution)config.resolution=display_device::resolution_t{static_cast<unsigned>(width),static_cast<unsigned>(height)};
     if(!config.refresh_rate)config.refresh_rate=display_device::refresh_rate_t{static_cast<unsigned>(fps),1};
@@ -89,6 +102,30 @@ namespace platf::service_vdd {
     capture_epoch.fetch_add(1,std::memory_order_acq_rel);
     single_display.store(config.device_prep==display_device::parsed_config_t::device_prep_e::ensure_only_display ||
         config.vdd_prep==display_device::parsed_config_t::vdd_prep_e::display_off);
-    Sleep(200);return true;
+    Sleep(200);
+    last_monitor_request=monitor_request{config,width,height,fps,brightness,physical};
+    monitor_console=WTSGetActiveConsoleSessionId();
+    return true;
+  }
+
+  // Called only while creating a replacement capture, after old textures and
+  // encoder resources have been released. A newly created anonymous console
+  // can expose the old channel with valid metadata but no advancing frames.
+  inline bool refresh_console_producer() {
+    if(!enabled()||!console_input_bridge::streaming_active.load())return true;
+    std::lock_guard lock(monitor_mutex);
+    const auto session=WTSGetActiveConsoleSessionId();
+    if(session==MAXDWORD)return false;
+    if(session==monitor_console||!last_monitor_request)return true;
+    LPWSTR user=nullptr;DWORD bytes=0;
+    if(!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE,session,WTSUserName,&user,&bytes))return false;
+    const bool anonymous=bytes>=sizeof(wchar_t)&&user&&!*user;
+    if(user)WTSFreeMemory(user);
+    if(!anonymous){monitor_console=session;return true;}
+    const auto request=*last_monitor_request;
+    BOOST_LOG(info) << "[service-vdd] Rebuilding stopped producer for new anonymous console: session=" << session;
+    if(!prepare_monitor(request.config,request.width,request.height,request.fps,request.brightness,request.physical))return false;
+    if(single_display.load()&&prepare_console(session)!=ERROR_SUCCESS){monitor_console=MAXDWORD;return false;}
+    return WTSGetActiveConsoleSessionId()==session;
   }
 }
