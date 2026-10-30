@@ -53,6 +53,8 @@ namespace platf::console_input_bridge {
   struct helper_status {
     volatile LONG ready = 0;
     volatile LONG session = -1;
+    volatile LONG display_required = 0;
+    volatile LONG wake_display = 0;
     input_queue inputs;
   };
 
@@ -83,14 +85,23 @@ namespace platf::console_input_bridge {
       desktop = next;
       return true;
     };
+    const auto apply_display_request = [&]() {
+      // Preparation must still wake an idle producer before encoder probing.
+      // Releasing a stream's continuous request must not issue another wake.
+      if (InterlockedExchange(&status->wake_display, 0)) SetThreadExecutionState(ES_DISPLAY_REQUIRED);
+      SetThreadExecutionState(ES_CONTINUOUS |
+        (InterlockedCompareExchange(&status->display_required, 0, 0) ? ES_DISPLAY_REQUIRED : 0));
+    };
     const bool ready = owner && sync_desktop();
-    if (ready) SetThreadExecutionState(ES_DISPLAY_REQUIRED);
+    if (ready) apply_display_request();
     InterlockedExchange(&status->session, static_cast<LONG>(session));
     InterlockedExchange(&status->ready, ready ? 1 : -1);
     bool active = ready;
     HANDLE waits[] {owner, data_event};
     while (active && WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
-      SetThreadExecutionState(ES_DISPLAY_REQUIRED);
+      // The capture thread runs in service session 0. Keep its display request
+      // in the interactive console instead, including periods without input.
+      apply_display_request();
       INPUT input {};
       while (status->inputs.pop(input)) {
         // Fail closed if the console changed after the parent selected this helper.
@@ -103,6 +114,7 @@ namespace platf::console_input_bridge {
         SendInput(1, &input, sizeof(input));
       }
     }
+    SetThreadExecutionState(ES_CONTINUOUS);
     if (owner) CloseHandle(owner);
     UnmapViewOfFile(status);
     CloseHandle(data_event);
@@ -141,6 +153,8 @@ namespace platf::console_input_bridge {
       status_ = static_cast<helper_status *>(MapViewOfFile(mapping_, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(helper_status)));
       if (!status_) return false;
       *status_ = {};
+      status_->wake_display = 1;
+      status_->display_required = streaming_active.load(std::memory_order_acquire) && sealed_capture_ready.load(std::memory_order_acquire);
 
       HANDLE current = nullptr;
       HANDLE token = nullptr;
@@ -203,7 +217,17 @@ namespace platf::console_input_bridge {
     ~helper_process() { close(); }
     bool prepare() {
       std::lock_guard lock(mutex_);
-      return ensure(WTSGetActiveConsoleSessionId()) && SetEvent(event_);
+      if (!ensure(WTSGetActiveConsoleSessionId())) return false;
+      InterlockedExchange(&status_->wake_display, 1);
+      InterlockedExchange(&status_->display_required,
+        streaming_active.load(std::memory_order_acquire) && sealed_capture_ready.load(std::memory_order_acquire));
+      return SetEvent(event_);
+    }
+    void release_display() {
+      std::lock_guard lock(mutex_);
+      if (!status_) return;
+      InterlockedExchange(&status_->display_required, 0);
+      SetEvent(event_);
     }
     bool send(const INPUT &input) {
       std::lock_guard lock(mutex_);
@@ -229,6 +253,7 @@ namespace platf::console_input_bridge {
     if (!event) return false;
     const bool active = streaming_active.load(std::memory_order_acquire);
     const bool sealed = sealed_capture_ready.load(std::memory_order_acquire);
+    if (!active || !sealed) helper().release_display();
     const bool input_ready = active && sealed && system_token() && helper().prepare();
     if (sunshinesvc::should_retain_transport(active, sealed, input_ready)) return SetEvent(reinterpret_cast<HANDLE>(event));
     ResetEvent(reinterpret_cast<HANDLE>(event));
