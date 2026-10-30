@@ -2,8 +2,8 @@
     "SchemaVersion":  1,
     "UpstreamRepository":  "https://github.com/AlkaidLab/foundation-sunshine",
     "BaseRevision":  "d549e16a3fa0887d26beb98eaa40785c1814b353",
-    "MaintenanceRevision":  "5e832dd884695df3ca2d322cc25cabeeeaaf15c4",
-    "ExpectedTreeSHA1":  "5a6744e5e6bbd2b9c5109c2d758861d54f3912dc",
+    "MaintenanceRevision":  "e230b3d041f675e8bf5d053a3061974a8c19a3b2",
+    "ExpectedTreeSHA1":  "90d64bc996ed9207e6c2599f7abcdcd46321f1c3",
     "ApplyInOrder":  [
                          {
                              "Path":  "0001-hyperv-vdd-capture-recovery.patch",
@@ -15,7 +15,7 @@
                          },
                          {
                              "Path":  "0003-hyperv-console-continuity.patch",
-                             "SHA256":  "0F73C426C3FF3EC7FE50CDB512641B4A52456B5203F29939EE91953321994A2F"
+                             "SHA256":  "7A3286C36967013559055270FB9C7D54C8AD4FEA61C8FBCEB368E069D12057A0"
                          },
                          {
                              "Path":  "0004-offline-vbcable-installer.patch",
@@ -23,7 +23,7 @@
                          }
                      ],
     "HostUpstreamSnapshotPatched":  false,
-    "Policy":  "Independent upstream-first four-patch series; active console display request scoped to sealed VDD streaming; guest-built and tested.",
+    "Policy":  "Independent upstream-first four-patch series; legacy cursor producer-access compatibility scoped to the exact LocalService-owned cursor-object ACL.",
     "Consolidation":  {
                           "Count":  4,
                           "Date":  "2026-10-27",
@@ -75,24 +75,24 @@
                                            "Tests":  39
                                        },
                        "AggregateTests":  577,
-                       "ResultTree":  "a85998cdaeecf83527b78d9c5479756d9d3fd6ed",
+                       "ResultTree":  "90d64bc996ed9207e6c2599f7abcdcd46321f1c3",
                        "PerformanceTargetValidated":  false,
                        "TemporaryIndexReplayPassed":  true,
-                       "RuntimeAcceptance":  "Not deployed; previous media acceptance applies only to 05134974",
+                       "RuntimeAcceptance":  "Guest native regressions and controlled RDP-to-console migration passed; full Moonlight password-entry flow remains unverified.",
                        "RequiredMaintenanceCases":  20,
                        "Skipped":  21,
                        "ServicePolicyTests":  12,
-                       "RuntimeBinaryUnchanged":  true
+                       "RuntimeBinaryUnchanged":  false
                    },
     "Publication":  {
                         "SourceOnly":  true,
                         "ForceUsed":  false,
-                        "Sunshine":  "bef0c6e8ae9ed4390958de06fbba3d6e2e102152",
-                        "Status":  "push-verified",
+                        "Sunshine":  "e230b3d041f675e8bf5d053a3061974a8c19a3b2",
+                        "Status":  "pending-push",
                         "Branch":  "maintenance/hyperv-win11-20261027",
                         "PatchCarrierBranch":  "maintenance/hyperv-patches-d549e16a"
                     },
-    "UpdatedAt":  "2026-10-27T14:57:51.6814562Z",
+    "UpdatedAt":  "2026-10-30T16:38:40.1964295Z",
     "CodeCleanup":  {
                         "NVENC":  "Restore upstream CRLF; completion logic and tests unchanged",
                         "UpstreamCommits":  4,
