@@ -78,17 +78,19 @@
                        "ResultTree":  "90d64bc996ed9207e6c2599f7abcdcd46321f1c3",
                        "PerformanceTargetValidated":  false,
                        "TemporaryIndexReplayPassed":  true,
-                       "RuntimeAcceptance":  "Guest native regressions and controlled RDP-to-console migration passed; full Moonlight password-entry flow remains unverified.",
+                       "RuntimeAcceptance":  "Controlled RDP-to-console migration, visible cursor metadata/motion, remote Start menu and two stopped-app GUI reconnects passed; full Moonlight password-entry flow remains unverified.",
                        "RequiredMaintenanceCases":  20,
                        "Skipped":  21,
                        "ServicePolicyTests":  12,
-                       "RuntimeBinaryUnchanged":  false
+                       "RuntimeBinaryUnchanged":  false,
+                       "GuiReconnects":  2,
+                       "FullPasswordUnlockUIVerified":  false
                    },
     "Publication":  {
                         "SourceOnly":  true,
                         "ForceUsed":  false,
                         "Sunshine":  "e230b3d041f675e8bf5d053a3061974a8c19a3b2",
-                        "Status":  "pending-push",
+                        "Status":  "push-verified",
                         "Branch":  "maintenance/hyperv-win11-20261027",
                         "PatchCarrierBranch":  "maintenance/hyperv-patches-d549e16a"
                     },
