@@ -6,20 +6,20 @@
     "ExpectedTreeSHA1":  "5a6744e5e6bbd2b9c5109c2d758861d54f3912dc",
     "ApplyInOrder":  [
                          {
-                             "Path":  null,
-                             "SHA256":  null
+                             "Path":  "0001-hyperv-vdd-capture-recovery.patch",
+                             "SHA256":  "F98DD5B4576941B9246781090D11EF487C3AEA2A67972D50AF2E6DE16A36B120"
                          },
                          {
-                             "Path":  null,
-                             "SHA256":  null
+                             "Path":  "0002-nvenc-delayed-completion.patch",
+                             "SHA256":  "05DB54ABE2B34BB9D8F293BC501EDED75ADAD646AA0D5C209984F06B860CE974"
                          },
                          {
-                             "Path":  null,
-                             "SHA256":  null
+                             "Path":  "0003-hyperv-console-continuity.patch",
+                             "SHA256":  "0F73C426C3FF3EC7FE50CDB512641B4A52456B5203F29939EE91953321994A2F"
                          },
                          {
-                             "Path":  null,
-                             "SHA256":  null
+                             "Path":  "0004-offline-vbcable-installer.patch",
+                             "SHA256":  "2801D8B9CF1148A0F351E699CDB1F727E9F48E54413DD03501FAD3D81B06D050"
                          }
                      ],
     "HostUpstreamSnapshotPatched":  false,
