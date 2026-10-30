@@ -1,159 +1,159 @@
 {
-  "SchemaVersion": 1,
-  "UpstreamRepository": "https://github.com/AlkaidLab/foundation-sunshine",
-  "BaseRevision": "d549e16a3fa0887d26beb98eaa40785c1814b353",
-  "MaintenanceRevision": "bef0c6e8ae9ed4390958de06fbba3d6e2e102152",
-  "ExpectedTreeSHA1": "a85998cdaeecf83527b78d9c5479756d9d3fd6ed",
-  "ApplyInOrder": [
-    {
-      "Path": "0001-hyperv-vdd-capture-recovery.patch",
-      "SHA256": "F98DD5B4576941B9246781090D11EF487C3AEA2A67972D50AF2E6DE16A36B120"
-    },
-    {
-      "Path": "0002-nvenc-delayed-completion.patch",
-      "SHA256": "05DB54ABE2B34BB9D8F293BC501EDED75ADAD646AA0D5C209984F06B860CE974"
-    },
-    {
-      "Path": "0003-hyperv-console-continuity.patch",
-      "SHA256": "EDA52D7C4D855E769E10EC4EBB08B054D8A8CE63815044A46F1D3D3CF0B0A710"
-    },
-    {
-      "Path": "0004-offline-vbcable-installer.patch",
-      "SHA256": "2801D8B9CF1148A0F351E699CDB1F727E9F48E54413DD03501FAD3D81B06D050"
-    }
-  ],
-  "HostUpstreamSnapshotPatched": false,
-  "Policy": "Independent upstream-first patches; audited dead code and EOL noise removed; build and tests run in Win11 guest; deployed runtime unchanged.",
-  "Consolidation": {
-    "Count": 4,
-    "Date": "2026-10-27",
-    "PreviousCount": 9,
-    "DeletedObsolete": [
-      "0009-persistent-vdd-console-session.patch",
-      "0010-retain-only-active-console-stream.patch",
-      "withdrawn/0009-recoverable-console-handoff.patch",
-      "moonlight/withdrawn/0003-pull-decoder-reconnect-readiness.patch"
-    ],
-    "Groups": [
-      {
-        "Path": "0001-hyperv-vdd-capture-recovery.patch",
-        "Replaces": [
-          "0001-hyperv-vdd-capture.patch",
-          "0002-dxgi-enumeration-failure.patch",
-          "0003-vdd-producer-diagnostics.patch",
-          "0004-vdd-capture-display-recovery.patch",
-          "0006-vdd-display-idle-wake.patch",
-          "0007-vdd-restore-auto-output.patch"
-        ]
-      },
-      {
-        "Path": "0002-nvenc-delayed-completion.patch",
-        "Replaces": [
-          "0005-nvenc-delayed-completion.patch"
-        ]
-      },
-      {
-        "Path": "0003-hyperv-console-continuity.patch",
-        "Replaces": [
-          "0009-persistent-service-vdd.patch"
-        ]
-      },
-      {
-        "Path": "0004-offline-vbcable-installer.patch",
-        "Replaces": [
-          "0008-offline-vbcable-installer.patch"
-        ]
-      }
-    ],
-    "EquivalentTreeVerified": true
-  },
-  "Validation": {
-    "NativeBuildPassed": true,
-    "FullStabilityValidated": false,
-    "NativeCTest": {
-      "Failures": 0,
-      "Tests": 39
-    },
-    "AggregateTests": 577,
-    "ResultTree": "a85998cdaeecf83527b78d9c5479756d9d3fd6ed",
-    "PerformanceTargetValidated": false,
-    "TemporaryIndexReplayPassed": true,
-    "RuntimeAcceptance": "Not deployed; previous media acceptance applies only to 05134974",
-    "RequiredMaintenanceCases": 20,
-    "Skipped": 21,
-    "ServicePolicyTests": 12,
-    "RuntimeBinaryUnchanged": true
-  },
-  "Publication": {
-    "SourceOnly": true,
-    "ForceUsed": false,
-    "Sunshine": "bef0c6e8ae9ed4390958de06fbba3d6e2e102152",
-    "Status": "push-verified",
-    "Branch": "maintenance/hyperv-win11-20261027",
-    "PatchCarrierBranch": "maintenance/hyperv-patches-d549e16a"
-  },
-  "UpdatedAt": "2026-10-27T14:57:51.6814562Z",
-  "CodeCleanup": {
-    "NVENC": "Restore upstream CRLF; completion logic and tests unchanged",
-    "UpstreamCommits": 4,
-    "Tree": "a85998cdaeecf83527b78d9c5479756d9d3fd6ed",
-    "NetSourceLinesRemovedIgnoringEOL": 49,
-    "RuntimeDeployedRevision": "051349744dc98e91368e3a8f6562a4f037c4b241",
-    "Date": "2026-10-27",
-    "BuildReceipt": "D:\\Tools\\reports\\patch-code-cleanup-20261027\\tested.json",
-    "Removed": [
-      "write-only console helper error state",
-      "constant-disabled internal encoder probe override",
-      "two dead final startup assignments"
-    ],
-    "Base": "d549e16a3fa0887d26beb98eaa40785c1814b353",
-    "Parent": {
-      "Tree": "c9cb8e9bb68faa49825274c6d686e83be27ca6d0",
-      "Base": "880f1efed6bd0c18871a78d0f61185a7381cda5f",
-      "PatchSeries": [
-        {
-          "Path": "0001-hyperv-vdd-capture-recovery.patch",
-          "SHA256": "01D69DA48C095CAB31C5A5E6FAED74F94A569B1007C90687252B3DDDEF3FEBE5"
-        },
-        {
-          "Path": "0002-nvenc-delayed-completion.patch",
-          "SHA256": "5BF614DCF475A592059B05B885B3720CA37CFB083C9193A6A4C61562C70B3C1D"
-        },
-        {
-          "Path": "0003-hyperv-console-continuity.patch",
-          "SHA256": "BA8F3848A794D2C80423DB04C7A7A360C7865E6ED2073692B2215B28BEAC5244"
-        },
-        {
-          "Path": "0004-offline-vbcable-installer.patch",
-          "SHA256": "2801D8B9CF1148A0F351E699CDB1F727E9F48E54413DD03501FAD3D81B06D050"
-        }
-      ],
-      "Publication": {
-        "Sunshine": "051349744dc98e91368e3a8f6562a4f037c4b241",
-        "Branch": "maintenance/hyperv-win11-20261027",
-        "Moonlight": "160246b6a1ff625a34427dc611ed7047ae41783b",
-        "Status": "push-verified",
-        "ForceUsed": false,
-        "SourceOnly": true,
-        "HostToolsPublished": false
-      },
-      "Validation": {
-        "TemporaryIndexReplayPassed": true,
-        "NativeCTest": {
-          "Disabled": 0,
-          "Tests": 34,
-          "Failures": 0
-        },
-        "SourceRevisionUnchanged": true,
-        "RuntimeAcceptance": "Existing limited media acceptance of identical source retained",
-        "FullStabilityValidated": false,
-        "AggregateTests": 569,
-        "RuntimeBinaryUnchanged": true,
-        "Skipped": 21,
-        "PerformanceTargetValidated": false,
-        "ResultTree": "c9cb8e9bb68faa49825274c6d686e83be27ca6d0"
-      },
-      "Revision": "051349744dc98e91368e3a8f6562a4f037c4b241"
-    }
-  }
+    "SchemaVersion":  1,
+    "UpstreamRepository":  "https://github.com/AlkaidLab/foundation-sunshine",
+    "BaseRevision":  "d549e16a3fa0887d26beb98eaa40785c1814b353",
+    "MaintenanceRevision":  "5e832dd884695df3ca2d322cc25cabeeeaaf15c4",
+    "ExpectedTreeSHA1":  "5a6744e5e6bbd2b9c5109c2d758861d54f3912dc",
+    "ApplyInOrder":  [
+                         {
+                             "Path":  null,
+                             "SHA256":  null
+                         },
+                         {
+                             "Path":  null,
+                             "SHA256":  null
+                         },
+                         {
+                             "Path":  null,
+                             "SHA256":  null
+                         },
+                         {
+                             "Path":  null,
+                             "SHA256":  null
+                         }
+                     ],
+    "HostUpstreamSnapshotPatched":  false,
+    "Policy":  "Independent upstream-first four-patch series; active console display request scoped to sealed VDD streaming; guest-built and tested.",
+    "Consolidation":  {
+                          "Count":  4,
+                          "Date":  "2026-10-27",
+                          "PreviousCount":  9,
+                          "DeletedObsolete":  [
+                                                  "0009-persistent-vdd-console-session.patch",
+                                                  "0010-retain-only-active-console-stream.patch",
+                                                  "withdrawn/0009-recoverable-console-handoff.patch",
+                                                  "moonlight/withdrawn/0003-pull-decoder-reconnect-readiness.patch"
+                                              ],
+                          "Groups":  [
+                                         {
+                                             "Path":  "0001-hyperv-vdd-capture-recovery.patch",
+                                             "Replaces":  [
+                                                              "0001-hyperv-vdd-capture.patch",
+                                                              "0002-dxgi-enumeration-failure.patch",
+                                                              "0003-vdd-producer-diagnostics.patch",
+                                                              "0004-vdd-capture-display-recovery.patch",
+                                                              "0006-vdd-display-idle-wake.patch",
+                                                              "0007-vdd-restore-auto-output.patch"
+                                                          ]
+                                         },
+                                         {
+                                             "Path":  "0002-nvenc-delayed-completion.patch",
+                                             "Replaces":  [
+                                                              "0005-nvenc-delayed-completion.patch"
+                                                          ]
+                                         },
+                                         {
+                                             "Path":  "0003-hyperv-console-continuity.patch",
+                                             "Replaces":  [
+                                                              "0009-persistent-service-vdd.patch"
+                                                          ]
+                                         },
+                                         {
+                                             "Path":  "0004-offline-vbcable-installer.patch",
+                                             "Replaces":  [
+                                                              "0008-offline-vbcable-installer.patch"
+                                                          ]
+                                         }
+                                     ],
+                          "EquivalentTreeVerified":  true
+                      },
+    "Validation":  {
+                       "NativeBuildPassed":  true,
+                       "FullStabilityValidated":  false,
+                       "NativeCTest":  {
+                                           "Failures":  0,
+                                           "Tests":  39
+                                       },
+                       "AggregateTests":  577,
+                       "ResultTree":  "a85998cdaeecf83527b78d9c5479756d9d3fd6ed",
+                       "PerformanceTargetValidated":  false,
+                       "TemporaryIndexReplayPassed":  true,
+                       "RuntimeAcceptance":  "Not deployed; previous media acceptance applies only to 05134974",
+                       "RequiredMaintenanceCases":  20,
+                       "Skipped":  21,
+                       "ServicePolicyTests":  12,
+                       "RuntimeBinaryUnchanged":  true
+                   },
+    "Publication":  {
+                        "SourceOnly":  true,
+                        "ForceUsed":  false,
+                        "Sunshine":  "bef0c6e8ae9ed4390958de06fbba3d6e2e102152",
+                        "Status":  "push-verified",
+                        "Branch":  "maintenance/hyperv-win11-20261027",
+                        "PatchCarrierBranch":  "maintenance/hyperv-patches-d549e16a"
+                    },
+    "UpdatedAt":  "2026-10-27T14:57:51.6814562Z",
+    "CodeCleanup":  {
+                        "NVENC":  "Restore upstream CRLF; completion logic and tests unchanged",
+                        "UpstreamCommits":  4,
+                        "Tree":  "a85998cdaeecf83527b78d9c5479756d9d3fd6ed",
+                        "NetSourceLinesRemovedIgnoringEOL":  49,
+                        "RuntimeDeployedRevision":  "051349744dc98e91368e3a8f6562a4f037c4b241",
+                        "Date":  "2026-10-27",
+                        "BuildReceipt":  "D:\\Tools\\reports\\patch-code-cleanup-20261027\\tested.json",
+                        "Removed":  [
+                                        "write-only console helper error state",
+                                        "constant-disabled internal encoder probe override",
+                                        "two dead final startup assignments"
+                                    ],
+                        "Base":  "d549e16a3fa0887d26beb98eaa40785c1814b353",
+                        "Parent":  {
+                                       "Tree":  "c9cb8e9bb68faa49825274c6d686e83be27ca6d0",
+                                       "Base":  "880f1efed6bd0c18871a78d0f61185a7381cda5f",
+                                       "PatchSeries":  [
+                                                           {
+                                                               "Path":  "0001-hyperv-vdd-capture-recovery.patch",
+                                                               "SHA256":  "01D69DA48C095CAB31C5A5E6FAED74F94A569B1007C90687252B3DDDEF3FEBE5"
+                                                           },
+                                                           {
+                                                               "Path":  "0002-nvenc-delayed-completion.patch",
+                                                               "SHA256":  "5BF614DCF475A592059B05B885B3720CA37CFB083C9193A6A4C61562C70B3C1D"
+                                                           },
+                                                           {
+                                                               "Path":  "0003-hyperv-console-continuity.patch",
+                                                               "SHA256":  "BA8F3848A794D2C80423DB04C7A7A360C7865E6ED2073692B2215B28BEAC5244"
+                                                           },
+                                                           {
+                                                               "Path":  "0004-offline-vbcable-installer.patch",
+                                                               "SHA256":  "2801D8B9CF1148A0F351E699CDB1F727E9F48E54413DD03501FAD3D81B06D050"
+                                                           }
+                                                       ],
+                                       "Publication":  {
+                                                           "Sunshine":  "051349744dc98e91368e3a8f6562a4f037c4b241",
+                                                           "Branch":  "maintenance/hyperv-win11-20261027",
+                                                           "Moonlight":  "160246b6a1ff625a34427dc611ed7047ae41783b",
+                                                           "Status":  "push-verified",
+                                                           "ForceUsed":  false,
+                                                           "SourceOnly":  true,
+                                                           "HostToolsPublished":  false
+                                                       },
+                                       "Validation":  {
+                                                          "TemporaryIndexReplayPassed":  true,
+                                                          "NativeCTest":  {
+                                                                              "Disabled":  0,
+                                                                              "Tests":  34,
+                                                                              "Failures":  0
+                                                                          },
+                                                          "SourceRevisionUnchanged":  true,
+                                                          "RuntimeAcceptance":  "Existing limited media acceptance of identical source retained",
+                                                          "FullStabilityValidated":  false,
+                                                          "AggregateTests":  569,
+                                                          "RuntimeBinaryUnchanged":  true,
+                                                          "Skipped":  21,
+                                                          "PerformanceTargetValidated":  false,
+                                                          "ResultTree":  "c9cb8e9bb68faa49825274c6d686e83be27ca6d0"
+                                                      },
+                                       "Revision":  "051349744dc98e91368e3a8f6562a4f037c4b241"
+                                   }
+                    }
 }
