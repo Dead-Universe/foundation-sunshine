@@ -21,6 +21,7 @@
 #include "src/display_device/vdd_ioctl.h"
 #include "src/main.h"
 #include "vdd_frame_channel.h"
+#include "vdd_cursor_security.h"
 
 #include <d3d11_1.h>
 #include <sddl.h>
@@ -399,6 +400,21 @@ namespace platf::dxgi {
       UnmapViewOfFile(cursor_mapping);
       CloseHandle(cursor_meta);
       return false;
+    }
+
+    // Keep a surviving legacy cursor object reopenable by its LocalService
+    // producer when IddCx replaces the swap chain during a console handoff.
+    for (const bool event : {false, true}) {
+      bool changed = false;
+      const DWORD status = vdd_cursor_security::preserve_producer_access(
+        event ? cursor_event_name.c_str() : cursor_meta_name.c_str(), event, changed);
+      if (changed) {
+        BOOST_LOG(info) << "[vdd_capture] preserved legacy cursor "sv
+                        << (event ? "event" : "mapping") << " producer access for monitor "sv << m_monitorIdx;
+      }
+      else if (status != ERROR_SUCCESS && status != ERROR_NOT_SUPPORTED) {
+        BOOST_LOG(debug) << "[vdd_capture] cursor producer-access compatibility check: "sv << status;
+      }
     }
 
     m_hCursorMeta = cursor_meta;
