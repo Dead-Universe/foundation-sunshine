@@ -24,6 +24,7 @@ target_link_libraries(audio-info
 target_compile_options(audio-info PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
 
 add_executable(sunshinesvc sunshinesvc.cpp)
+target_link_libraries(sunshinesvc PRIVATE setupapi advapi32)
 set_target_properties(sunshinesvc PROPERTIES CXX_STANDARD 23)
 target_link_libraries(sunshinesvc
         PRIVATE Threads::Threads

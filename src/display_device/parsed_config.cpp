@@ -393,8 +393,11 @@ namespace display_device {
     // An explicit VDD request does not depend on CCD being available.
     bool explicit_vdd = session.use_vdd;
 #ifdef _WIN32
-    // VDD_NAME is the stable alias exposed by the Windows host configuration UI.
-    explicit_vdd = explicit_vdd || intent.device_id == VDD_NAME;
+    // A process-level Auto decision must agree with display preparation.
+    // Preserve every explicitly named host or client display.
+    const bool automatic_output_uses_vdd =
+      config.capture == "vdd" && !client_named_it && intent.device_id.empty();
+    explicit_vdd = explicit_vdd || intent.device_id == VDD_NAME || automatic_output_uses_vdd;
 #endif
     if (explicit_vdd) {
       intent.target = display_intent_t::target_e::vdd;

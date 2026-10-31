@@ -42,6 +42,7 @@
 #include <Shlwapi.h>
 
 #include "misc.h"
+#include "console_input_bridge.h"
 
 #include "src/entry_handler.h"
 #include "src/globals.h"
@@ -1390,6 +1391,7 @@ namespace platf {
 
   void
   streaming_will_start() {
+    console_input_bridge::set_streaming_active(true);
     static std::once_flag load_wlanapi_once_flag;
     std::call_once(load_wlanapi_once_flag, []() {
       // wlanapi.dll is not installed by default on Windows Server, so we load it dynamically
@@ -1515,6 +1517,7 @@ namespace platf {
 
   void
   streaming_will_stop() {
+    console_input_bridge::set_streaming_active(false);
     // Demote ourselves back to normal priority class
     SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
 

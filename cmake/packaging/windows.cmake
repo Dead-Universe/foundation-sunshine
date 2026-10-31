@@ -2,6 +2,7 @@
 
 # Fetch driver dependencies (downloads at configure time)
 include(${CMAKE_MODULE_PATH}/packaging/FetchDriverDeps.cmake)
+include(${CMAKE_MODULE_PATH}/packaging/BundleVbCable.cmake)
 
 install(TARGETS sunshine RUNTIME DESTINATION "." COMPONENT application)
 
@@ -108,9 +109,20 @@ if(VIGEMBUS_AVAILABLE)
           DESTINATION "scripts/gamepad"
           COMPONENT gamepad)
 endif()
-install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vsink/"
+install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vsink/install-vsink.bat"
+              "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vsink/uninstall-vsink.bat"
         DESTINATION "scripts"
         COMPONENT vsink)
+install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vsink/vb-cable-helper.ps1"
+              "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vsink/VB-CABLE-NOTICE.txt"
+        DESTINATION "tools/vbcable"
+        COMPONENT vsink)
+if(VBCABLE_BUNDLED)
+  install(FILES "${VBCABLE_ARCHIVE}"
+          DESTINATION "tools/vbcable"
+          RENAME "VBCABLE_Driver_Pack45.zip"
+          COMPONENT vsink)
+endif()
 # VDD: scripts & shared config from source tree, driver binaries from download cache
 install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vdd/install-vdd.bat"
               "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vdd/vdd-device-helper.ps1"

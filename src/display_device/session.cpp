@@ -14,6 +14,7 @@
 #include "src/platform/windows/display_device/windows_utils.h"
 #ifdef _WIN32
   #include "src/platform/windows/vulkan_hdr_bridge_session.h"
+  #include "src/platform/windows/service_vdd.h"
 #endif
 #include "src/rtsp.h"
 #include "to_string.h"
@@ -175,10 +176,8 @@ namespace display_device {
     current_vdd_prep.reset();
     current_use_vdd.reset();
     pending_vdd_.reset();
-    // 恢复原始的 output_name，避免下一个会话使用已销毁的 VDD 设备 ID
-    if (!original_output_name.empty()) {
-      config::video.output_name = original_output_name;
-      original_output_name.clear();
+    // Restore Auto too, so the next session cannot retain a destroyed VDD ID.
+    if (original_output_name.restore(config::video.output_name)) {
       BOOST_LOG(debug) << "已恢复原始 output_name: " << config::video.output_name;
     }
   }
@@ -417,6 +416,34 @@ namespace display_device {
         "Set display, VDD, resolution, refresh rate, and HDR options to Auto or valid values, then try again."
       };
     }
+
+    #ifdef _WIN32
+    if (platf::service_vdd::enabled()) {
+      if (!is_reconfigure && rtsp_stream::session_count() > 0) {
+        return {configure_result_t::result_e::success, {}, {}};
+      }
+      const vdd_utils::hdr_brightness_t brightness {session.hdr_capabilities.max_nits,
+          session.hdr_capabilities.min_nits, session.hdr_capabilities.max_full_frame_nits};
+      const auto physical = vdd_utils::get_client_physical_size(session.client_name);
+      if (!platf::service_vdd::prepare_monitor(*parsed_config, session.width, session.height, session.fps, brightness, physical)) {
+        return {configure_result_t::result_e::vdd_create_failed,
+            "Sunshine could not prepare the sealed virtual display.",
+            "Check the virtual display driver and requested display mode, then try again."};
+      }
+      // Session 0 has no console-local CCD device IDs. The following encoder
+      // probe must validate the real sealed producer; do not invent an ID.
+      current_use_vdd = true;
+      current_device_prep = parsed_config->device_prep;
+      current_vdd_prep = parsed_config->vdd_prep;
+      current_vdd_client_id = get_client_id_from_session(session);
+      current_vdd_hdr_brightness = brightness;
+      config::video.output_name.clear();
+      pending_vdd_.reset();
+      timer->setup_timer(nullptr);
+      BOOST_LOG(info) << "[service-vdd] Driver preparation completed; validating the sealed capture producer";
+      return {configure_result_t::result_e::success, {}, {}};
+    }
+    #endif
 
     // Parsing is side-effect free. From this point on, parsed_config is the
     // single source of truth for whether this session needs VDD preparation.
@@ -886,9 +913,8 @@ namespace display_device {
       settings.replace_vdd_id(rebuild_old_vdd_id, device_zako);
     }
 
-    if (original_output_name.empty()) {
-      original_output_name = config::video.output_name;
-      BOOST_LOG(debug) << "保存原始 output_name: " << original_output_name;
+    if (original_output_name.remember(config::video.output_name)) {
+      BOOST_LOG(debug) << "保存原始 output_name: " << config::video.output_name;
     }
 
     // Update configuration and state
@@ -917,6 +943,18 @@ namespace display_device {
 
   void
   session_t::restore_state_impl(revert_reason_e reason) {
+#ifdef _WIN32
+    if (platf::service_vdd::enabled() && current_use_vdd.has_value()) {
+      platf::service_vdd::single_display.store(false);
+      if (!config::video.vdd_keep_enabled) {
+        vdd_ioctl::send_command(L"DESTROYMONITOR");
+      }
+      current_vdd_client_id.clear();
+      current_vdd_hdr_brightness.reset();
+      stop_timer_and_clear_vdd_state();
+      return;
+    }
+#endif
 #ifdef _WIN32
     // Stop exposing the implicit layer before changing HDR state or removing
     // the VDD. The layer itself is pass-through, but registration must remain

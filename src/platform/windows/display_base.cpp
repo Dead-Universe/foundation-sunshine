@@ -30,6 +30,7 @@ typedef enum _D3DKMT_GPU_PREFERENCE_QUERY_STATE: DWORD {
 #include "display.h"
 #include "display_device/windows_utils.h"
 #include "misc.h"
+#include "console_input_bridge.h"
 #include "src/config.h"
 #include "src/cursor_channel.h"
 #include "src/display_device/display_device.h"
@@ -632,6 +633,16 @@ namespace platf::dxgi {
     const bool is_rdp_session = !is_running_as_system_user && display_device::w_utils::is_any_rdp_session_active();
     auto output_name = is_rdp_session ? std::wstring {} : from_utf8(display_name);
     display_device_name.clear();
+    // Match the backend selected for this display, including a session override.
+    const auto &capture_backend = config.capture_backend_override.empty() ? config::video.capture : config.capture_backend_override;
+    const bool direct_vdd_capture = capture_backend == "vdd";
+    std::wstring vdd_output_name;
+    if (direct_vdd_capture) {
+      const auto vdd_device_id = display_device::find_device_by_friendlyname(ZAKO_NAME);
+      if (!vdd_device_id.empty()) {
+        vdd_output_name = from_utf8(display_device::get_display_name(vdd_device_id));
+      }
+    }
 
     if (is_rdp_session) {
       BOOST_LOG(info) << "[Display Init] RDP session detected - using first available RDP virtual display";
@@ -640,6 +651,11 @@ namespace platf::dxgi {
       BOOST_LOG(debug) << "[Display Init] Initializing display: " << display_name;
     }
 
+    // Service session 0 cannot enumerate interactive DXGI outputs. Resolve
+    // the real sealed producer before entering that session-local API path.
+    const bool service_headless = direct_vdd_capture && console_input_bridge::persistent_service_core;
+    if (service_headless && !init_headless_target(config)) return -1;
+
     adapter_t::pointer adapter_p;
     // Tries:
     //   0 - normal pass with the configured adapter filter (if any).
@@ -647,7 +663,7 @@ namespace platf::dxgi {
     //   2 - last resort: if the configured adapter never matched, drop the
     //       filter and accept any adapter so a misconfigured / stale
     //       adapter_name doesn't make capture init fail outright.
-    for (int tries = 0; tries < 3 && !output; ++tries) {
+    for (int tries = 0; tries < 3 && !output && !service_headless; ++tries) {
       if (tries == 1) {
         SetThreadExecutionState(ES_DISPLAY_REQUIRED);
         Sleep(500);
@@ -660,31 +676,72 @@ namespace platf::dxgi {
         adapter_name.clear();
       }
 
-      for (int x = 0; factory->EnumAdapters1(x, &adapter_p) != DXGI_ERROR_NOT_FOUND; ++x) {
+      for (UINT x = 0; ; ++x) {
+        adapter_p = nullptr;
+        status = factory->EnumAdapters1(x, &adapter_p);
+        if (status == DXGI_ERROR_NOT_FOUND) {
+          break;
+        }
+        if (FAILED(status) || !adapter_p) {
+          BOOST_LOG(error) << "[Display Init] Adapter enumeration failed [0x"sv << util::hex(status).to_string_view() << ']';
+          return -1;
+        }
         dxgi::adapter_t adapter_tmp { adapter_p };
 
         DXGI_ADAPTER_DESC1 adapter_desc;
-        adapter_tmp->GetDesc1(&adapter_desc);
+        status = adapter_tmp->GetDesc1(&adapter_desc);
+        if (FAILED(status)) {
+          BOOST_LOG(error) << "[Display Init] Adapter description failed [0x"sv << util::hex(status).to_string_view() << ']';
+          return -1;
+        }
 
         if (!adapter_name.empty() && adapter_desc.Description != adapter_name) {
           continue;
         }
 
-        dxgi::output_t::pointer output_p;
-        for (int y = 0; adapter_tmp->EnumOutputs(y, &output_p) != DXGI_ERROR_NOT_FOUND; ++y) {
+        for (UINT y = 0; ; ++y) {
+          dxgi::output_t::pointer output_p {};
+          status = adapter_tmp->EnumOutputs(y, &output_p);
+          if (status == DXGI_ERROR_NOT_FOUND) {
+            break;
+          }
+          if (FAILED(status) || !output_p) {
+            BOOST_LOG(error) << "[Display Init] Output enumeration failed [0x"sv << util::hex(status).to_string_view() << ']';
+            return -1;
+          }
           dxgi::output_t output_tmp { output_p };
 
           DXGI_OUTPUT_DESC desc;
-          output_tmp->GetDesc(&desc);
+          status = output_tmp->GetDesc(&desc);
+          if (FAILED(status)) {
+            BOOST_LOG(error) << "[Display Init] Output description failed [0x"sv << util::hex(status).to_string_view() << ']';
+            return -1;
+          }
 
           if (!is_rdp_session && !output_name.empty() && desc.DeviceName != output_name) {
             continue;
           }
+          if (direct_vdd_capture &&
+              output_name.empty() &&
+              !vdd_output_name.empty() &&
+              desc.DeviceName != vdd_output_name) {
+            continue;
+          }
 
+          const bool is_selected_vdd_output =
+            direct_vdd_capture &&
+            !vdd_output_name.empty() &&
+            desc.DeviceName == vdd_output_name;
           const bool output_accepted = is_rdp_session ||
-                                       (desc.AttachedToDesktop && test_dxgi_duplication(adapter_tmp, output_tmp, false));
+                                       (desc.AttachedToDesktop &&
+                                        (is_selected_vdd_output ||
+                                         test_dxgi_duplication(adapter_tmp, output_tmp, false)));
 
           if (output_accepted) {
+            if (is_selected_vdd_output) {
+              BOOST_LOG(info) << "[vdd] Selected ZakoVDD output without requiring DXGI Desktop Duplication: "
+                              << to_utf8(desc.DeviceName);
+            }
             BOOST_LOG(is_rdp_session ? info : debug) << "[Display Init] Selected display: " << to_utf8(desc.DeviceName);
 
             output = std::move(output_tmp);
@@ -717,7 +774,7 @@ namespace platf::dxgi {
       }
     }
 
-    if (!output) {
+    if (!output && !service_headless && !init_headless_target(config)) {
       BOOST_LOG(error) << "Failed to locate an output device"sv;
       return -1;
     }
@@ -868,7 +925,7 @@ namespace platf::dxgi {
     }
 
     dxgi::output6_t output6 {};
-    status = output->QueryInterface(IID_IDXGIOutput6, (void **) &output6);
+    status = output ? output->QueryInterface(IID_IDXGIOutput6, (void **) &output6) : E_NOINTERFACE;
     if (SUCCEEDED(status)) {
       DXGI_OUTPUT_DESC1 desc1;
       output6->GetDesc1(&desc1);
@@ -1345,6 +1402,7 @@ namespace platf {
       }
 
       if (ret) {
+        if (type != "vdd") console_input_bridge::disable_for_standard_capture();
         cursor_channel::set_producer_available(type == "ddx" || type == "vdd");
         return ret;
       }
@@ -1362,6 +1420,14 @@ namespace platf {
   std::vector<std::string>
   display_names(mem_type_e) {
     std::vector<std::string> display_names;
+    const bool direct_vdd_capture = config::video.capture == "vdd";
+    std::string vdd_output_name;
+    if (direct_vdd_capture) {
+      const auto vdd_device_id = display_device::find_device_by_friendlyname(ZAKO_NAME);
+      if (!vdd_device_id.empty()) {
+        vdd_output_name = display_device::get_display_name(vdd_device_id);
+      }
+    }
 
     HRESULT status;
 
@@ -1381,8 +1447,16 @@ namespace platf {
       return {};
     }
 
-    dxgi::adapter_t::pointer adapter_p;
-    for (int x = 0; factory->EnumAdapters1(x, &adapter_p) != DXGI_ERROR_NOT_FOUND; ++x) {
+    for (UINT x = 0; ; ++x) {
+      dxgi::adapter_t::pointer adapter_p {};
+      status = factory->EnumAdapters1(x, &adapter_p);
+      if (status == DXGI_ERROR_NOT_FOUND) {
+        break;
+      }
+      if (FAILED(status) || !adapter_p) {
+        BOOST_LOG(error) << "DXGI adapter enumeration failed [0x"sv << util::hex(status).to_string_view() << ']';
+        return {};
+      }
       dxgi::adapter_t adapter { adapter_p };
       DXGI_ADAPTER_DESC1 adapter_desc;
       adapter->GetDesc1(&adapter_desc);
@@ -1397,8 +1471,16 @@ namespace platf {
         << ",Device Sys Mem: "sv << adapter_desc.DedicatedSystemMemory / 1048576 << " MiB"sv
         << ",Share Sys Mem: "sv << adapter_desc.SharedSystemMemory / 1048576 << " MiB"sv;
 
-      dxgi::output_t::pointer output_p {};
-      for (int y = 0; adapter->EnumOutputs(y, &output_p) != DXGI_ERROR_NOT_FOUND; ++y) {
+      for (UINT y = 0; ; ++y) {
+        dxgi::output_t::pointer output_p {};
+        status = adapter->EnumOutputs(y, &output_p);
+        if (status == DXGI_ERROR_NOT_FOUND) {
+          break;
+        }
+        if (FAILED(status) || !output_p) {
+          BOOST_LOG(error) << "DXGI output enumeration failed [0x"sv << util::hex(status).to_string_view() << ']';
+          return {};
+        }
         dxgi::output_t output { output_p };
 
         DXGI_OUTPUT_DESC desc;
@@ -1420,7 +1502,22 @@ namespace platf {
 
         bool can_capture = false;
 
-        if (is_rdp) {
+        const bool is_selected_vdd_output =
+          direct_vdd_capture &&
+          !vdd_output_name.empty() &&
+          device_name == vdd_output_name;
+
+        if (is_selected_vdd_output && desc.AttachedToDesktop) {
+          can_capture = true;
+          BOOST_LOG(debug) << "[Display] Accepting ZakoVDD output without a DXGI Desktop Duplication test: "
+                           << device_name;
+        }
+        else if (direct_vdd_capture && !vdd_output_name.empty()) {
+          BOOST_LOG(debug) << "[Display] Skipping non-ZakoVDD output while direct VDD capture is configured: "
+                           << device_name;
+          continue;
+        }
+        else if (is_rdp) {
           // In RDP, accept any enumerated output regardless of AttachedToDesktop status
           // Virtual displays may not report this correctly
           can_capture = true;
@@ -1464,8 +1561,16 @@ namespace platf {
       return {};
     }
 
-    dxgi::adapter_t::pointer adapter_p;
-    for (int x = 0; factory->EnumAdapters1(x, &adapter_p) != DXGI_ERROR_NOT_FOUND; ++x) {
+    for (UINT x = 0; ; ++x) {
+      dxgi::adapter_t::pointer adapter_p {};
+      status = factory->EnumAdapters1(x, &adapter_p);
+      if (status == DXGI_ERROR_NOT_FOUND) {
+        break;
+      }
+      if (FAILED(status) || !adapter_p) {
+        BOOST_LOG(error) << "DXGI adapter enumeration failed [0x"sv << util::hex(status).to_string_view() << ']';
+        return {};
+      }
       dxgi::adapter_t adapter { adapter_p };
       DXGI_ADAPTER_DESC1 adapter_desc;
       adapter->GetDesc1(&adapter_desc);

@@ -1,0 +1,29 @@
+VB-CABLE - VB-Audio Software
+
+When VB-CABLE bundling is enabled, this package includes the complete,
+unmodified standard VBCABLE_Driver_Pack45.zip (October 2024; Windows driver
+3.3.1.7). Builds without this optional archive retain only the helper and notice.
+The original README, license text, installers and signed driver files remain
+inside that archive. VB-CABLE is separate software, not licensed under the
+Sunshine project's GPL license.
+
+Official source and updates: https://vb-audio.com/Cable/
+VB-CABLE is Donationware. All participations are welcome.
+Donate or obtain a license: https://shop.vb-audio.com/en/win-apps/11-vb-cable.html
+Current distribution conditions: https://vb-audio.com/Services/licensing.htm
+The current standard VB-CABLE bundling grant requires its origin and
+Donationware model to remain visible to the end user. Professional use and
+distribution remain subject to VB-Audio's published licensing conditions.
+VB-CABLE A+B and C+D are not included.
+
+Choose the VB-CABLE component to install the standard cable when it is absent.
+Its original installer window requires your explicit action; Sunshine does not
+click it, use undocumented silent switches, or automatically restart Windows.
+The original package requires a restart after installation or uninstallation.
+Existing same/newer drivers are retained. Older installations require an
+explicit update through the original VB-Audio installer and restart workflow.
+
+Sunshine uninstallation retains this shared system audio driver. To remove it,
+extract the included original archive, run VBCABLE_Setup_x64.exe as administrator,
+explicitly select Remove Driver in the vendor window, then restart Windows.
+Never delete arbitrary oem*.inf packages or the whole VB-Audio registry tree.

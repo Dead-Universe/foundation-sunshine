@@ -6,6 +6,7 @@
 #include "display_cursor.h"
 #include "display_vram_internal.h"
 #include "misc.h"
+#include "service_vdd.h"
 
 #include <chrono>
 #include <utility>
@@ -70,6 +71,16 @@ namespace platf::dxgi {
       dup.release_frame();
       current_frame->Release();
       current_frame = nullptr;
+    }
+
+    // Windows may replace the sealed mapping and textures when retiring an
+    // anonymous console while reusing the same monitor index/generation value.
+    // Renew capture through the existing reinit path after console preparation;
+    // the service Core, application and RTSP transport stay alive.
+    if (service_vdd::enabled() &&
+        service_capture_epoch != service_vdd::capture_epoch.load(std::memory_order_acquire)) {
+      BOOST_LOG(info) << "[service-vdd] Console capture context changed; renewing sealed resources"sv;
+      return capture_e::reinit;
     }
 
     const bool use_local_cursor = local_cursor_mode_active();

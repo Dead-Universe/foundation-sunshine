@@ -21,6 +21,7 @@
 #include "logging.h"
 #include "touch_keyboard_session.h"
 #include "video.h"
+#include "vdd_capture_recovery.h"
 
 #include <algorithm>
 
@@ -485,6 +486,9 @@ namespace nvhttp::stream_start {
 
       const auto original_display_result = display_result;
       const auto original_probe_result = video::last_encoder_probe_result;
+      // A late VDD recovery must probe VDD, even when the startup probe restored
+      // Auto. Commit the process preference only when recovery succeeds.
+      video::vdd_capture_recovery_t capture_recovery {config::video.capture, rtsp_stream::session_count() == 0};
       rtsp_stream::launch_session_t recovery_session {};
       fill_vdd_recovery_session(recovery_session, launch_session);
 
@@ -501,6 +505,7 @@ namespace nvhttp::stream_start {
               probe_matches_display_state,
               true)) {
           commit_vdd_recovery_to_launch_session(launch_session, recovery_session);
+          capture_recovery.commit();
           recovery_result.succeeded = true;
           recovery_result.detail = "A VDD-backed display became available after a short retry and encoder probing succeeded.";
           BOOST_LOG(info) << "Recovered stream startup by preparing a VDD-backed display after a deferred retry";
@@ -535,6 +540,7 @@ namespace nvhttp::stream_start {
 
       if (!video::probe_encoders(make_vdd_probe_target())) {
         commit_vdd_recovery_to_launch_session(launch_session, recovery_session);
+        capture_recovery.commit();
         recovery_result.succeeded = true;
         recovery_result.detail = "A VDD-backed display became available and encoder probing succeeded.";
         BOOST_LOG(info) << "Recovered stream startup by preparing a VDD-backed display";
