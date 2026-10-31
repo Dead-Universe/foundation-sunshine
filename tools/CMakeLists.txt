@@ -115,3 +115,15 @@ if(WIN32)
             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
             COMMENT "Checking Sunshine/VDD IOCTL ABI header sync; set VDD_DRIVER_HEADER when DriverHeader is not passed")
 endif()
+
+if(WIN32)
+  add_executable(sunshine-file-clipboard file_clipboard_agent.cpp
+      "${CMAKE_SOURCE_DIR}/src/file_clipboard/file_clipboard_native.cpp"
+      "${CMAKE_SOURCE_DIR}/src/file_clipboard/file_clipboard_source.cpp")
+  set_target_properties(sunshine-file-clipboard PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON)
+  target_compile_definitions(sunshine-file-clipboard PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_link_libraries(sunshine-file-clipboard PRIVATE Threads::Threads ole32 oleaut32 shell32 uuid user32 advapi32 wtsapi32 sunshine_project_options)
+  if(MINGW)
+    target_link_options(sunshine-file-clipboard PRIVATE -municode -static -static-libgcc -static-libstdc++)
+  endif()
+endif()
