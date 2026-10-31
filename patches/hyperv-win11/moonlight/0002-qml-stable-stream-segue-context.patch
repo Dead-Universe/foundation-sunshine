@@ -1,0 +1,65 @@
+diff --git a/app/gui/AppView.qml b/app/gui/AppView.qml
+index 35a57fa1a1abd70a7288636835c04bcafc544483..047939bb7d4f4b210762f888781bc10cc3d3919c 100644
+--- a/app/gui/AppView.qml
++++ b/app/gui/AppView.qml
+@@ -680,8 +680,7 @@ CenteredGridView {
+                 return
+             }
+ 
+-            var component = Qt.createComponent("StreamSegue.qml")
+-            var segue = component.createObject(stackView, {
++            var segue = window.createStreamSegue({
+                                                    "appName": model.name,
+                                                    "boxArtUrl": model.boxart,
+                                                    "session": appModel.createSessionForApp(index, selectedDisplayTarget),
+diff --git a/app/gui/CliStartStreamSegue.qml b/app/gui/CliStartStreamSegue.qml
+index 3585f451d61c5076a2d4997b52fb9a91604149b7..597fd2c4896dff48adfa7676e1f300f799fae1a4 100644
+--- a/app/gui/CliStartStreamSegue.qml
++++ b/app/gui/CliStartStreamSegue.qml
+@@ -15,8 +15,7 @@ Item {
+     }
+ 
+     function onSessionCreated(appName, session) {
+-        var component = Qt.createComponent("StreamSegue.qml")
+-        var segue = component.createObject(stackView, {
++        var segue = window.createStreamSegue({
+             "appName": appName,
+             "session": session,
+             "quitAfter": true
+diff --git a/app/gui/QuitSegue.qml b/app/gui/QuitSegue.qml
+index bd147db5e8dd29a84bb0ade9caa01ddd3b909350..87d69de9aa1a8cf6d6ab474af4299d5a4664c7ba 100644
+--- a/app/gui/QuitSegue.qml
++++ b/app/gui/QuitSegue.qml
+@@ -27,8 +27,7 @@ Item {
+ 
+         // If we're supposed to launch another game after this, do so now
+         if (error === undefined && nextSession !== null) {
+-            var component = Qt.createComponent("StreamSegue.qml")
+-            var segue = component.createObject(stackView, {"appName": nextAppName,
++            var segue = window.createStreamSegue({"appName": nextAppName,
+                                                                     "boxArtUrl": nextBoxArtUrl,
+                                                                     "session": nextSession})
+             stackView.replace(segue)
+diff --git a/app/gui/main.qml b/app/gui/main.qml
+index 37249e8ac077e4adc2cace5e562a3e0221ccd518..41b8a0cfbda12c35f3b60692ded3a1e9ed8efa24 100644
+--- a/app/gui/main.qml
++++ b/app/gui/main.qml
+@@ -240,6 +240,18 @@ ApplicationWindow {
+         z: -2
+     }
+ 
++    // A delegate can disappear while a session is starting. Keep the segue's
++    // creation context in the main window so its callbacks retain access to
++    // navigation controls and the persistent error dialog.
++    Component {
++        id: streamSegueComponent
++        StreamSegue {}
++    }
++
++    function createStreamSegue(properties) {
++        return streamSegueComponent.createObject(stackView, properties)
++    }
++
+     StackView {
+         id: stackView
+         anchors.fill: parent

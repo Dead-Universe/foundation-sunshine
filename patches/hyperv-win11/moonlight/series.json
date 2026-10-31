@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "repository": "https://github.com/qiin2333/moonlight-qt",
+  "tag": "v6.5.3",
+  "baseRevision": "5c3061568275170fcfa6e29856eac8f9739dda5e",
+  "sourceControlHead": "ae4e2e40a6aec2912245a75a4eb7b1399d64a6e1",
+  "resultTree": "68cd23ce9d23e2c6b929deaecb181815237cc2fb",
+  "maintenanceVersion": "6.5.3-hdrfix.1-filecopy.1",
+  "policy": "Necessary HDR/QML fixes plus Windows file clipboard helper; no new decoder changes, no reconnect workaround",
+  "patches": [
+    {
+      "file": "0001-d3d11va-hdr-render-serialization.patch",
+      "sha256": "EB845CF48DA42D8EAA7DA2BE064408D7A556EA6B78D1F18923B4A0892936FAC8"
+    },
+    {
+      "file": "0002-qml-stable-stream-segue-context.patch",
+      "sha256": "CBD1257F7E2A235B846E2F70DF290EC65A2592FBEDA9D05740FF87A25F7EE771"
+    },
+    {
+      "file": "0003-windows-file-clipboard.patch",
+      "sha256": "C6CEA7BD60940FAFDE6E2E3564D7D83CE53CFA5307C81824A5186A053BF4A068"
+    }
+  ],
+  "currentSeriesValidation": {
+    "independentReplay": "passed",
+    "helperSHA256": "FCF53191F6200D896BEBFFF65BB53FCB71B364A054A72F0354AAA3CE05A15AA7",
+    "officialExecutableSHA256": "A6481693A7D0E50A32176F8B972980A023C0D7B6B4491AF381904DCC49AEA64B",
+    "mainExecutableUnchanged": true,
+    "decoderRetestedWithoutWorkaroundsThisTask": false,
+    "runtimeValidation": "Bidirectional native Shell copying and user Explorer copying passed; source files preserved; lazy 64-bit reads and revocation passed",
+    "maintainedExecutableSHA256": "62923248D5B1CA4CA23D48BC57CF5DB7740C6B5D80FECF2F2DCC33D76A554E22",
+    "helperBuild": "passed in win11 D:\\Tools",
+    "installedDirectory": "D:\\Software\\Moonlight-VPlus-Portable-x64-6.5.3-hdrfix.1-filecopy.1"
+  },
+  "publication": {
+    "SourceOnly": true,
+    "ForceUsed": false,
+    "SourceHead": "ae4e2e40a6aec2912245a75a4eb7b1399d64a6e1",
+    "Branch": "maintenance/moonlight-hdr-20261031"
+  }
+}

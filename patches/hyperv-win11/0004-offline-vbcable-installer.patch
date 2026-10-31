@@ -1,0 +1,474 @@
+diff --git a/cmake/packaging/BundleVbCable.cmake b/cmake/packaging/BundleVbCable.cmake
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e39a48855d51c31f12d8108f813a41b9006b4b2
+--- /dev/null
++++ b/cmake/packaging/BundleVbCable.cmake
+@@ -0,0 +1,17 @@
++# Bundle the unmodified standard VB-CABLE package. Downloads belong to the
++# build provisioning step; the generated installer works entirely offline.
++include_guard(GLOBAL)
++option(BUNDLE_VBCABLE "Bundle the standard VB-Audio VB-CABLE driver" OFF)
++set(VBCABLE_ARCHIVE "" CACHE FILEPATH "Official VBCABLE_Driver_Pack45.zip")
++set(VBCABLE_BUNDLED 0)
++if(NOT BUNDLE_VBCABLE)
++  return()
++endif()
++if(NOT EXISTS "${VBCABLE_ARCHIVE}")
++  message(FATAL_ERROR "BUNDLE_VBCABLE requires the complete offline VBCABLE_ARCHIVE")
++endif()
++file(SHA256 "${VBCABLE_ARCHIVE}" _vbcable_sha256)
++if(NOT _vbcable_sha256 STREQUAL "b950e39f01af1d04ea623c8f6d8eb9b6ea5c477c637295fabf20631c85116bfb")
++  message(FATAL_ERROR "VBCABLE_ARCHIVE is not the reviewed official standard Pack45")
++endif()
++set(VBCABLE_BUNDLED 1)
+diff --git a/cmake/packaging/sunshine.iss.in b/cmake/packaging/sunshine.iss.in
+index 7baffeebd582805ad6bea9f815bde0de8a0725a1..246b0406ec930428732b4ff949a888c7c4e3143c 100644
+--- a/cmake/packaging/sunshine.iss.in
++++ b/cmake/packaging/sunshine.iss.in
+@@ -13,6 +13,7 @@
+ #define MyWelcomeBmp "@CMAKE_SOURCE_DIR@\assets\installer\welcome.bmp"
+ #define MySmallBmp "@CMAKE_SOURCE_DIR@\assets\installer\wizard_small.bmp"
+ #define MyLicenseFile "@CMAKE_SOURCE_DIR@\LICENSE"
++#define MyVbCableBundled @VBCABLE_BUNDLED@
+ 
+ [Setup]
+ ; 基本设置
+@@ -81,6 +82,11 @@ english.ComponentApplication=Sunshine main application
+ english.ComponentAssets=Required assets (shaders, web UI)
+ english.ComponentGUI=Sunshine GUI and tray agent (required)
+ english.ComponentVDD=Zako Virtual Display Driver (HDR)
++english.ComponentVbCable=VB-CABLE virtual sound card (VB-Audio)
++english.ComponentVbCableDesc=Standard Pack45, Donationware - https://vb-audio.com/Cable/; existing drivers are retained
++english.StatusInstallVbCable=Checking or installing VB-CABLE. Complete the original VB-Audio window if it opens.
++english.MsgVbCableFailed=VB-CABLE was not installed or could not be verified. See the installer log and the bundled VB-CABLE notice. Existing drivers were not removed.
++english.MsgVbCableOlder=An older VB-CABLE driver was retained. To update, follow the original VB-Audio installer and restart workflow; this installation did not upgrade that driver.
+ english.ComponentAutostart=Launch on system startup
+ english.ComponentFirewall=Add firewall exclusions
+ english.ComponentGamepad=Virtual Gamepad (ViGEmBus)
+@@ -124,6 +130,11 @@ chinesesimplified.ComponentApplication=Sunshine 主程序
+ chinesesimplified.ComponentAssets=必要资源（着色器、Web UI）
+ chinesesimplified.ComponentGUI=Sunshine GUI 与托盘代理（必需）
+ chinesesimplified.ComponentVDD=Zako 虚拟显示驱动（HDR）
++chinesesimplified.ComponentVbCable=VB-CABLE 虚拟声卡（VB-Audio）
++chinesesimplified.ComponentVbCableDesc=标准版 Pack45，Donationware：https://vb-audio.com/Cable/；保留已有驱动
++chinesesimplified.StatusInstallVbCable=正在检查或安装 VB-CABLE；如弹出原厂窗口，请手动完成安装。
++chinesesimplified.MsgVbCableFailed=VB-CABLE 未安装或验证失败。请查看安装日志及随包说明；没有删除已有驱动。
++chinesesimplified.MsgVbCableOlder=保留了已有旧版 VB-CABLE。本次未升级此驱动；请通过原厂安装器及重启流程手动更新。
+ chinesesimplified.ComponentAutostart=开机自动启动
+ chinesesimplified.ComponentFirewall=添加防火墙规则
+ chinesesimplified.ComponentGamepad=虚拟手柄（ViGEmBus）
+@@ -178,6 +189,9 @@ Name: "autostart"; Description: "{cm:ComponentAutostart} — {cm:ComponentAutost
+ Name: "gamepad"; Description: "{cm:ComponentGamepad} — {cm:ComponentGamepadDesc}"; Types: recommended full
+ Name: "vmouse"; Description: "{cm:ComponentVmouse} — {cm:ComponentVmouseDesc}"; Types: recommended full
+ Name: "tools"; Description: "{cm:ComponentTools} — {cm:ComponentToolsDesc}"; Types: recommended full
++#if MyVbCableBundled
++Name: "vb_cable"; Description: "{cm:ComponentVbCable} — {cm:ComponentVbCableDesc}"; Types: recommended full
++#endif
+ 
+ [Tasks]
+ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
+@@ -279,11 +293,15 @@ Source: "{#MySourceDir}\scripts\vmouse\install-vmouse.bat"; DestDir: "{app}\scri
+ Source: "{#MySourceDir}\scripts\vmouse\uninstall-vmouse.bat"; DestDir: "{app}\scripts\vmouse"; Flags: ignoreversion
+ Source: "{#MySourceDir}\scripts\vmouse\driver\*"; DestDir: "{app}\scripts\vmouse\driver"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist
+ 
+-; Virtual audio sink (microphone / VB-Cable) scripts
+-; Always shipped — there is no install-time component for this; the user can
+-; right-click + "Run as administrator" on install-vsink.bat to enable it.
+-Source: "{#MySourceDir}\scripts\install-vsink.bat"; DestDir: "{app}\scripts"; Flags: ignoreversion skipifsourcedoesntexist
+-Source: "{#MySourceDir}\scripts\uninstall-vsink.bat"; DestDir: "{app}\scripts"; Flags: ignoreversion skipifsourcedoesntexist
++; Offline standard VB-CABLE. Keep the complete original archive and notices.
++; The component controls execution; the payload remains available for explicit repair.
++Source: "{#MySourceDir}\scripts\install-vsink.bat"; DestDir: "{app}\scripts"; Flags: ignoreversion
++Source: "{#MySourceDir}\scripts\uninstall-vsink.bat"; DestDir: "{app}\scripts"; Flags: ignoreversion
++Source: "{#MySourceDir}\tools\vbcable\vb-cable-helper.ps1"; DestDir: "{app}\tools\vbcable"; Flags: ignoreversion
++Source: "{#MySourceDir}\tools\vbcable\VB-CABLE-NOTICE.txt"; DestDir: "{app}\tools\vbcable"; Flags: ignoreversion
++#if MyVbCableBundled
++Source: "{#MySourceDir}\tools\vbcable\VBCABLE_Driver_Pack45.zip"; DestDir: "{app}\tools\vbcable"; Flags: ignoreversion
++#endif
+ 
+ ; Optional diagnostic tools
+ Source: "{#MySourceDir}\tools\dxgi-info.exe"; DestDir: "{app}\tools"; Flags: ignoreversion; Components: tools
+@@ -393,6 +411,8 @@ var
+   ServiceVerifyFailed: Boolean;
+   // 0 = ready/not selected, 101 = failed, 3010 = reboot required.
+   VDDResultCode: Integer;
++  // 102 = failed, 103 = older shared driver retained, 3010 = reboot required.
++  VbCableResultCode: Integer;
+ 
+ function VDDComponentSelected(): Boolean;
+ begin
+@@ -401,7 +421,7 @@ end;
+ 
+ function GetServiceInstallParameters(Param: String): String;
+ begin
+-  if VDDResultCode = 0 then
++  if (VDDResultCode = 0) and ((VbCableResultCode = 0) or (VbCableResultCode = 103)) then
+     Result := ''
+   else
+     Result := '--no-start';
+@@ -409,7 +429,7 @@ end;
+ 
+ function ShouldConfigureServiceAutostart(): Boolean;
+ begin
+-  Result := VDDResultCode <> 101;
++  Result := (VDDResultCode <> 101) and (VbCableResultCode <> 102);
+ end;
+ 
+ procedure InstallAndVerifyVDD();
+@@ -452,6 +472,42 @@ begin
+   end;
+ end;
+ 
++procedure InstallAndVerifyVbCable();
++#if MyVbCableBundled
++var
++  ResultCode: Integer;
++  Params: String;
++#endif
++begin
++#if MyVbCableBundled
++  if not WizardIsComponentSelected('vb_cable') then
++    Exit;
++  WizardForm.StatusLabel.Caption := CustomMessage('StatusInstallVbCable');
++  Params := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "' +
++    ExpandConstant('{app}\tools\vbcable\vb-cable-helper.ps1') + '" -ResultPath "' +
++    ExpandConstant('{tmp}\sunshine-vbcable-result.json') + '"';
++  // Missing drivers in silent mode fail visibly in the log; never open an invisible GUI.
++  if not WizardSilent then
++    Params := Params + ' -AllowVendorUI';
++  ResultCode := -1;
++  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Params, '',
++              SW_HIDE, ewWaitUntilTerminated, ResultCode) then
++    VbCableResultCode := 102
++  else if (ResultCode = 0) or (ResultCode = 103) or (ResultCode = 3010) then
++    VbCableResultCode := ResultCode
++  else
++    VbCableResultCode := 102;
++  Log('VB-CABLE helper result: ' + IntToStr(ResultCode) +
++      '; details: ' + ExpandConstant('{tmp}\sunshine-vbcable-result.json'));
++  if not WizardSilent then
++  begin
++    if VbCableResultCode = 102 then
++      MsgBox(CustomMessage('MsgVbCableFailed'), mbError, MB_OK)
++    else if VbCableResultCode = 103 then
++      MsgBox(CustomMessage('MsgVbCableOlder'), mbInformation, MB_OK);
++  end;
++#endif
++end;
+ procedure InitializeWizard();
+ var
+   WelcomeLeft: Integer;
+@@ -848,10 +904,16 @@ end;
+ // result consumed by unattended updaters.
+ function GetCustomSetupExitCode(): Integer;
+ begin
+-  if VDDResultCode <> 0 then
+-    Result := VDDResultCode
++  if VDDResultCode = 101 then
++    Result := 101
++  else if VbCableResultCode = 102 then
++    Result := 102
+   else if ServiceVerifyFailed then
+     Result := 100
++  else if (VDDResultCode = 3010) or (VbCableResultCode = 3010) then
++    Result := 3010
++  else if VbCableResultCode = 103 then
++    Result := 103
+   else
+     Result := 0;
+ end;
+@@ -973,6 +1035,7 @@ begin
+     // Sunshine service is allowed to start. A bound-but-not-ready device is
+     // kept for Windows to finish during the requested reboot.
+     InstallAndVerifyVDD();
++    InstallAndVerifyVbCable();
+     // Delete portable scripts in installed version
+     DeleteFile(ExpandConstant('{app}\install_portable.bat'));
+     DeleteFile(ExpandConstant('{app}\uninstall_portable.bat'));
+@@ -981,7 +1044,7 @@ end;
+ 
+ function NeedRestart(): Boolean;
+ begin
+-  Result := VDDResultCode = 3010;
++  Result := (VDDResultCode = 3010) or (VbCableResultCode = 3010);
+ end;
+ 
+ // Custom uninstall: ask about gamepad and data removal
+diff --git a/cmake/packaging/windows.cmake b/cmake/packaging/windows.cmake
+index 68608bfe900b635c80e2fef80798ff4f281e3ccd..863c12b6ecf0ecb7b87bf37104b89598c87c3dd1 100644
+--- a/cmake/packaging/windows.cmake
++++ b/cmake/packaging/windows.cmake
+@@ -2,6 +2,7 @@
+ 
+ # Fetch driver dependencies (downloads at configure time)
+ include(${CMAKE_MODULE_PATH}/packaging/FetchDriverDeps.cmake)
++include(${CMAKE_MODULE_PATH}/packaging/BundleVbCable.cmake)
+ 
+ install(TARGETS sunshine RUNTIME DESTINATION "." COMPONENT application)
+ 
+@@ -108,9 +109,20 @@ if(VIGEMBUS_AVAILABLE)
+           DESTINATION "scripts/gamepad"
+           COMPONENT gamepad)
+ endif()
+-install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vsink/"
++install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vsink/install-vsink.bat"
++              "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vsink/uninstall-vsink.bat"
+         DESTINATION "scripts"
+         COMPONENT vsink)
++install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vsink/vb-cable-helper.ps1"
++              "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vsink/VB-CABLE-NOTICE.txt"
++        DESTINATION "tools/vbcable"
++        COMPONENT vsink)
++if(VBCABLE_BUNDLED)
++  install(FILES "${VBCABLE_ARCHIVE}"
++          DESTINATION "tools/vbcable"
++          RENAME "VBCABLE_Driver_Pack45.zip"
++          COMPONENT vsink)
++endif()
+ # VDD: scripts & shared config from source tree, driver binaries from download cache
+ install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vdd/install-vdd.bat"
+               "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vdd/vdd-device-helper.ps1"
+diff --git a/src_assets/windows/misc/vsink/VB-CABLE-NOTICE.txt b/src_assets/windows/misc/vsink/VB-CABLE-NOTICE.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..89be8f98f307af4410f2e0ba64d9b1fe51c8344e
+--- /dev/null
++++ b/src_assets/windows/misc/vsink/VB-CABLE-NOTICE.txt
+@@ -0,0 +1,29 @@
++VB-CABLE - VB-Audio Software
++
++When VB-CABLE bundling is enabled, this package includes the complete,
++unmodified standard VBCABLE_Driver_Pack45.zip (October 2024; Windows driver
++3.3.1.7). Builds without this optional archive retain only the helper and notice.
++The original README, license text, installers and signed driver files remain
++inside that archive. VB-CABLE is separate software, not licensed under the
++Sunshine project's GPL license.
++
++Official source and updates: https://vb-audio.com/Cable/
++VB-CABLE is Donationware. All participations are welcome.
++Donate or obtain a license: https://shop.vb-audio.com/en/win-apps/11-vb-cable.html
++Current distribution conditions: https://vb-audio.com/Services/licensing.htm
++The current standard VB-CABLE bundling grant requires its origin and
++Donationware model to remain visible to the end user. Professional use and
++distribution remain subject to VB-Audio's published licensing conditions.
++VB-CABLE A+B and C+D are not included.
++
++Choose the VB-CABLE component to install the standard cable when it is absent.
++Its original installer window requires your explicit action; Sunshine does not
++click it, use undocumented silent switches, or automatically restart Windows.
++The original package requires a restart after installation or uninstallation.
++Existing same/newer drivers are retained. Older installations require an
++explicit update through the original VB-Audio installer and restart workflow.
++
++Sunshine uninstallation retains this shared system audio driver. To remove it,
++extract the included original archive, run VBCABLE_Setup_x64.exe as administrator,
++explicitly select Remove Driver in the vendor window, then restart Windows.
++Never delete arbitrary oem*.inf packages or the whole VB-Audio registry tree.
+diff --git a/src_assets/windows/misc/vsink/install-vsink.bat b/src_assets/windows/misc/vsink/install-vsink.bat
+index dc02c3365c4f54843b25bb02976609a285e8d224..99d00f4e695ac7634d0f6aa1ab6707fab0a2a49a 100644
+--- a/src_assets/windows/misc/vsink/install-vsink.bat
++++ b/src_assets/windows/misc/vsink/install-vsink.bat
+@@ -1,62 +1,10 @@
+ @echo off
+-set "PATH=%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem;%SystemRoot%\System32\WindowsPowerShell\v1.0"
+-:: Check for administrator privileges
+-net session >nul 2>&1
+-if %errorLevel% neq 0 (
+-    echo Please run this script as administrator
+-    pause
+-    exit /b
+-)
+-
+-:: Check if VB-Cable driver is already installed
+-:: Use PowerShell to check registry (more reliable, doesn't depend on PATH)
+-powershell -Command "try { $key = Get-ItemProperty -Path 'HKLM:\SOFTWARE\VB-Audio\Cable' -ErrorAction SilentlyContinue; if ($key) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
+-if %errorLevel% equ 0 (
+-    echo VB-Cable driver is already installed (detected via registry)
+-    pause
+-    exit /b
+-)
+-
+-:: Method 2: Check if VB-Cable audio device exists in system (fallback method)
+-:: This method is more reliable as it checks actual hardware devices
+-powershell -Command "try { $devices = Get-PnpDevice -Class AudioEndpoint -ErrorAction SilentlyContinue | Where-Object {$_.FriendlyName -like '*VB-Cable*' -or $_.FriendlyName -like '*CABLE*' -or $_.FriendlyName -like '*VB-Audio Virtual Cable*'}; if ($devices) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
+-if %errorLevel% equ 0 (
+-    echo VB-Cable driver is already installed (detected via audio device)
+-    pause
+-    exit /b
+-)
+-
+-:: Method 3: Check audio devices via registry using PowerShell (additional fallback)
+-powershell -Command "try { $devices = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Enum\SWD\MMDEVAPI\*' -ErrorAction SilentlyContinue | Where-Object {$_.FriendlyName -like '*CABLE*' -or $_.FriendlyName -like '*VB-Cable*'}; if ($devices) { exit 0 } else { exit 1 } } catch { exit 1 }" >nul 2>&1
+-if %errorLevel% equ 0 (
+-    echo VB-Cable driver is already installed (detected via device registry)
+-    pause
+-    exit /b
+-)
+-
+-:: Set variables
+-set "installer=VBCABLE_Driver_Pack43.zip"
+-set "download_url=https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip"
+-set "temp_dir=%TEMP%\vb_cable_install"
+-
+-:: Create temp directory
+-if not exist "%temp_dir%" mkdir "%temp_dir%"
+-
+-:: Download installer
+-echo Downloading VB-Cable driver...
+-powershell -Command "Invoke-WebRequest -Uri '%download_url%' -OutFile '%temp_dir%\%installer%'"
+-
+-:: Extract files
+-echo Extracting files...
+-powershell -Command "Expand-Archive -Path '%temp_dir%\%installer%' -DestinationPath '%temp_dir%' -Force"
+-
+-:: Install driver
+-echo Installing VB-Cable driver...
+-start /wait "" "%temp_dir%\VBCABLE_Setup_x64.exe" /S
+-
+-:: Clean up temp files
+-echo Cleaning up temporary files...
+-rd /s /q "%temp_dir%"
+-
+-echo VB-Cable driver installation completed!
+-pause
++setlocal
++set "helper=%~dp0..\tools\vbcable\vb-cable-helper.ps1"
++if not exist "%helper%" (
++    echo This package does not contain the optional offline VB-CABLE component.
++    echo See https://vb-audio.com/Cable/ or rerun Sunshine Setup with VB-CABLE selected.
++    exit /b 102
++)
++"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "%helper%" -AllowVendorUI %*
++exit /b %ERRORLEVEL%
+diff --git a/src_assets/windows/misc/vsink/uninstall-vsink.bat b/src_assets/windows/misc/vsink/uninstall-vsink.bat
+index aa5e35a95b93af82755edfc6cbcea532b51de26c..ccf1afbdbdf3ef5611c8f78b926abff157f9ff47 100644
+--- a/src_assets/windows/misc/vsink/uninstall-vsink.bat
++++ b/src_assets/windows/misc/vsink/uninstall-vsink.bat
+@@ -1,33 +1,8 @@
+ @echo off
+-set "PATH=%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem;%SystemRoot%\System32\WindowsPowerShell\v1.0"
+-:: Uninstall VB-Cable virtual audio device
+-:: Requires administrator privileges
+-
+-:: Check if running as administrator
+-net session >nul 2>&1
+-if %errorLevel% neq 0 (
+-    echo Please run this script as administrator
+-    pause
+-    exit /b
+-)
+-
+-:: Stop and remove VB-Cable service
+-echo Stopping VB-Cable service...
+-net stop "VB-Audio Virtual Cable" >nul 2>&1
+-
+-echo Removing VB-Cable driver...
+-pnputil /delete-driver oem*.inf /uninstall /force >nul 2>&1
+-
+-:: Clean registry entries
+-echo Cleaning registry...
+-reg delete "HKLM\SYSTEM\CurrentControlSet\Services\VB-Audio Virtual Cable" /f >nul 2>&1
+-reg delete "HKLM\SOFTWARE\VB-Audio" /f >nul 2>&1
+-
+-:: Remove program files
+-echo Removing program files...
+-rd /s /q "%ProgramFiles%\VB\Cable" >nul 2>&1
+-rd /s /q "%ProgramFiles(x86)%\VB\Cable" >nul 2>&1
+-
+-echo Uninstallation complete!
+-echo Please restart your computer for changes to take effect
+-pause
++rem VB-CABLE is a shared system driver. Sunshine must not remove other audio users.
++echo Sunshine keeps the shared VB-CABLE driver installed.
++echo To remove it explicitly, extract ..\tools\vbcable\VBCABLE_Driver_Pack45.zip,
++echo run its original VBCABLE_Setup_x64.exe as administrator, choose Remove Driver,
++echo and restart Windows when you are ready. Sunshine will not restart Windows.
++echo Official instructions: https://vb-audio.com/Cable/
++exit /b 0
+diff --git a/src_assets/windows/misc/vsink/vb-cable-helper.ps1 b/src_assets/windows/misc/vsink/vb-cable-helper.ps1
+new file mode 100644
+index 0000000000000000000000000000000000000000..66a85de6164bc0ae0e041b81ec4322da5c4864f4
+--- /dev/null
++++ b/src_assets/windows/misc/vsink/vb-cable-helper.ps1
+@@ -0,0 +1,82 @@
++#requires -Version 5.1
++[CmdletBinding()]
++param(
++    [switch]$InspectOnly,
++    [switch]$AllowVendorUI,
++    [string]$Archive=(Join-Path $PSScriptRoot 'VBCABLE_Driver_Pack45.zip'),
++    [string]$ResultPath=(Join-Path $env:TEMP 'sunshine-vbcable-result.json')
++)
++$ErrorActionPreference='Stop'
++$expectedVersion=[version]'3.3.1.7'
++$expectedArchive='B950E39F01AF1D04EA623C8F6D8EB9B6EA5C477C637295FABF20631C85116BFB'
++$result=[ordered]@{At=[DateTime]::UtcNow.ToString('o');Status='checking';BundledDriverVersion=$expectedVersion.ToString();ChangesMade=$false;ActiveRenderCount=0;RestartRequired=$false;VendorExitCode=$null;Error=$null}
++$code=102;$temporary=$null
++function Get-CableState {
++    $drivers=@(Get-CimInstance Win32_PnPSignedDriver -Filter "DeviceClass='MEDIA'"|Where-Object{$_.DeviceName -eq 'VB-Audio Virtual Cable' -and $_.DriverProviderName -eq 'VB-Audio Software'})
++    $active=@(Get-ChildItem -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render' -ErrorAction SilentlyContinue|Where-Object{
++        $state=Get-ItemProperty -LiteralPath $_.PSPath
++        $properties=Get-ItemProperty -LiteralPath ($_.PSPath+'\Properties') -ErrorAction SilentlyContinue
++        $state.DeviceState -eq 1 -and $properties.'{a45c254e-df1c-4efd-8020-67d146a850e0},2' -eq 'CABLE Input'
++    })
++    [pscustomobject]@{Drivers=$drivers;ActiveRenderCount=$active.Count}
++}
++function Check-FileTrust([string]$Path,[string]$Hash,[string]$Signer){
++    if((Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ne $Hash){throw 'The extracted official driver file SHA256 does not match.'}
++    $signature=Get-AuthenticodeSignature -LiteralPath $Path
++    if($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Thumbprint -ne $Signer){throw ('Windows could not validate the expected publisher signature: '+[IO.Path]::GetFileName($Path))}
++}
++try{
++    if((Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash -ne $expectedArchive){throw 'The complete official standard Pack45 archive is missing or has a different SHA256.'}
++    $result['ArchiveSHA256']=$expectedArchive
++    $before=Get-CableState
++    $result.ActiveRenderCount=$before.ActiveRenderCount
++    if($before.Drivers.Count){
++        if($before.Drivers.Count -ne 1 -or -not $before.Drivers[0].IsSigned){throw 'Existing standard VB-CABLE driver state is ambiguous or unsigned; retain it and repair explicitly.'}
++        $installed=[version]$before.Drivers[0].DriverVersion
++        $result['InstalledDriverVersion']=$installed.ToString()
++        if($before.ActiveRenderCount -lt 1){throw 'VB-CABLE is already registered but its CABLE Input playback endpoint is not active. No reinstall was attempted.'}
++        if($installed -lt $expectedVersion){$result.Status='existing-older-retained-update-required';$result.Error='An older driver was retained. Use the official installer and restart workflow to update explicitly.';$code=103}
++        else{$result.Status=if($installed -eq $expectedVersion){'existing-current-retained'}else{'existing-newer-retained'};$code=0}
++    }elseif($InspectOnly){$result.Status='not-installed';$code=104}
++    else{
++        if(Test-Path -LiteralPath 'HKLM:\SOFTWARE\VB-Audio\Cable'){throw 'A previous VB-CABLE installation is still registered. Repair it explicitly with the original installer; no automatic reinstall was attempted.'}
++        if(-not $AllowVendorUI -or -not [Environment]::UserInteractive){throw 'VB-CABLE is absent. Run the Sunshine installer interactively or use the included original installer; silent installation will not open or wait for an invisible vendor window.'}
++        $principal=New-Object Security.Principal.WindowsPrincipal ([Security.Principal.WindowsIdentity]::GetCurrent())
++        if(-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)){throw 'Administrator privileges are required to install the driver.'}
++        if(-not [Environment]::Is64BitOperatingSystem){throw 'This Sunshine package requires 64-bit Windows.'}
++        $tempRoot=[IO.Path]::GetFullPath([IO.Path]::GetTempPath())
++        $temporary=Join-Path $tempRoot ('Sunshine-VBCable-'+[guid]::NewGuid().ToString('N'))
++        Add-Type -AssemblyName System.IO.Compression.FileSystem
++        $zip=[IO.Compression.ZipFile]::OpenRead($Archive)
++        try{foreach($entry in $zip.Entries){if(-not ([IO.Path]::GetFullPath((Join-Path $temporary $entry.FullName))).StartsWith($temporary+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Unexpected archive extraction path.'}}}finally{$zip.Dispose()}
++        [IO.Compression.ZipFile]::ExtractToDirectory($Archive,$temporary)
++        $setup=Join-Path $temporary 'VBCABLE_Setup_x64.exe'
++        Check-FileTrust $setup '734C35DFA6D98F48782A451633CEB471166EC70D60482FD89A1123D0EE3C4F41' 'A77952D93229D0EC36E2543081EEA7D125732B9C'
++        Check-FileTrust (Join-Path $temporary 'vbaudio_cable64_win10.cat') '0A921EBADBE39CF3FA7C14FF37D1CA22565A9651244BD3AC177DC810BC99072E' '9A4A6CFEE73C6B65945FCAA083DFBCC1E9077E7E'
++        Write-Host 'Complete the original VB-Audio installer window. Sunshine will not click its controls or restart Windows.'
++        $vendor=Start-Process -FilePath $setup -WorkingDirectory $temporary -WindowStyle Normal -PassThru -Wait
++        $result.VendorExitCode=$vendor.ExitCode
++        $after=$null
++        for($attempt=0;$attempt -lt 15;$attempt++){
++            $after=Get-CableState
++            if($after.Drivers.Count -eq 1 -and $after.Drivers[0].IsSigned -and [version]$after.Drivers[0].DriverVersion -ge $expectedVersion){break}
++            Start-Sleep -Seconds 2
++        }
++        if($after.Drivers.Count -ne 1 -or -not $after.Drivers[0].IsSigned -or [version]$after.Drivers[0].DriverVersion -lt $expectedVersion){throw 'The vendor window exited, but the signed expected driver was not found. Installation was cancelled or failed; its exit code alone is not treated as success.'}
++        $result['InstalledDriverVersion']=$after.Drivers[0].DriverVersion
++        $result.ActiveRenderCount=$after.ActiveRenderCount
++        $result.Status=if($after.ActiveRenderCount){'installed-restart-required'}else{'driver-staged-restart-required'}
++        $result.ChangesMade=$true;$result.RestartRequired=$true;$code=3010
++    }
++}catch{$result.Status='failed';$result.Error=$_.Exception.Message;$code=102}
++finally{
++    if($temporary -and (Test-Path -LiteralPath $temporary)){
++        $resolved=[IO.Path]::GetFullPath($temporary)
++        if(-not $resolved.StartsWith($tempRoot.TrimEnd('\')+'\Sunshine-VBCable-',[StringComparison]::OrdinalIgnoreCase)){throw 'Refusing cleanup outside this helper temporary directory.'}
++        Remove-Item -LiteralPath $resolved -Recurse -Force
++    }
++    $result['ExitCode']=$code
++    $result|ConvertTo-Json -Depth 4|Set-Content -LiteralPath $ResultPath -Encoding UTF8
++}
++$result|ConvertTo-Json -Depth 4
++exit $code

@@ -1,0 +1,1272 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dead-Universe <Dead-Universe@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 15:44:03 +0800
+Subject: [PATCH] Add authenticated Windows file and folder clipboard copying
+
+Copy-only native virtual files over paired HTTPS; user-token file reads, bounded chunks, lazy IStream access and session-scoped revocation.
+
+Built and verified in Hyper-V Win11; independent maintenance patch on 5c3061568275170fcfa6e29856eac8f9739dda5e.
+
+diff --git a/app/streaming/clipboardsync.cpp b/app/streaming/clipboardsync.cpp
+index 7faecaaa..7fb5aa3d 100644
+--- a/app/streaming/clipboardsync.cpp
++++ b/app/streaming/clipboardsync.cpp
+@@ -401,6 +401,7 @@ void ClipboardSync::applyInboundText(const QByteArray& payload)
+         return;
+     }
+ 
++    emit aboutToApplyRemoteClipboard();
+     if (hasFileReferences(cb->mimeData())) {
+         ClipboardLog::debug("ClipboardSync: preserving local file clipboard; inbound text ignored");
+         return;
+@@ -424,6 +425,7 @@ void ClipboardSync::applyInboundPng(const QByteArray& payload)
+         return;
+     }
+ 
++    emit aboutToApplyRemoteClipboard();
+     if (hasFileReferences(cb->mimeData())) {
+         ClipboardLog::debug("ClipboardSync: preserving local file clipboard; inbound PNG ignored");
+         return;
+@@ -1254,6 +1256,7 @@ void ClipboardSync::applyCompound(const QByteArray& text, const QByteArray& png)
+         return;
+     }
+ 
++    emit aboutToApplyRemoteClipboard();
+     if (hasFileReferences(cb->mimeData())) {
+         ClipboardLog::debug("ClipboardSync: preserving local file clipboard; inbound compound ignored");
+         return;
+diff --git a/app/streaming/clipboardsync.h b/app/streaming/clipboardsync.h
+index 1deea245..c7ab1399 100644
+--- a/app/streaming/clipboardsync.h
++++ b/app/streaming/clipboardsync.h
+@@ -135,6 +135,7 @@ signals:
+     // owner decides how to deliver the frame, which lets the clipboard engine
+     // run in a helper process without direct access to the Limelight session.
+     void outboundFrame(QByteArray frame);
++    void aboutToApplyRemoteClipboard();
+ 
+ private slots:
+ #ifdef Q_OS_MACOS
+diff --git a/clipboard-helper/clipboard-helper.pro b/clipboard-helper/clipboard-helper.pro
+index ff38c92b..2ee6c869 100644
+--- a/clipboard-helper/clipboard-helper.pro
++++ b/clipboard-helper/clipboard-helper.pro
+@@ -32,3 +32,10 @@ unix:!macx {
+     target.path = $$PREFIX/$$BINDIR/
+     INSTALLS += target
+ }
++
++win32 {
++    SOURCES += fileclipboardsync.cpp native/file_clipboard_native.cpp native/file_clipboard_source.cpp
++    HEADERS += fileclipboardsync.h native/file_clipboard_native.h native/file_clipboard_wire.h
++    DEFINES += NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
++    LIBS += -lole32 -loleaut32 -lshell32 -luuid -luser32 -ladvapi32 -lwtsapi32
++}
+\ No newline at end of file
+diff --git a/clipboard-helper/fileclipboardsync.cpp b/clipboard-helper/fileclipboardsync.cpp
+new file mode 100644
+index 00000000..0e59c76c
+--- /dev/null
++++ b/clipboard-helper/fileclipboardsync.cpp
+@@ -0,0 +1,237 @@
++#include "fileclipboardsync.h"
++#include "native/file_clipboard_wire.h"
++#include "backend/pairedcertificate.h"
++#include "streaming/clipboardlogging.h"
++#include <QEventLoop>
++#include <QNetworkReply>
++#include <QPointer>
++#include <QThread>
++#include <QTimer>
++#include <QUrl>
++#include <mutex>
++
++namespace fc = streaming::file_clipboard;
++namespace wire = fc::wire;
++namespace {
++QByteArray array(const wire::bytes& data) { return QByteArray(reinterpret_cast<const char*>(data.data()), static_cast<qsizetype>(data.size())); }
++wire::bytes bytes(const QByteArray& data) { return wire::bytes(data.begin(), data.end()); }
++struct Transport {
++    ClipboardSyncHostContext context;
++    QByteArray session;
++    std::atomic<bool> valid {true};
++};
++QNetworkRequest request(const ClipboardSyncHostContext& context, const QByteArray& session, const QString& tail)
++{
++    QUrl url;
++    url.setScheme(QStringLiteral("https")); url.setHost(context.address); url.setPort(context.httpsPort);
++    url.setPath(QStringLiteral("/api/v1/clipboard/files/") + tail);
++    QNetworkRequest result(url);
++    auto ssl = QSslConfiguration::defaultConfiguration();
++    ssl.setLocalCertificate(context.clientCertificate); ssl.setPrivateKey(context.clientPrivateKey);
++    result.setSslConfiguration(ssl);
++    result.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::ManualRedirectPolicy);
++    result.setRawHeader("Content-Type", "application/octet-stream");
++    result.setRawHeader("X-Clipboard-Session", session);
++    result.setTransferTimeout(18000);
++    return result;
++}
++void pin(QNetworkAccessManager* manager, QObject* parent, const QSslCertificate& certificate)
++{
++    PairedCertificate::enforce(manager, parent, certificate);
++    QObject::connect(manager, &QNetworkAccessManager::sslErrors, parent,
++                     [certificate](QNetworkReply* reply, const QList<QSslError>& errors) {
++        if (PairedCertificate::canIgnoreErrors(certificate, errors)) reply->ignoreSslErrors(errors);
++    });
++}
++bool accepted(QNetworkReply* reply, const QSslCertificate& pinned)
++{
++    return reply->error() == QNetworkReply::NoError &&
++        PairedCertificate::matches(pinned, reply->sslConfiguration().peerCertificate());
++}
++// Each COM reader uses its own event loop. It never waits for the clipboard/UI
++// thread, including when Explorer calls IStream while that thread is in OLE.
++HRESULT remoteRead(const std::shared_ptr<Transport>& transport, const wire::read_query& query,
++                   void* buffer, ULONG count, ULONG& received)
++{
++    received = 0;
++    if (!transport->valid || !fc::interactive_desktop_available()) return STG_E_REVERTED;
++    QNetworkAccessManager manager; pin(&manager, &manager, transport->context.serverCertificate);
++    auto reply = manager.post(request(transport->context, transport->session, QStringLiteral("read")),
++                              array(wire::encode({wire::kind::request, 0, wire::query(query)})));
++    reply->setReadBufferSize(fc::max_chunk_bytes + 4);
++    QByteArray content; bool overflow = false;
++    QObject::connect(reply, &QNetworkReply::readyRead, reply, [&] {
++        content += reply->readAll();
++        if (content.size() > static_cast<qsizetype>(fc::max_chunk_bytes + 4)) { overflow = true; reply->abort(); }
++    });
++    QEventLoop loop; QTimer timer, cancellation; timer.setSingleShot(true);
++    QObject::connect(reply, &QNetworkReply::finished, &loop, &QEventLoop::quit);
++    QObject::connect(&timer, &QTimer::timeout, reply, &QNetworkReply::abort);
++    QObject::connect(&cancellation, &QTimer::timeout, reply, [transport, reply] { if (!transport->valid) reply->abort(); });
++    cancellation.start(100);
++    timer.start(18000); if (!reply->isFinished()) loop.exec();
++    content += reply->readAll();
++    if (!transport->valid || overflow || !accepted(reply, transport->context.serverCertificate) ||
++        reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() != 200) return STG_E_READFAULT;
++    return wire::reply(bytes(content), buffer, count, received);
++}
++struct RemoteReader final : fc::reader {
++    std::shared_ptr<Transport> transport; std::uint64_t generation;
++    std::timed_mutex gate;
++    HRESULT read_at(std::size_t index, std::uint64_t offset, void* buffer, ULONG count, ULONG& got) override {
++        got = 0;
++        std::unique_lock<std::timed_mutex> lock(gate, std::defer_lock);
++        if (!lock.try_lock_for(std::chrono::seconds(20))) return STG_E_INUSE;
++        return remoteRead(transport, {generation, static_cast<std::uint32_t>(index), offset, count}, buffer, count, got);
++    }
++};
++}
++
++struct FileClipboardSync::Impl {
++    FileClipboardSync* owner; ClipboardSyncHostContext context;
++    std::unique_ptr<QNetworkAccessManager> manager;
++    QTimer retry; QPointer<QNetworkReply> events;
++    std::shared_ptr<Transport> transport;
++    std::atomic<std::uint64_t> generation {1};
++    std::atomic<bool> stopping {false};
++    std::mutex mutex; std::shared_ptr<fc::source_files> source;
++    fc::publisher publisher;
++    std::unique_ptr<wire::workers> workers;
++    bool opening = false, unsupported = false;
++    wire::message pendingOffer;
++    bool havePendingOffer = false;
++    explicit Impl(FileClipboardSync* object, ClipboardSyncHostContext value): owner(object), context(std::move(value)) {
++        manager = std::make_unique<QNetworkAccessManager>(); pin(manager.get(), owner, context.serverCertificate);
++        workers = std::make_unique<wire::workers>();
++        QObject::connect(&retry, &QTimer::timeout, owner, [this] { if (!transport) open(); else poll(); });
++        retry.setInterval(1500); retry.start();
++        publisher.observe([this](std::uint32_t, std::vector<std::wstring> paths) {
++            auto epoch = ++generation;
++            { std::lock_guard<std::mutex> lock(mutex); source.reset(); }
++            QMetaObject::invokeMethod(owner, [this] { havePendingOffer = false; send({wire::kind::offer, 0, {}}); }, Qt::QueuedConnection);
++            if (paths.empty()) return;
++            workers->post([this, epoch, paths = std::move(paths)] {
++                std::shared_ptr<fc::source_files> collected;
++                auto status = fc::source_files::collect(paths, [this, epoch] { return stopping || generation != epoch; }, collected);
++                if (FAILED(status)) {
++                    if (generation == epoch && !stopping) ClipboardLog::warn("FileClipboard: cannot prepare file selection (0x%08lx)", static_cast<unsigned long>(status));
++                    return;
++                }
++                if (stopping || generation != epoch) return;
++                auto manifest = wire::manifest(collected->entries()); if (manifest.empty()) return;
++                QMetaObject::invokeMethod(owner, [this, epoch, collected, manifest = std::move(manifest)]() mutable {
++                    if (stopping || generation != epoch) return;
++                    { std::lock_guard<std::mutex> lock(mutex); source = collected; }
++                    wire::message value {wire::kind::offer, epoch, std::move(manifest)};
++                    if (transport) send(std::move(value));
++                    else { pendingOffer = std::move(value); havePendingOffer = true; }
++                }, Qt::QueuedConnection);
++            });
++        });
++        QTimer::singleShot(250, owner, [this] { open(); });
++    }
++    ~Impl() {
++        stopping = true; retry.stop(); generation++;
++        publisher.observe({}); publisher.clear();
++        if (transport) transport->valid = false;
++        if (events) events->abort();
++        workers.reset();
++        manager.reset();
++    }
++    void reset() {
++        if (transport) transport->valid = false;
++        transport.reset(); generation++;
++        havePendingOffer = false;
++        { std::lock_guard<std::mutex> lock(mutex); source.reset(); }
++        publisher.clear();
++    }
++    void bounded(QNetworkReply* reply, qsizetype limit) {
++        reply->setReadBufferSize(limit + 1);
++        QObject::connect(reply, &QNetworkReply::readyRead, owner, [reply, limit] {
++            if (reply->bytesAvailable() > limit) reply->abort();
++        });
++    }
++    void open() {
++        if (opening || unsupported || stopping) return;
++        opening = true;
++        auto reply = manager->post(request(context, {}, QStringLiteral("open")), QByteArray()); bounded(reply, 128);
++        QObject::connect(reply, &QNetworkReply::finished, owner, [this, reply] {
++            opening = false;
++            auto status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
++            auto key = reply->readAll();
++            if (status == 404) unsupported = true;
++            if (accepted(reply, context.serverCertificate) && status == 200 && key.size() == 64) {
++                transport = std::make_shared<Transport>(); transport->context = context; transport->session = key;
++                ClipboardLog::info("FileClipboard: connected (copy only, files + folders)");
++                if (havePendingOffer) {
++                    if (pendingOffer.id == generation) send(std::move(pendingOffer));
++                    havePendingOffer = false;
++                }
++                poll();
++            }
++            reply->deleteLater();
++        });
++    }
++    void poll() {
++        if (events || !transport || stopping) return;
++        auto current = transport;
++        auto reply = manager->get(request(context, current->session, QStringLiteral("events"))); events = reply;
++        bounded(reply, wire::max_manifest_bytes + 16);
++        QObject::connect(reply, &QNetworkReply::finished, owner, [this, current, reply] {
++            if (events == reply) events = nullptr;
++            auto body = reply->readAll();
++            auto status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
++            bool okay = current == transport && accepted(reply, context.serverCertificate);
++            if (okay && status == 200) {
++                wire::message value;
++                if (wire::decode(bytes(body), value)) receive(std::move(value)); else okay = false;
++            } else if (status != 204) okay = false;
++            reply->deleteLater();
++            if (stopping || current != transport) return;
++            if (!okay) { reset(); return; }
++            QTimer::singleShot(0, owner, [this] { poll(); });
++        });
++    }
++    void send(wire::message value) {
++        if (!transport || stopping) return;
++        auto current = transport;
++        auto reply = manager->post(request(context, current->session, QStringLiteral("send")), array(wire::encode(value)));
++        bounded(reply, 1024);
++        QObject::connect(reply, &QNetworkReply::finished, owner, [this, current, reply] {
++            auto status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
++            if (current == transport && (status == 403 || status == 410)) reset();
++            reply->deleteLater();
++        });
++    }
++    void receive(wire::message value) {
++        if (value.type == wire::kind::offer) {
++            if (!value.id) { publisher.clear(); return; }
++            generation++; havePendingOffer = false;
++            { std::lock_guard<std::mutex> lock(mutex); source.reset(); }
++            auto offer = std::make_shared<fc::offer>();
++            if (!wire::manifest(value.body, offer->entries) || !fc::interactive_desktop_available()) return;
++            auto reader = std::make_shared<RemoteReader>(); reader->transport = transport; reader->generation = value.id;
++            offer->source = std::move(reader);
++            if (FAILED(publisher.publish(std::move(offer)))) ClipboardLog::warn("FileClipboard: cannot publish remote file list");
++        } else if (value.type == wire::kind::request) {
++            wire::read_query query; std::shared_ptr<fc::source_files> local;
++            { std::lock_guard<std::mutex> lock(mutex); local = source; }
++            if (!wire::query(value.body, query) || !local || !wire::within(query, generation, local->entries())) {
++                send({wire::kind::reply, value.id, wire::reply(STG_E_REVERTED)}); return;
++            }
++            auto id = value.id;
++            if (!workers->post([this, local, query, id] {
++                wire::bytes data(query.count); ULONG got = 0;
++                auto status = generation == query.generation ? local->read_at(query.index, query.offset, data.data(), query.count, got) : STG_E_REVERTED;
++                if (generation != query.generation) status = STG_E_REVERTED;
++                auto body = wire::reply(status, data.data(), SUCCEEDED(status) ? got : 0);
++                QMetaObject::invokeMethod(owner, [this, id, body = std::move(body)]() mutable {
++                    if (!stopping) send({wire::kind::reply, id, std::move(body)});
++                }, Qt::QueuedConnection);
++            })) send({wire::kind::reply, id, wire::reply(STG_E_INUSE)});
++        }
++    }
++};
++FileClipboardSync::FileClipboardSync(const ClipboardSyncHostContext& context, QObject* parent): QObject(parent), state(std::make_unique<Impl>(this, context)) {}
++FileClipboardSync::~FileClipboardSync() = default;
++void FileClipboardSync::clearRemote() { state->publisher.clear(); }
+diff --git a/clipboard-helper/fileclipboardsync.h b/clipboard-helper/fileclipboardsync.h
+new file mode 100644
+index 00000000..a6546493
+--- /dev/null
++++ b/clipboard-helper/fileclipboardsync.h
+@@ -0,0 +1,14 @@
++#pragma once
++#include "streaming/clipboardsync.h"
++#include <memory>
++class FileClipboardSync final : public QObject
++{
++public:
++    explicit FileClipboardSync(const ClipboardSyncHostContext& context, QObject* parent = nullptr);
++    ~FileClipboardSync() override;
++    // Releases only this engine's remote virtual files, preserving a local copy.
++    void clearRemote();
++private:
++    struct Impl;
++    std::unique_ptr<Impl> state;
++};
+diff --git a/clipboard-helper/main.cpp b/clipboard-helper/main.cpp
+index aaef23c0..60b263e7 100644
+--- a/clipboard-helper/main.cpp
++++ b/clipboard-helper/main.cpp
+@@ -1,5 +1,8 @@
+ #include "streaming/clipboardsync.h"
+ #include "streaming/clipboardipc.h"
++#ifdef Q_OS_WIN
++#include "fileclipboardsync.h"
++#endif
+ 
+ #include <QByteArray>
+ #include <QCoreApplication>
+@@ -126,6 +129,11 @@ private:
+             m_ClipboardEngine->setHostContext(context);
+         }
+ 
++#ifdef Q_OS_WIN
++        delete m_FileClipboard;
++        m_FileClipboard = new FileClipboardSync(context, this);
++        connect(m_ClipboardEngine, &ClipboardSync::aboutToApplyRemoteClipboard, m_FileClipboard, &FileClipboardSync::clearRemote);
++#endif
+         writeProtocolLine(ClipboardIpc::encodeReady(sequence));
+     }
+ 
+@@ -146,6 +154,9 @@ private:
+     }
+ 
+     ClipboardSync* m_ClipboardEngine = nullptr;
++#ifdef Q_OS_WIN
++    FileClipboardSync* m_FileClipboard = nullptr;
++#endif
+     quint32 m_NextSequence = 1;
+ };
+ 
+diff --git a/clipboard-helper/native/file_clipboard_native.cpp b/clipboard-helper/native/file_clipboard_native.cpp
+new file mode 100644
+index 00000000..27a4dd03
+--- /dev/null
++++ b/clipboard-helper/native/file_clipboard_native.cpp
+@@ -0,0 +1,488 @@
++#include "file_clipboard_native.h"
++#include "file_clipboard_wire.h"
++#include <shlobj.h>
++#include <shellapi.h>
++#include <shldisp.h>
++#include <wtsapi32.h>
++#include <algorithm>
++#include <array>
++#include <condition_variable>
++#include <cstring>
++#include <cwctype>
++#include <limits>
++#include <mutex>
++#include <set>
++#include <thread>
++
++namespace streaming::file_clipboard {
++namespace {
++CLIPFORMAT descriptor_format() { return static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"FileGroupDescriptorW")); }
++CLIPFORMAT contents_format() { return static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"FileContents")); }
++CLIPFORMAT effect_format() { return static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"Preferred DropEffect")); }
++
++HRESULT global_medium(std::size_t size, STGMEDIUM *medium, const std::function<void(void *)> &fill) {
++  HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, size);
++  if (!memory) return E_OUTOFMEMORY;
++  void *data = GlobalLock(memory);
++  if (!data) { GlobalFree(memory); return E_OUTOFMEMORY; }
++  fill(data);
++  GlobalUnlock(memory);
++  medium->tymed = TYMED_HGLOBAL;
++  medium->hGlobal = memory;
++  medium->pUnkForRelease = nullptr;
++  return S_OK;
++}
++
++class file_stream final : public IStream {
++public:
++  file_stream(std::shared_ptr<offer> value, std::size_t index, std::uint64_t position = 0)
++      : value_(std::move(value)), index_(index), position_(position) {
++    CoCreateFreeThreadedMarshaler(static_cast<IStream *>(this), &marshaler_);
++  }
++  ~file_stream() { if (marshaler_) marshaler_->Release(); }
++  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
++    if (!out) return E_POINTER;
++    *out = nullptr;
++    if (id == IID_IUnknown || id == IID_ISequentialStream || id == IID_IStream) {
++      *out = static_cast<IStream *>(this); AddRef(); return S_OK;
++    }
++    if (id == IID_IMarshal && marshaler_) return marshaler_->QueryInterface(id, out);
++    return E_NOINTERFACE;
++  }
++  ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
++  ULONG STDMETHODCALLTYPE Release() override { auto n = --references_; if (!n) delete this; return n; }
++  HRESULT STDMETHODCALLTYPE Read(void *buffer, ULONG count, ULONG *read) override {
++    if (read) *read = 0;
++    if (!buffer && count) return STG_E_INVALIDPOINTER;
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!value_->valid.load()) return STG_E_REVERTED;
++    const auto size = value_->entries[index_].size;
++    ULONG total = 0;
++    while (total < count && position_ < size) {
++      ULONG wanted = static_cast<ULONG>(std::min<std::uint64_t>(
++          std::min<ULONG>(max_chunk_bytes, count - total), size - position_));
++      ULONG received = 0;
++      HRESULT status = value_->source->read_at(index_, position_,
++          static_cast<unsigned char *>(buffer) + total, wanted, received);
++      if (FAILED(status)) { if (read) *read = total; return status; }
++      if (received == 0 || received > wanted) { if (read) *read = total; return STG_E_READFAULT; }
++      position_ += received;
++      total += received;
++      if (!value_->valid.load()) { if (read) *read = total; return STG_E_REVERTED; }
++    }
++    if (read) *read = total;
++    return total == count ? S_OK : S_FALSE;
++  }
++  HRESULT STDMETHODCALLTYPE Write(const void *, ULONG, ULONG *written) override {
++    if (written) *written = 0;
++    return STG_E_ACCESSDENIED;
++  }
++  HRESULT STDMETHODCALLTYPE Seek(LARGE_INTEGER move, DWORD origin, ULARGE_INTEGER *new_position) override {
++    std::lock_guard<std::mutex> lock(mutex_);
++    std::uint64_t base = 0;
++    if (origin == STREAM_SEEK_CUR) base = position_;
++    else if (origin == STREAM_SEEK_END) base = value_->entries[index_].size;
++    else if (origin != STREAM_SEEK_SET) return STG_E_INVALIDFUNCTION;
++    if (move.QuadPart < 0) {
++      const auto magnitude = static_cast<std::uint64_t>(-(move.QuadPart + 1)) + 1;
++      if (magnitude > base) return STG_E_INVALIDFUNCTION;
++      position_ = base - magnitude;
++    } else {
++      if (static_cast<std::uint64_t>(move.QuadPart) > UINT64_MAX - base) return STG_E_INVALIDFUNCTION;
++      position_ = base + static_cast<std::uint64_t>(move.QuadPart);
++    }
++    if (new_position) new_position->QuadPart = position_;
++    return S_OK;
++  }
++  HRESULT STDMETHODCALLTYPE SetSize(ULARGE_INTEGER) override { return STG_E_ACCESSDENIED; }
++  HRESULT STDMETHODCALLTYPE CopyTo(IStream *destination, ULARGE_INTEGER count,
++                                    ULARGE_INTEGER *read, ULARGE_INTEGER *written) override {
++    if (!destination) return STG_E_INVALIDPOINTER;
++    if (read) read->QuadPart = 0;
++    if (written) written->QuadPart = 0;
++    std::vector<unsigned char> buffer(max_chunk_bytes);
++    std::uint64_t remaining = count.QuadPart;
++    while (remaining) {
++      ULONG got = 0, sent = 0;
++      HRESULT status = Read(buffer.data(), static_cast<ULONG>(std::min<std::uint64_t>(remaining, buffer.size())), &got);
++      if (FAILED(status)) return status;
++      if (read) read->QuadPart += got;
++      if (got) {
++        HRESULT write_status = destination->Write(buffer.data(), got, &sent);
++        if (written) written->QuadPart += sent;
++        if (FAILED(write_status)) return write_status;
++        if (sent != got) return STG_E_WRITEFAULT;
++        remaining -= got;
++      }
++      if (status == S_FALSE) return S_OK;
++    }
++    return S_OK;
++  }
++  HRESULT STDMETHODCALLTYPE Commit(DWORD) override { return S_OK; }
++  HRESULT STDMETHODCALLTYPE Revert() override { return STG_E_INVALIDFUNCTION; }
++  HRESULT STDMETHODCALLTYPE LockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return STG_E_INVALIDFUNCTION; }
++  HRESULT STDMETHODCALLTYPE UnlockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return STG_E_INVALIDFUNCTION; }
++  HRESULT STDMETHODCALLTYPE Stat(STATSTG *stat, DWORD flags) override {
++    if (!stat) return STG_E_INVALIDPOINTER;
++    std::memset(stat, 0, sizeof(*stat));
++    const auto &item = value_->entries[index_];
++    stat->type = STGTY_STREAM;
++    stat->cbSize.QuadPart = item.size;
++    stat->mtime = item.last_write;
++    stat->grfMode = STGM_READ | STGM_SHARE_DENY_NONE;
++    if (!(flags & STATFLAG_NONAME)) {
++      const auto bytes = (item.relative_path.size() + 1) * sizeof(wchar_t);
++      stat->pwcsName = static_cast<wchar_t *>(CoTaskMemAlloc(bytes));
++      if (!stat->pwcsName) return E_OUTOFMEMORY;
++      std::memcpy(stat->pwcsName, item.relative_path.c_str(), bytes);
++    }
++    return S_OK;
++  }
++  HRESULT STDMETHODCALLTYPE Clone(IStream **out) override {
++    if (!out) return E_POINTER;
++    std::lock_guard<std::mutex> lock(mutex_);
++    *out = new (std::nothrow) file_stream(value_, index_, position_);
++    return *out ? S_OK : E_OUTOFMEMORY;
++  }
++private:
++  std::atomic<ULONG> references_ {1};
++  std::shared_ptr<offer> value_;
++  std::size_t index_;
++  std::uint64_t position_;
++  std::mutex mutex_;
++  IUnknown *marshaler_ = nullptr;
++};
++
++class data_object final : public IDataObject, public IDataObjectAsyncCapability {
++public:
++  explicit data_object(std::shared_ptr<offer> value): value_(std::move(value)) {
++    // IDataObject stays STA-marshalled. Free-threaded content IStreams remain
++    // separate: OLE's clipboard wrapper lost the registered descriptor format
++    // when this IDataObject itself used the free-threaded marshaler.
++    formats_ = {{{ descriptor_format(), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL },
++                 { contents_format(), nullptr, DVASPECT_CONTENT, -1, TYMED_ISTREAM },
++                 { effect_format(), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL }}};
++  }
++  ~data_object() = default;
++  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
++    if (!out) return E_POINTER;
++    *out = nullptr;
++    if (id == IID_IUnknown || id == IID_IDataObject) *out = static_cast<IDataObject *>(this);
++    else if (id == __uuidof(IDataObjectAsyncCapability)) *out = static_cast<IDataObjectAsyncCapability *>(this);
++    else return E_NOINTERFACE;
++    AddRef(); return S_OK;
++  }
++  ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
++  ULONG STDMETHODCALLTYPE Release() override { auto n = --references_; if (!n) delete this; return n; }
++  HRESULT STDMETHODCALLTYPE GetData(FORMATETC *format, STGMEDIUM *medium) override {
++    if (!format || !medium) return E_POINTER;
++    std::memset(medium, 0, sizeof(*medium));
++    if (!value_->valid.load()) return STG_E_REVERTED;
++    HRESULT supported = QueryGetData(format);
++    if (FAILED(supported)) return supported;
++    if (format->cfFormat == descriptor_format()) {
++      const auto size = offsetof(FILEGROUPDESCRIPTORW, fgd) + value_->entries.size() * sizeof(FILEDESCRIPTORW);
++      return global_medium(size, medium, [&](void *memory) {
++        auto *group = static_cast<FILEGROUPDESCRIPTORW *>(memory);
++        group->cItems = static_cast<UINT>(value_->entries.size());
++        for (std::size_t i = 0; i < value_->entries.size(); ++i) {
++          const auto &item = value_->entries[i];
++          auto &descriptor = group->fgd[i];
++          descriptor.dwFlags = FD_ATTRIBUTES | FD_UNICODE | FD_WRITESTIME | FD_PROGRESSUI;
++          descriptor.dwFileAttributes = item.attributes;
++          descriptor.ftLastWriteTime = item.last_write;
++          if (!item.directory()) {
++            descriptor.dwFlags |= FD_FILESIZE;
++            descriptor.nFileSizeHigh = static_cast<DWORD>(item.size >> 32);
++            descriptor.nFileSizeLow = static_cast<DWORD>(item.size);
++          }
++          std::memcpy(descriptor.cFileName, item.relative_path.c_str(),
++                      (item.relative_path.size() + 1) * sizeof(wchar_t));
++        }
++      });
++    }
++    if (format->cfFormat == effect_format()) {
++      return global_medium(sizeof(DWORD), medium, [](void *memory) {
++        *static_cast<DWORD *>(memory) = DROPEFFECT_COPY;
++      });
++    }
++    if (format->cfFormat == contents_format()) {
++      if (format->lindex < 0 || static_cast<std::size_t>(format->lindex) >= value_->entries.size() ||
++          value_->entries[format->lindex].directory()) return DV_E_LINDEX;
++      medium->pstm = new (std::nothrow) file_stream(value_, static_cast<std::size_t>(format->lindex));
++      if (!medium->pstm) return E_OUTOFMEMORY;
++      medium->tymed = TYMED_ISTREAM;
++      return S_OK;
++    }
++    return DV_E_FORMATETC;
++  }
++  HRESULT STDMETHODCALLTYPE GetDataHere(FORMATETC *, STGMEDIUM *) override { return DATA_E_FORMATETC; }
++  HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC *format) override {
++    if (!format) return E_POINTER;
++    if (format->dwAspect != DVASPECT_CONTENT) return DV_E_DVASPECT;
++    if (format->cfFormat == descriptor_format() || format->cfFormat == effect_format())
++      return (format->tymed & TYMED_HGLOBAL) ? S_OK : DV_E_TYMED;
++    if (format->cfFormat == contents_format())
++      return (format->tymed & TYMED_ISTREAM) ? S_OK : DV_E_TYMED;
++    return DV_E_FORMATETC;
++  }
++  HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC *, FORMATETC *out) override {
++    if (out) out->ptd = nullptr;
++    return E_NOTIMPL;
++  }
++  HRESULT STDMETHODCALLTYPE SetData(FORMATETC *format, STGMEDIUM *medium, BOOL release) override {
++    // Completion notifications never authorize deleting source files.
++    if (!format || !medium) return E_POINTER;
++    const auto performed = static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"Performed DropEffect"));
++    const auto pasted = static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"Paste Succeeded"));
++    if (format->cfFormat != performed && format->cfFormat != pasted) return DV_E_FORMATETC;
++    if (release) ReleaseStgMedium(medium);
++    return S_OK;
++  }
++  HRESULT STDMETHODCALLTYPE EnumFormatEtc(DWORD direction, IEnumFORMATETC **out) override {
++    if (direction != DATADIR_GET) return E_NOTIMPL;
++    return SHCreateStdEnumFmtEtc(static_cast<UINT>(formats_.size()), formats_.data(), out);
++  }
++  HRESULT STDMETHODCALLTYPE DAdvise(FORMATETC *, DWORD, IAdviseSink *, DWORD *) override { return OLE_E_ADVISENOTSUPPORTED; }
++  HRESULT STDMETHODCALLTYPE DUnadvise(DWORD) override { return OLE_E_ADVISENOTSUPPORTED; }
++  HRESULT STDMETHODCALLTYPE EnumDAdvise(IEnumSTATDATA **) override { return OLE_E_ADVISENOTSUPPORTED; }
++  HRESULT STDMETHODCALLTYPE SetAsyncMode(BOOL value) override { asynchronous_ = value != FALSE; return S_OK; }
++  HRESULT STDMETHODCALLTYPE GetAsyncMode(BOOL *out) override { if (!out) return E_POINTER; *out = asynchronous_ ? TRUE : FALSE; return S_OK; }
++  HRESULT STDMETHODCALLTYPE StartOperation(IBindCtx *) override { in_operation_ = true; return S_OK; }
++  HRESULT STDMETHODCALLTYPE InOperation(BOOL *out) override { if (!out) return E_POINTER; *out = in_operation_ ? TRUE : FALSE; return S_OK; }
++  HRESULT STDMETHODCALLTYPE EndOperation(HRESULT, IBindCtx *, DWORD) override { in_operation_ = false; return S_OK; }
++private:
++  std::atomic<ULONG> references_ {1};
++  std::shared_ptr<offer> value_;
++  std::array<FORMATETC, 3> formats_ {};
++  std::atomic<bool> asynchronous_ {true};
++  std::atomic<bool> in_operation_ {false};
++};
++}
++
++bool valid_relative_path(const std::wstring &path) {
++  if (path.empty() || path.size() >= MAX_PATH || path.front() == L'\\' || path.front() == L'/') return false;
++  std::size_t begin = 0;
++  while (begin < path.size()) {
++    auto end = path.find(L'\\', begin);
++    if (end == std::wstring::npos) end = path.size();
++    auto part = path.substr(begin, end - begin);
++    if (part.empty() || part == L"." || part == L".." || part.back() == L'.' || part.back() == L' ') return false;
++    for (std::size_t i = 0; i < part.size(); ++i) {
++      wchar_t c = part[i];
++      if (c < 32 || std::wstring(L"<>:\"/|?*").find(c) != std::wstring::npos) return false;
++      if (c >= 0xd800 && c <= 0xdbff) {
++        if (++i == part.size() || part[i] < 0xdc00 || part[i] > 0xdfff) return false;
++      } else if (c >= 0xdc00 && c <= 0xdfff) return false;
++    }
++    auto stem = part.substr(0, part.find(L'.'));
++    std::transform(stem.begin(), stem.end(), stem.begin(), [](wchar_t c) { return std::towupper(c); });
++    if (stem == L"CON" || stem == L"PRN" || stem == L"AUX" || stem == L"NUL" ||
++        (stem.size() == 4 && (stem.substr(0, 3) == L"COM" || stem.substr(0, 3) == L"LPT") &&
++          ((stem[3] >= L'1' && stem[3] <= L'9') || stem[3] == L'\u00b9' || stem[3] == L'\u00b2' || stem[3] == L'\u00b3'))) return false;
++    if (end == path.size()) return true;
++    begin = end + 1;
++    if (begin == path.size()) return false;
++  }
++  return false;
++}
++
++HRESULT create_data_object(std::shared_ptr<offer> value, IDataObject **result) {
++  if (!result) return E_POINTER;
++  *result = nullptr;
++  if (!value || !value->source || value->entries.empty() || value->entries.size() > max_entries) return E_INVALIDARG;
++  if (!wire::valid_manifest(value->entries)) return E_INVALIDARG;
++  *result = new (std::nothrow) data_object(std::move(value));
++  return *result ? S_OK : E_OUTOFMEMORY;
++}
++
++struct publisher::impl {
++  std::mutex mutex;
++  std::condition_variable ready;
++  std::thread thread;
++  HWND window = nullptr;
++  bool initialized = false;
++  HRESULT status = E_PENDING;
++  IDataObject *current = nullptr;
++  std::shared_ptr<offer> current_offer;
++  publisher::clipboard_change observer;
++  DWORD last_sequence = 0;
++  unsigned clipboard_retries = 0;
++  bool locked = false;
++  void changed(HWND window) {
++    if (!observer) return;
++    DWORD sequence = GetClipboardSequenceNumber();
++    if (sequence == last_sequence) return;
++    if (current && OleIsCurrentClipboard(current) == S_OK) { last_sequence = sequence; return; }
++    if (current_offer) current_offer->valid = false;
++    if (locked || !interactive_desktop_available()) {
++      last_sequence = sequence;
++      observer(sequence, {});
++      return;
++    }
++    if (!OpenClipboard(window)) {
++      if (++clipboard_retries <= 10) SetTimer(window, 1, 100, nullptr);
++      return;
++    }
++    std::vector<std::wstring> paths;
++    bool copy = true;
++    HANDLE effect = GetClipboardData(effect_format());
++    if (effect && GlobalSize(effect) >= sizeof(DWORD)) {
++      if (auto *value = static_cast<DWORD *>(GlobalLock(effect))) {
++        copy = (*value & DROPEFFECT_MOVE) == 0;
++        GlobalUnlock(effect);
++      }
++    }
++    if (copy && IsClipboardFormatAvailable(CF_HDROP)) {
++      const bool shell_files = IsClipboardFormatAvailable(RegisterClipboardFormatW(L"Shell IDList Array"));
++      const bool image = IsClipboardFormatAvailable(CF_DIB) || IsClipboardFormatAvailable(CF_DIBV5) ||
++                         IsClipboardFormatAvailable(RegisterClipboardFormatW(L"PNG"));
++      if (image && !shell_files) copy = false;
++    }
++    if (copy && IsClipboardFormatAvailable(CF_HDROP)) {
++      HDROP drop = static_cast<HDROP>(GetClipboardData(CF_HDROP));
++      UINT count = drop ? DragQueryFileW(drop, 0xffffffffu, nullptr, 0) : 0;
++      std::size_t path_characters = 0;
++      if (count <= max_entries) {
++        for (UINT i = 0; i < count; ++i) {
++          UINT length = DragQueryFileW(drop, i, nullptr, 0);
++          if (!length || length > 32766 || length > wire::max_manifest_bytes / sizeof(wchar_t) - path_characters) { paths.clear(); break; }
++          path_characters += length;
++          std::vector<wchar_t> path(length + 1);
++          if (DragQueryFileW(drop, i, path.data(), static_cast<UINT>(path.size())) != length) { paths.clear(); break; }
++          paths.emplace_back(path.data());
++        }
++      }
++    }
++    CloseClipboard();
++    clipboard_retries = 0;
++    last_sequence = sequence;
++    observer(sequence, std::move(paths));
++  }
++  struct request { std::shared_ptr<offer> value; HRESULT result = E_PENDING; };
++  static LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
++    auto *self = reinterpret_cast<impl *>(GetWindowLongPtrW(window, GWLP_USERDATA));
++    if (message == WM_NCCREATE) {
++      self = static_cast<impl *>(reinterpret_cast<CREATESTRUCTW *>(lparam)->lpCreateParams);
++      SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
++    }
++    if (self && message == WM_APP + 1) {
++      auto &call = *reinterpret_cast<request *>(lparam);
++      IDataObject *object = nullptr;
++      bool changed_clipboard = false;
++      call.result = call.value ? create_data_object(call.value, &object) : S_OK;
++      if (SUCCEEDED(call.result)) {
++        if (object) { call.result = OleSetClipboard(object); changed_clipboard = SUCCEEDED(call.result); }
++        else if (self->current && OleIsCurrentClipboard(self->current) == S_OK) {
++          call.result = OleSetClipboard(nullptr); changed_clipboard = SUCCEEDED(call.result);
++        }
++      }
++      if (SUCCEEDED(call.result)) {
++        if (self->current_offer) self->current_offer->valid = false;
++        if (self->current) self->current->Release();
++        self->current = object;
++        self->current_offer = call.value;
++        if (changed_clipboard) self->last_sequence = GetClipboardSequenceNumber();
++      } else if (object) object->Release();
++      return 0;
++    }
++    if (self && message == WM_APP + 2) { PostQuitMessage(0); return 0; }
++    if (self && message == WM_APP + 3) {
++      self->observer = *reinterpret_cast<publisher::clipboard_change *>(lparam);
++      self->last_sequence = GetClipboardSequenceNumber();
++      return 0;
++    }
++    if (self && message == WM_CLIPBOARDUPDATE) { self->changed(window); return 0; }
++    if (self && message == WM_TIMER && wparam == 1) { KillTimer(window, 1); self->changed(window); return 0; }
++    if (self && message == WM_TIMER && wparam == 2) {
++      const bool unavailable = !interactive_desktop_available();
++      if (unavailable && !self->locked) {
++        self->locked = true;
++        request clear;
++        SendMessageW(window, WM_APP + 1, 0, reinterpret_cast<LPARAM>(&clear));
++        if (self->observer) self->observer(GetClipboardSequenceNumber(), {});
++      } else if (!unavailable) self->locked = false;
++      return 0;
++    }
++    if (self && message == WM_WTSSESSION_CHANGE) {
++      if (wparam == WTS_SESSION_LOCK || wparam == WTS_SESSION_LOGOFF || wparam == WTS_CONSOLE_DISCONNECT || wparam == WTS_REMOTE_DISCONNECT) {
++        self->locked = true;
++        if (self->current_offer) self->current_offer->valid = false;
++        request clear;
++        SendMessageW(window, WM_APP + 1, 0, reinterpret_cast<LPARAM>(&clear));
++        if (self->observer) self->observer(GetClipboardSequenceNumber(), {});
++      } else if (wparam == WTS_SESSION_UNLOCK || wparam == WTS_SESSION_LOGON || wparam == WTS_CONSOLE_CONNECT || wparam == WTS_REMOTE_CONNECT) self->locked = false;
++      return 0;
++    }
++    return DefWindowProcW(window, message, wparam, lparam);
++  }
++  impl() {
++    thread = std::thread([this] {
++      HRESULT apartment = OleInitialize(nullptr);
++      HWND created = nullptr;
++      if (SUCCEEDED(apartment)) {
++        WNDCLASSW type {};
++        type.lpfnWndProc = procedure;
++        type.hInstance = GetModuleHandleW(nullptr);
++        type.lpszClassName = L"StreamingFileClipboardSTA";
++        if (RegisterClassW(&type) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS) {
++          created = CreateWindowExW(0, type.lpszClassName, L"", 0, 0, 0, 0, 0,
++                                    HWND_MESSAGE, nullptr, type.hInstance, this);
++        }
++      }
++      {
++        std::lock_guard<std::mutex> lock(mutex);
++        window = created;
++        initialized = true;
++        status = FAILED(apartment) ? apartment : created ? S_OK : HRESULT_FROM_WIN32(GetLastError());
++      }
++      ready.notify_all();
++      if (FAILED(apartment)) return;
++      if (!created) { OleUninitialize(); return; }
++      AddClipboardFormatListener(created);
++      WTSRegisterSessionNotification(created, NOTIFY_FOR_THIS_SESSION);
++      SetTimer(created, 2, 250, nullptr);
++      MSG message;
++      while (GetMessageW(&message, nullptr, 0, 0) > 0) {
++        TranslateMessage(&message); DispatchMessageW(&message);
++      }
++      if (current) {
++        if (OleIsCurrentClipboard(current) == S_OK) OleSetClipboard(nullptr);
++        current->Release(); current = nullptr;
++      }
++      WTSUnRegisterSessionNotification(created);
++      RemoveClipboardFormatListener(created);
++      DestroyWindow(created);
++      OleUninitialize();
++    });
++    std::unique_lock<std::mutex> lock(mutex);
++    ready.wait(lock, [&] { return initialized; });
++  }
++  ~impl() {
++    if (thread.joinable()) {
++      if (window) {
++        request clear;
++        SendMessageW(window, WM_APP + 1, 0, reinterpret_cast<LPARAM>(&clear));
++        PostMessageW(window, WM_APP + 2, 0, 0);
++      }
++      thread.join();
++    }
++  }
++};
++
++publisher::publisher(): state_(std::make_unique<impl>()) {}
++publisher::~publisher() = default;
++HRESULT publisher::publish(std::shared_ptr<offer> value) {
++  if (FAILED(state_->status)) return state_->status;
++  impl::request call {std::move(value), E_PENDING};
++  // SendMessage dispatches incoming nonqueued messages while waiting. A bare
++  // condition-variable wait here would deadlock if this caller owned the
++  // previous clipboard and OLE sent it WM_DESTROYCLIPBOARD during replacement.
++  SendMessageW(state_->window, WM_APP + 1, 0, reinterpret_cast<LPARAM>(&call));
++  return call.result;
++}
++void publisher::clear() { publish({}); }
++void publisher::observe(clipboard_change callback) {
++  if (SUCCEEDED(state_->status)) SendMessageW(state_->window, WM_APP + 3, 0, reinterpret_cast<LPARAM>(&callback));
++}
++}
+diff --git a/clipboard-helper/native/file_clipboard_native.h b/clipboard-helper/native/file_clipboard_native.h
+new file mode 100644
+index 00000000..fba45b1a
+--- /dev/null
++++ b/clipboard-helper/native/file_clipboard_native.h
+@@ -0,0 +1,79 @@
++#pragma once
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#include <objidl.h>
++#include <atomic>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace streaming::file_clipboard {
++inline constexpr std::size_t max_entries = 20000;
++inline constexpr ULONG max_chunk_bytes = 1024 * 1024;
++
++struct entry {
++  std::wstring relative_path;
++  std::uint64_t size = 0;
++  DWORD attributes = FILE_ATTRIBUTE_NORMAL;
++  FILETIME last_write {};
++  bool directory() const { return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0; }
++};
++
++// The transport must authenticate the offer and supply bounded reads. No
++// destination path or arbitrary source path is accepted by this interface.
++class reader {
++public:
++  virtual ~reader() = default;
++  virtual HRESULT read_at(std::size_t index, std::uint64_t offset,
++                          void *buffer, ULONG requested, ULONG &received) = 0;
++};
++
++struct offer {
++  std::vector<entry> entries;
++  std::shared_ptr<reader> source;
++  std::atomic<bool> valid {true};
++};
++
++bool valid_relative_path(const std::wstring &path);
++HRESULT create_data_object(std::shared_ptr<offer> value, IDataObject **result);
++bool interactive_desktop_available();
++
++class source_files final : public reader {
++public:
++  static HRESULT collect(const std::vector<std::wstring> &paths,
++                         const std::function<bool()> &cancelled,
++                         std::shared_ptr<source_files> &result);
++  ~source_files();
++  const std::vector<entry> &entries() const;
++  HRESULT read_at(std::size_t index, std::uint64_t offset,
++                  void *buffer, ULONG requested, ULONG &received) override;
++private:
++  struct impl;
++  source_files();
++  std::unique_ptr<impl> state_;
++};
++
++// Owns a dedicated OLE STA. Network/source callbacks may run on COM worker
++// threads and must not depend on this thread's message pump to make progress.
++class publisher {
++public:
++  publisher();
++  ~publisher();
++  publisher(const publisher &) = delete;
++  publisher &operator=(const publisher &) = delete;
++  HRESULT publish(std::shared_ptr<offer> value);
++  void clear();
++  using clipboard_change = std::function<void(std::uint32_t, std::vector<std::wstring>)>;
++  void observe(clipboard_change callback);
++private:
++  struct impl;
++  std::unique_ptr<impl> state_;
++};
++}
+diff --git a/clipboard-helper/native/file_clipboard_source.cpp b/clipboard-helper/native/file_clipboard_source.cpp
+new file mode 100644
+index 00000000..69f0fbbc
+--- /dev/null
++++ b/clipboard-helper/native/file_clipboard_source.cpp
+@@ -0,0 +1,163 @@
++#include "file_clipboard_native.h"
++#include "file_clipboard_wire.h"
++#include <filesystem>
++#include <set>
++
++namespace streaming::file_clipboard {
++namespace {
++std::wstring extended(const std::wstring &path) {
++  if (path.rfind(L"\\\\?\\", 0) == 0) return path;
++  if (path.rfind(L"\\\\", 0) == 0) return L"\\\\?\\UNC\\" + path.substr(2);
++  return L"\\\\?\\" + path;
++}
++struct handle {
++  HANDLE value = INVALID_HANDLE_VALUE;
++  ~handle() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
++};
++struct ordinal_less {
++  bool operator()(const std::wstring &a, const std::wstring &b) const {
++    return CompareStringOrdinal(a.c_str(), static_cast<int>(a.size()), b.c_str(), static_cast<int>(b.size()), TRUE) == CSTR_LESS_THAN;
++  }
++};
++HRESULT full_path(const std::wstring &input, std::wstring &output) {
++  DWORD count = GetFullPathNameW(input.c_str(), 0, nullptr, nullptr);
++  if (!count || count > 32767) return E_INVALIDARG;
++  std::vector<wchar_t> buffer(count);
++  if (!GetFullPathNameW(input.c_str(), count, buffer.data(), nullptr)) return HRESULT_FROM_WIN32(GetLastError());
++  output = buffer.data();
++  while (output.size() > 3 && output.back() == L'\\') output.pop_back();
++  auto parent = std::filesystem::path(output);
++  while (!parent.empty()) {
++    auto attributes = GetFileAttributesW(extended(parent.wstring()).c_str());
++    if (attributes == INVALID_FILE_ATTRIBUTES) return HRESULT_FROM_WIN32(GetLastError());
++    if (attributes & FILE_ATTRIBUTE_REPARSE_POINT) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
++    auto next = parent.parent_path();
++    if (next == parent) break;
++    parent = next;
++  }
++  return S_OK;
++}
++}
++
++bool interactive_desktop_available() {
++  DWORD session = MAXDWORD;
++  if (!ProcessIdToSessionId(GetCurrentProcessId(), &session) || session != WTSGetActiveConsoleSessionId()) return false;
++  HDESK desktop = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
++  if (!desktop) return false;
++  wchar_t name[128] {};
++  DWORD bytes = 0;
++  BOOL success = GetUserObjectInformationW(desktop, UOI_NAME, name, sizeof(name), &bytes);
++  CloseDesktop(desktop);
++  return success && CompareStringOrdinal(name, -1, L"Default", -1, TRUE) == CSTR_EQUAL;
++}
++
++struct source_files::impl {
++  struct fingerprint {
++    std::wstring path;
++    BY_HANDLE_FILE_INFORMATION information {};
++  };
++  std::vector<entry> entries;
++  std::vector<fingerprint> files;
++  std::set<std::wstring, ordinal_less> names;
++  std::size_t path_characters = 0;
++  HRESULT append(const std::wstring &path, const std::wstring &relative,
++                 const std::function<bool()> &cancelled, unsigned depth) {
++    if (cancelled && cancelled()) return HRESULT_FROM_WIN32(ERROR_CANCELLED);
++    if (depth > 64 || entries.size() >= max_entries || !valid_relative_path(relative)) return E_INVALIDARG;
++    if (path.size() > wire::max_manifest_bytes / sizeof(wchar_t) - path_characters) return E_OUTOFMEMORY;
++    path_characters += path.size();
++    if (!names.insert(relative).second) return HRESULT_FROM_WIN32(ERROR_DUP_NAME);
++    WIN32_FILE_ATTRIBUTE_DATA attributes {};
++    if (!GetFileAttributesExW(extended(path).c_str(), GetFileExInfoStandard, &attributes)) return HRESULT_FROM_WIN32(GetLastError());
++    if (attributes.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE)) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
++    entry descriptor;
++    descriptor.relative_path = relative;
++    descriptor.attributes = attributes.dwFileAttributes &
++        (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_SYSTEM);
++    if (!descriptor.attributes) descriptor.attributes = FILE_ATTRIBUTE_NORMAL;
++    descriptor.last_write = attributes.ftLastWriteTime;
++    fingerprint identity;
++    identity.path = extended(path);
++    if (!descriptor.directory()) {
++      handle file;
++      file.value = CreateFileW(identity.path.c_str(), FILE_READ_ATTRIBUTES,
++                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                               nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
++      if (file.value == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
++      if (!GetFileInformationByHandle(file.value, &identity.information)) return HRESULT_FROM_WIN32(GetLastError());
++      if (identity.information.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
++      descriptor.size = (static_cast<std::uint64_t>(identity.information.nFileSizeHigh) << 32) | identity.information.nFileSizeLow;
++      descriptor.last_write = identity.information.ftLastWriteTime;
++    }
++    entries.push_back(descriptor);
++    files.push_back(std::move(identity));
++    if (!descriptor.directory()) return S_OK;
++    WIN32_FIND_DATAW found {};
++    HANDLE search = FindFirstFileW(extended(path + L"\\*").c_str(), &found);
++    if (search == INVALID_HANDLE_VALUE) {
++      DWORD error = GetLastError();
++      return error == ERROR_FILE_NOT_FOUND ? S_OK : HRESULT_FROM_WIN32(error);
++    }
++    std::set<std::wstring, ordinal_less> children;
++    do {
++      if (std::wstring(found.cFileName) != L"." && std::wstring(found.cFileName) != L"..") children.insert(found.cFileName);
++      if (children.size() + entries.size() > max_entries || (cancelled && cancelled())) {
++        FindClose(search); return HRESULT_FROM_WIN32(ERROR_CANCELLED);
++      }
++    } while (FindNextFileW(search, &found));
++    DWORD error = GetLastError();
++    FindClose(search);
++    if (error != ERROR_NO_MORE_FILES) return HRESULT_FROM_WIN32(error);
++    for (const auto &child : children) {
++      HRESULT status = append(path + L"\\" + child, relative + L"\\" + child, cancelled, depth + 1);
++      if (FAILED(status)) return status;
++    }
++    return S_OK;
++  }
++};
++
++source_files::source_files(): state_(std::make_unique<impl>()) {}
++source_files::~source_files() = default;
++const std::vector<entry> &source_files::entries() const { return state_->entries; }
++HRESULT source_files::collect(const std::vector<std::wstring> &paths,
++                              const std::function<bool()> &cancelled,
++                              std::shared_ptr<source_files> &result) {
++  result.reset();
++  if (paths.empty() || paths.size() > max_entries || !interactive_desktop_available()) return E_ACCESSDENIED;
++  auto collection = std::shared_ptr<source_files>(new source_files);
++  for (const auto &path : paths) {
++    std::wstring full;
++    HRESULT status = full_path(path, full);
++    if (FAILED(status)) return status;
++    auto name = std::filesystem::path(full).filename().wstring();
++    status = collection->state_->append(full, name, cancelled, 0);
++    if (FAILED(status)) return status;
++  }
++  result = std::move(collection);
++  return S_OK;
++}
++HRESULT source_files::read_at(std::size_t index, std::uint64_t offset,
++                             void *buffer, ULONG requested, ULONG &received) {
++  received = 0;
++  if (!interactive_desktop_available()) return E_ACCESSDENIED;
++  if (index >= state_->entries.size() || state_->entries[index].directory() || requested > max_chunk_bytes) return E_INVALIDARG;
++  const auto &descriptor = state_->entries[index];
++  if (offset > descriptor.size || requested > descriptor.size - offset) return E_INVALIDARG;
++  const auto &identity = state_->files[index];
++  handle file;
++  file.value = CreateFileW(identity.path.c_str(), GENERIC_READ, FILE_SHARE_READ,
++                           nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
++  if (file.value == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
++  BY_HANDLE_FILE_INFORMATION current {};
++  if (!GetFileInformationByHandle(file.value, &current)) return HRESULT_FROM_WIN32(GetLastError());
++  const auto &before = identity.information;
++  if ((current.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
++      current.dwVolumeSerialNumber != before.dwVolumeSerialNumber || current.nFileIndexHigh != before.nFileIndexHigh ||
++      current.nFileIndexLow != before.nFileIndexLow || current.nFileSizeHigh != before.nFileSizeHigh ||
++      current.nFileSizeLow != before.nFileSizeLow || CompareFileTime(&current.ftLastWriteTime, &before.ftLastWriteTime) != 0) return STG_E_REVERTED;
++  LARGE_INTEGER position; position.QuadPart = static_cast<LONGLONG>(offset);
++  if (!SetFilePointerEx(file.value, position, nullptr, FILE_BEGIN)) return HRESULT_FROM_WIN32(GetLastError());
++  if (!ReadFile(file.value, buffer, requested, &received, nullptr)) return HRESULT_FROM_WIN32(GetLastError());
++  return received == requested ? S_OK : STG_E_READFAULT;
++}
++}
+diff --git a/clipboard-helper/native/file_clipboard_wire.h b/clipboard-helper/native/file_clipboard_wire.h
+new file mode 100644
+index 00000000..4008d120
+--- /dev/null
++++ b/clipboard-helper/native/file_clipboard_wire.h
+@@ -0,0 +1,155 @@
++#pragma once
++#include "file_clipboard_native.h"
++#include <condition_variable>
++#include <cstring>
++#include <deque>
++#include <limits>
++#include <mutex>
++#include <set>
++#include <thread>
++
++namespace streaming::file_clipboard::wire {
++using bytes = std::vector<unsigned char>;
++inline constexpr std::size_t max_manifest_bytes = 16 * 1024 * 1024;
++enum class kind : std::uint32_t { hello = 1, offer = 2, request = 3, reply = 4, publish = 5 };
++struct message { kind type {}; std::uint64_t id = 0; bytes body; };
++inline void number(bytes &out, std::uint64_t value, unsigned count) {
++  for (unsigned i = 0; i < count; ++i) out.push_back(static_cast<unsigned char>(value >> (i * 8)));
++}
++struct decoder {
++  const unsigned char *data; std::size_t size, position = 0;
++  explicit decoder(const bytes &in): data(in.data()), size(in.size()) {}
++  bool number(std::uint64_t &value, unsigned count) {
++    if (count > 8 || count > size - position) return false;
++    value = 0;
++    for (unsigned i = 0; i < count; ++i) value |= std::uint64_t(data[position++]) << (i * 8);
++    return true;
++  }
++  bool done() const { return position == size; }
++};
++inline bytes encode(const message &value) {
++  if (value.body.size() > max_manifest_bytes) return {};
++  bytes out; out.reserve(16 + value.body.size());
++  number(out, static_cast<std::uint32_t>(value.type), 4);
++  number(out, value.id, 8); number(out, value.body.size(), 4);
++  out.insert(out.end(), value.body.begin(), value.body.end());
++  return out;
++}
++inline bool decode(const bytes &data, message &value) {
++  decoder input(data); std::uint64_t type, size;
++  if (!input.number(type, 4) || !input.number(value.id, 8) || !input.number(size, 4) ||
++      type < 1 || type > 5 || size > max_manifest_bytes || size != data.size() - input.position) return false;
++  value.type = static_cast<kind>(type);
++  value.body.assign(data.begin() + input.position, data.end()); return true;
++}
++struct ordinal_less {
++  bool operator()(const std::wstring &a, const std::wstring &b) const {
++    return CompareStringOrdinal(a.c_str(), static_cast<int>(a.size()), b.c_str(), static_cast<int>(b.size()), TRUE) == CSTR_LESS_THAN;
++  }
++};
++inline bool valid_manifest(const std::vector<entry> &entries) {
++  if (entries.empty() || entries.size() > max_entries) return false;
++  std::set<std::wstring, ordinal_less> names, directories;
++  for (const auto &item : entries) {
++    if (!valid_relative_path(item.relative_path) || !names.insert(item.relative_path).second ||
++        item.size > static_cast<std::uint64_t>(INT64_MAX) || (item.directory() && item.size)) return false;
++    const auto slash = item.relative_path.rfind(L'\\');
++    if (slash != std::wstring::npos && !directories.count(item.relative_path.substr(0, slash))) return false;
++    if (item.attributes & ~(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN |
++                            FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_NORMAL)) return false;
++    if (item.directory()) directories.insert(item.relative_path);
++  }
++  return true;
++}
++inline bytes manifest(const std::vector<entry> &entries) {
++  if (!valid_manifest(entries)) return {};
++  bytes out; number(out, entries.size(), 4);
++  for (const auto &item : entries) {
++    number(out, item.relative_path.size(), 2);
++    for (wchar_t character : item.relative_path) number(out, static_cast<std::uint16_t>(character), 2);
++    number(out, item.size, 8); number(out, item.attributes, 4);
++    number(out, (std::uint64_t(item.last_write.dwHighDateTime) << 32) | item.last_write.dwLowDateTime, 8);
++    if (out.size() > max_manifest_bytes) return {};
++  }
++  return out;
++}
++inline bool manifest(const bytes &body, std::vector<entry> &entries) {
++  entries.clear(); if (body.size() > max_manifest_bytes) return false;
++  decoder input(body); std::uint64_t count, length, value;
++  if (!input.number(count, 4) || !count || count > max_entries) return false;
++  entries.reserve(static_cast<std::size_t>(count));
++  for (std::uint64_t i = 0; i < count; ++i) {
++    entry item;
++    if (!input.number(length, 2) || !length || length >= MAX_PATH) return false;
++    for (std::uint64_t j = 0; j < length; ++j) {
++      if (!input.number(value, 2)) return false;
++      item.relative_path.push_back(static_cast<wchar_t>(value));
++    }
++    if (!input.number(item.size, 8) || !input.number(value, 4)) return false;
++    item.attributes = static_cast<DWORD>(value);
++    if (!input.number(value, 8)) return false;
++    item.last_write.dwLowDateTime = static_cast<DWORD>(value);
++    item.last_write.dwHighDateTime = static_cast<DWORD>(value >> 32);
++    entries.push_back(std::move(item));
++  }
++  return input.done() && valid_manifest(entries);
++}
++struct read_query { std::uint64_t generation = 0; std::uint32_t index = 0; std::uint64_t offset = 0; std::uint32_t count = 0; };
++inline bytes query(const read_query &value) {
++  bytes out; number(out, value.generation, 8); number(out, value.index, 4);
++  number(out, value.offset, 8); number(out, value.count, 4); return out;
++}
++inline bool query(const bytes &body, read_query &value) {
++  decoder input(body); std::uint64_t index, count;
++  if (!input.number(value.generation, 8) || !input.number(index, 4) || !input.number(value.offset, 8) ||
++      !input.number(count, 4) || !input.done() || count > max_chunk_bytes) return false;
++  value.index = static_cast<std::uint32_t>(index); value.count = static_cast<std::uint32_t>(count); return true;
++}
++inline bool within(const read_query &value, std::uint64_t generation, const std::vector<entry> &entries) {
++  return value.generation && value.generation == generation && value.index < entries.size() &&
++      !entries[value.index].directory() && value.offset <= entries[value.index].size &&
++      value.count <= max_chunk_bytes && value.count <= entries[value.index].size - value.offset;
++}
++inline bytes reply(HRESULT status, const void *data = nullptr, std::size_t size = 0) {
++  bytes out; number(out, static_cast<std::uint32_t>(status), 4);
++  if (data && size <= max_chunk_bytes) out.insert(out.end(), static_cast<const unsigned char *>(data), static_cast<const unsigned char *>(data) + size);
++  return out;
++}
++inline HRESULT reply(const bytes &body, void *data, ULONG count, ULONG &received) {
++  received = 0; decoder input(body); std::uint64_t status;
++  if (!input.number(status, 4) || body.size() - 4 > count) return STG_E_READFAULT;
++  HRESULT result = static_cast<HRESULT>(status);
++  if (FAILED(result)) return result;
++  received = static_cast<ULONG>(body.size() - 4);
++  if (received != count) return STG_E_READFAULT;
++  if (received) std::memcpy(data, body.data() + 4, received);
++  return S_OK;
++}
++
++// Two workers and a bounded queue keep file operations away from UI and video threads.
++class workers {
++public:
++  workers() { for (unsigned i = 0; i < 2; ++i) threads_.emplace_back([this] { run(); }); }
++  ~workers() {
++    { std::lock_guard<std::mutex> lock(mutex_); stop_ = true; queue_.clear(); }
++    ready_.notify_all(); for (auto &thread : threads_) thread.join();
++  }
++  bool post(std::function<void()> task) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (stop_ || queue_.size() >= 8) return false;
++    queue_.push_back(std::move(task)); ready_.notify_one(); return true;
++  }
++private:
++  void run() {
++    for (;;) {
++      std::function<void()> task;
++      { std::unique_lock<std::mutex> lock(mutex_); ready_.wait(lock, [this] { return stop_ || !queue_.empty(); });
++        if (stop_) return;
++        task = std::move(queue_.front()); queue_.pop_front(); }
++      try { task(); } catch (...) { /* A failed offer must not terminate the helper. */ }
++    }
++  }
++  std::mutex mutex_; std::condition_variable ready_; bool stop_ = false;
++  std::deque<std::function<void()>> queue_; std::vector<std::thread> threads_;
++};
++}

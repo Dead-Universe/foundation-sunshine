@@ -1,0 +1,69 @@
+{
+  "SchemaVersion": 1,
+  "UpstreamRepository": "https://github.com/AlkaidLab/foundation-sunshine",
+  "BaseRevision": "bcbb5ec76afc27964b04142eeded465bf61d6a49",
+  "MaintenanceRevision": "bd38637f0d378b0bb9488cd66cf918cb1a794646",
+  "ExpectedTreeSHA1": "54acd37158e4c7db5c3d07cc85de08738d45c9e8",
+  "ApplyInOrder": [
+    {
+      "Path": "0001-hyperv-vdd-capture-recovery.patch",
+      "SHA256": "150E7B090199B80B8434C0C16408D1E24AF2463A7F8D4AFC04ABB1815DA7C2AE"
+    },
+    {
+      "Path": "0002-nvenc-delayed-completion.patch",
+      "SHA256": "05DB54ABE2B34BB9D8F293BC501EDED75ADAD646AA0D5C209984F06B860CE974"
+    },
+    {
+      "Path": "0003-hyperv-console-continuity.patch",
+      "SHA256": "2AE8C75760AC13C57B195F96F64BB776D33B52BFA16163937633B0435944A554"
+    },
+    {
+      "Path": "0004-offline-vbcable-installer.patch",
+      "SHA256": "2801D8B9CF1148A0F351E699CDB1F727E9F48E54413DD03501FAD3D81B06D050"
+    },
+    {
+      "Path": "0005-windows-file-clipboard.patch",
+      "SHA256": "25FDD09D6CFC8ABDF429FC5F7828437D0985D75615FA2386CC6F11E512E67A56"
+    }
+  ],
+  "HostUpstreamSnapshotPatched": false,
+  "Policy": "Five independent ordered patches; upstream-first, guest-only build, no client reconnect workaround.",
+  "Rebase": {
+    "PreviousBase": "d549e16a3fa0887d26beb98eaa40785c1814b353",
+    "BaselineTreeUnchanged": true,
+    "SharedCaptureContinuityFilesInPatch3": [
+      "src/main.cpp",
+      "src/platform/windows/display_vdd.cpp"
+    ],
+    "PreFeatureBaseline": "66115a7f58d99dfb8c38a0e0819563fdcdea2312"
+  },
+  "Validation": {
+    "LockscreenPasswordFlowRetested": false,
+    "Skipped": 21,
+    "FullStabilityValidated": false,
+    "AggregateTests": 585,
+    "NativeBuildPassed": true,
+    "RuntimeAcceptance": "Native Shell files and folders copied both directions with matching SHA256, Unicode and empty folders; >4GiB seek and revocation passed; user Explorer acceptance passed",
+    "ResultTree": "54acd37158e4c7db5c3d07cc85de08738d45c9e8",
+    "NativeCTest": {
+      "Tests": 40,
+      "Failures": 0
+    },
+    "TemporaryIndexReplayPassed": true
+  },
+  "BuildArtifacts": {
+    "FileAgentSHA256": "79FD1591E73946195F5BDBEBE02D9D472555C9938A36EC5156A8181275E4C0D9",
+    "CoreSHA256": "3DD8C71EBE03E8E803B9B981D602B133E15A57394F1A1EABC0502AD717263912",
+    "InstallerRepacked": false,
+    "GuiRebuilt": false,
+    "GuiVersion": "0.6.1"
+  },
+  "Publication": {
+    "SourceOnly": true,
+    "PatchCarrierBranch": "maintenance/hyperv-patches-bcbb5ec7",
+    "ForceUsed": false,
+    "SourceHead": "bd38637f0d378b0bb9488cd66cf918cb1a794646",
+    "Branch": "maintenance/hyperv-win11-20261031"
+  },
+  "UpdatedAt": "2026-10-31T07:45:59.2365456Z"
+}

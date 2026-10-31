@@ -1,0 +1,1684 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dead-Universe <Dead-Universe@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 15:31:35 +0800
+Subject: [PATCH] Add authenticated Windows file and folder clipboard copying
+
+Copy-only native virtual files over paired HTTPS; user-token file reads, bounded chunks, lazy IStream access and session-scoped revocation.
+
+Built and verified in Hyper-V Win11; independent maintenance patch on bcbb5ec76afc27964b04142eeded465bf61d6a49.
+
+diff --git a/cmake/packaging/windows.cmake b/cmake/packaging/windows.cmake
+index 863c12b6..0e3e924b 100644
+--- a/cmake/packaging/windows.cmake
++++ b/cmake/packaging/windows.cmake
+@@ -43,6 +43,7 @@ install(TARGETS audio-info RUNTIME DESTINATION "tools" COMPONENT audio)
+ # Mandatory tools
+ install(TARGETS sunshinesvc RUNTIME DESTINATION "tools" COMPONENT application)
+ install(TARGETS qiin-tabtip RUNTIME DESTINATION "tools" COMPONENT application)
++install(TARGETS sunshine-file-clipboard RUNTIME DESTINATION "tools" COMPONENT application)
+ 
+ # The optional self-contained runtime is a separate release asset. The main
+ # package carries only its pinned download manifest, keeping the feature
+diff --git a/cmake/sources/host.cmake b/cmake/sources/host.cmake
+index 66fa9852..9e39a677 100644
+--- a/cmake/sources/host.cmake
++++ b/cmake/sources/host.cmake
+@@ -56,6 +56,7 @@ set(SUNSHINE_HOST_SOURCES
+     src/rtsp.cpp src/rtsp.h
+     src/stream.cpp src/stream.h
+     src/clipboard_bridge.cpp src/clipboard_bridge.h
++    src/file_clipboard.cpp src/file_clipboard.h
+     src/cursor_channel.cpp src/cursor_channel.h
+     src/clipboard_blob_store.cpp src/clipboard_blob_store.h
+     src/clipboard_http.cpp src/clipboard_http.h
+@@ -190,3 +191,7 @@ set(SUNSHINE_HOST_SOURCES
+     src/tray/tray_state.cpp src/tray/tray_state.h
+ )
+ list(TRANSFORM SUNSHINE_HOST_SOURCES PREPEND "${CMAKE_SOURCE_DIR}/")
++
++if(WIN32)
++  list(APPEND SUNSHINE_HOST_SOURCES "${CMAKE_SOURCE_DIR}/src/file_clipboard/file_clipboard_native.cpp" "${CMAKE_SOURCE_DIR}/src/file_clipboard/file_clipboard_source.cpp")
++endif()
+diff --git a/src/file_clipboard.cpp b/src/file_clipboard.cpp
+new file mode 100644
+index 00000000..5b3d0c4a
+--- /dev/null
++++ b/src/file_clipboard.cpp
+@@ -0,0 +1,340 @@
++#include "file_clipboard.h"
++#ifdef _WIN32
++#include "file_clipboard/file_clipboard_pipe.h"
++#include "config.h"
++#include "logging.h"
++#include <sddl.h>
++#include <userenv.h>
++#include <wtsapi32.h>
++#include <openssl/rand.h>
++#include <filesystem>
++#include <map>
++
++namespace file_clipboard {
++namespace {
++namespace wire = streaming::file_clipboard::wire;
++using clock = std::chrono::steady_clock;
++using response = std::shared_ptr<web::ServerBase<nvhttp::SunshineHTTPS>::Response>;
++using request = nvhttp::req_https_t;
++const web::CaseInsensitiveMultimap headers {{"Content-Type", "application/octet-stream"}, {"Cache-Control", "no-store"}};
++void write(response out, web::StatusCode status, const wire::bytes &data = {}) {
++  out->write(status, std::string_view(reinterpret_cast<const char *>(data.data()), data.size()), headers);
++}
++std::string random_key() {
++  unsigned char value[32]; if (RAND_bytes(value, sizeof(value)) != 1) return {};
++  const char hex[] = "0123456789abcdef"; std::string out;
++  for (auto c : value) { out += hex[c >> 4]; out += hex[c & 15]; } return out;
++}
++struct owned_handle {
++  HANDLE value = INVALID_HANDLE_VALUE;
++  ~owned_handle() { if (value && value != INVALID_HANDLE_VALUE) CloseHandle(value); }
++};
++std::shared_ptr<wire::pipe> launch_agent(DWORD session, HANDLE &process) {
++  auto failure = [](const char *stage, DWORD error) {
++    static auto next_log = clock::time_point {};
++    if (clock::now() >= next_log) {
++      BOOST_LOG(warning) << "File clipboard: helper startup failed at " << stage << " (status " << error << ")";
++      next_log = clock::now() + std::chrono::seconds(30);
++    }
++    return std::shared_ptr<wire::pipe> {};
++  };
++  owned_handle token;
++  if (!WTSQueryUserToken(session, &token.value)) return failure("user token", GetLastError());
++  DWORD size = 0; GetTokenInformation(token.value, TokenUser, nullptr, 0, &size);
++  std::vector<unsigned char> user(size);
++  if (!size || !GetTokenInformation(token.value, TokenUser, user.data(), size, &size)) return failure("token identity", GetLastError());
++  auto sid = reinterpret_cast<TOKEN_USER *>(user.data())->User.Sid;
++  LPWSTR sid_string = nullptr;
++  if (!ConvertSidToStringSidW(sid, &sid_string)) return failure("user SID", GetLastError());
++  // A SYSTEM token's default owner may be the Administrators group. Pin the
++  // pipe owner explicitly so the standard-user helper can authenticate it.
++  std::wstring acl = L"O:SYD:P(A;;GA;;;SY)(A;;GA;;;" + std::wstring(sid_string) + L")"; LocalFree(sid_string);
++  PSECURITY_DESCRIPTOR descriptor = nullptr;
++  if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(acl.c_str(), SDDL_REVISION_1, &descriptor, nullptr)) return failure("pipe security", GetLastError());
++  SECURITY_ATTRIBUTES security {sizeof(security), descriptor, FALSE};
++  auto key = random_key(); if (key.empty()) { LocalFree(descriptor); return {}; }
++  std::wstring name = L"\\\\.\\pipe\\SunshineFileClipboard-" + std::wstring(key.begin(), key.end());
++  HANDLE handle = CreateNamedPipeW(name.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
++      PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 1024 * 1024, 1024 * 1024, 0, &security);
++  const DWORD pipe_error = GetLastError();
++  LocalFree(descriptor); if (handle == INVALID_HANDLE_VALUE) return failure("pipe creation", pipe_error);
++  auto pipe = std::make_shared<wire::pipe>(handle, true);
++  OVERLAPPED connect {}; owned_handle event; event.value = CreateEventW(nullptr, TRUE, FALSE, nullptr); connect.hEvent = event.value;
++  if (!event.value) return failure("pipe event", GetLastError());
++  BOOL connected = ConnectNamedPipe(handle, &connect); auto connect_error = connected ? ERROR_SUCCESS : GetLastError();
++  auto cancel_connect = [&] {
++    pipe->stop();
++    if (!connected && connect_error == ERROR_IO_PENDING) GetOverlappedResult(handle, &connect, &size, TRUE);
++  };
++  wchar_t executable[32768] {}; GetModuleFileNameW(nullptr, executable, 32768);
++  auto helper = std::filesystem::path(executable).parent_path() / L"tools" / L"sunshine-file-clipboard.exe";
++  std::wstring command = L"\"" + helper.wstring() + L"\" \"" + name + L"\" " + std::to_wstring(GetCurrentProcessId());
++  STARTUPINFOW startup {}; startup.cb = sizeof(startup); startup.lpDesktop = const_cast<wchar_t *>(L"winsta0\\default");
++  PROCESS_INFORMATION child {}; void *environment = nullptr;
++  if (!CreateEnvironmentBlock(&environment, token.value, FALSE)) { auto error = GetLastError(); cancel_connect(); return failure("user environment", error); }
++  BOOL created = CreateProcessAsUserW(token.value, helper.c_str(), command.data(), nullptr, nullptr, FALSE,
++      CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB,
++      environment, helper.parent_path().c_str(), &startup, &child);
++  const DWORD creation_error = GetLastError();
++  if (environment) DestroyEnvironmentBlock(environment);
++  if (!created) { cancel_connect(); return failure("process creation", creation_error); }
++  CloseHandle(child.hThread); process = child.hProcess;
++  if (!connected && connect_error == ERROR_IO_PENDING) connected = WaitForSingleObject(event.value, 5000) == WAIT_OBJECT_0;
++  else if (connect_error == ERROR_PIPE_CONNECTED) connected = TRUE;
++  if (!connected) { cancel_connect(); return failure("pipe connection", WAIT_TIMEOUT); }
++  ULONG client_pid = 0, client_session = MAXDWORD;
++  bool valid = GetNamedPipeClientProcessId(handle, &client_pid) && client_pid == child.dwProcessId &&
++      GetNamedPipeClientSessionId(handle, &client_session) && client_session == session;
++  // ImpersonateNamedPipeClient authenticates the last message actually read.
++  // Read the fixed hello before querying its token, with a bounded startup wait.
++  if (valid) {
++    DWORD available = 0; const auto deadline = GetTickCount64() + 5000;
++    while (GetTickCount64() < deadline && WaitForSingleObject(child.hProcess, 0) == WAIT_TIMEOUT) {
++      if (!PeekNamedPipe(handle, nullptr, 0, nullptr, &available, nullptr) || available >= 16) break;
++      Sleep(10);
++    }
++    wire::message hello;
++    valid = available >= 16 && pipe->receive(hello) && hello.type == wire::kind::hello && hello.id == 1 && hello.body.empty();
++  }
++  if (valid && ImpersonateNamedPipeClient(handle)) {
++    owned_handle client_token;
++    valid = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &client_token.value);
++    DWORD bytes = 0;
++    if (valid) {
++      GetTokenInformation(client_token.value, TokenUser, nullptr, 0, &bytes);
++      std::vector<unsigned char> actual(bytes);
++      valid = bytes && GetTokenInformation(client_token.value, TokenUser, actual.data(), bytes, &bytes) &&
++          EqualSid(sid, reinterpret_cast<TOKEN_USER *>(actual.data())->User.Sid);
++    }
++    if (!RevertToSelf()) std::terminate();
++  } else valid = false;
++  if (!valid) {
++    DWORD exit = STILL_ACTIVE; GetExitCodeProcess(child.hProcess, &exit);
++    pipe->stop(); return failure("helper authentication", exit);
++  }
++  return pipe;
++}
++class hub {
++public:
++  hub() { thread_ = std::thread([this] { run(); }); }
++  ~hub() { stop(); }
++  void stop() {
++    stopped_ = true;
++    wake_.notify_all();
++    { std::lock_guard<std::mutex> lock(mutex_); if (pipe_) pipe_->stop(); }
++    if (thread_.joinable()) thread_.join();
++  }
++  void started(std::uint32_t id, const std::string &uuid) {
++    std::lock_guard<std::mutex> lock(mutex_); sessions_[id] = uuid;
++  }
++  void ended(std::uint32_t id) {
++    std::lock_guard<std::mutex> lock(mutex_); sessions_.erase(id); if (id == session_) revoke();
++  }
++  void authorize_with(std::function<bool(std::string_view)> paired) {
++    std::lock_guard<std::mutex> lock(mutex_); paired_ = std::move(paired);
++  }
++  void open(response out, request in) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    auto found = std::find_if(sessions_.begin(), sessions_.end(), [&](const auto &value) { return value.second == in->client_uuid; });
++    if (found == sessions_.end() || !config::input.clipboard_sync) { write(out, web::StatusCode::conflict); return; }
++    if (!uuid_.empty() && uuid_ != in->client_uuid) { write(out, web::StatusCode::conflict); return; }
++    if (uuid_.empty()) {
++      key_ = random_key(); if (key_.empty()) { write(out, web::StatusCode::service_unavailable); return; }
++      uuid_ = in->client_uuid; session_ = found->first;
++    }
++    last_seen_ = clock::now();
++    if (!pipe_ || !pipe_->alive() || !ready_) { write(out, web::StatusCode::service_unavailable); return; }
++    wire::bytes result(key_.begin(), key_.end()); write(out, web::StatusCode::ok, result);
++  }
++  bool authorized(const request &in) {
++    auto key = in->header.find("X-Clipboard-Session");
++    if (uuid_.empty() || in->client_uuid != uuid_ || key == in->header.end() || key->second != key_ ||
++        !sessions_.count(session_) || !config::input.clipboard_sync) return false;
++    last_seen_ = clock::now(); return true;
++  }
++  void events(response out, request in) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!authorized(in)) { write(out, web::StatusCode::forbidden); return; }
++    if (event_response_) write(std::move(event_response_), web::StatusCode::conflict);
++    event_response_ = std::move(out); event_deadline_ = clock::now() + std::chrono::seconds(10);
++    flush();
++  }
++  void send(response out, request in, bool read_file) {
++    const auto body = in->content.string(); wire::message message;
++    if (body.size() > wire::max_manifest_bytes + 16 || !wire::decode(wire::bytes(body.begin(), body.end()), message)) {
++      write(out, web::StatusCode::bad_request); return;
++    }
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!authorized(in)) { write(out, web::StatusCode::forbidden); return; }
++    if (!pipe_ || !ready_) { write(out, web::StatusCode::service_unavailable); return; }
++    if (read_file) {
++      wire::read_query query;
++      if (message.type != wire::kind::request || !wire::query(message.body, query) || !wire::within(query, source_generation_, source_entries_) || reads_.size() >= 4) {
++        write(out, web::StatusCode::conflict); return;
++      }
++      const auto id = ++request_id_;
++      reads_[id] = {std::move(out), query.count, clock::now() + std::chrono::seconds(15)};
++      enqueue({wire::kind::request, id, std::move(message.body)});
++      return;
++    }
++    if (message.type == wire::kind::offer) {
++      std::vector<streaming::file_clipboard::entry> entries;
++      if (message.id && !wire::manifest(message.body, entries)) { write(out, web::StatusCode::bad_request); return; }
++      if (!message.id && !message.body.empty()) { write(out, web::StatusCode::bad_request); return; }
++      client_generation_ = message.id; client_entries_ = std::move(entries);
++      source_generation_ = 0; source_entries_.clear();
++      enqueue({wire::kind::publish, message.id, std::move(message.body)});
++    } else if (message.type == wire::kind::reply) {
++      auto expected = client_reads_.find(message.id);
++      if (expected == client_reads_.end() || message.body.size() < 4 || message.body.size() > expected->second.count + 4) {
++        write(out, web::StatusCode::conflict); return;
++      }
++      client_reads_.erase(expected); enqueue(std::move(message));
++    } else { write(out, web::StatusCode::bad_request); return; }
++    write(out, web::StatusCode::ok);
++  }
++private:
++  struct read_response { response out; std::uint32_t count; clock::time_point deadline; };
++  void fail_reads() {
++    for (auto &[id, value] : reads_) write(std::move(value.out), web::StatusCode::gone);
++    reads_.clear(); client_reads_.clear();
++  }
++  void revoke() {
++    key_.clear(); uuid_.clear(); session_ = 0; source_generation_ = 0; client_generation_ = 0;
++    source_entries_.clear(); client_entries_.clear(); events_.clear(); outgoing_.clear(); fail_reads();
++    if (event_response_) write(std::move(event_response_), web::StatusCode::gone);
++    if (pipe_) pipe_->stop();
++  }
++  void enqueue(wire::message value) {
++    if (outgoing_.size() < 16) outgoing_.push_back(std::move(value)); else if (pipe_) pipe_->stop();
++    wake_.notify_one();
++  }
++  void event(wire::message value) {
++    if (value.type == wire::kind::offer) {
++      events_.erase(std::remove_if(events_.begin(), events_.end(), [](const auto &item) { return item.type == wire::kind::offer; }), events_.end());
++    }
++    if (events_.size() < 16) events_.push_back(std::move(value)); else if (pipe_) pipe_->stop();
++    flush();
++  }
++  void flush() {
++    if (!event_response_) return;
++    if (!events_.empty()) {
++      auto value = wire::encode(events_.front()); events_.pop_front();
++      write(std::move(event_response_), web::StatusCode::ok, value);
++    } else if (clock::now() >= event_deadline_) write(std::move(event_response_), web::StatusCode::no_content);
++  }
++  void received(const std::shared_ptr<wire::pipe> &connection, wire::message message) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (pipe_ != connection || !connection->alive() || uuid_.empty()) return;
++    if (message.type == wire::kind::hello) { ready_ = message.id == 1; return; }
++    if (message.type == wire::kind::offer) {
++      std::vector<streaming::file_clipboard::entry> entries;
++      if (message.id && !wire::manifest(message.body, entries)) { if (pipe_) pipe_->stop(); return; }
++      source_generation_ = message.id; source_entries_ = std::move(entries);
++      client_generation_ = 0; client_entries_.clear(); event(std::move(message));
++    } else if (message.type == wire::kind::request) {
++      wire::read_query query;
++      if (!wire::query(message.body, query) || !wire::within(query, client_generation_, client_entries_) || client_reads_.size() >= 4) {
++        enqueue({wire::kind::reply, message.id, wire::reply(STG_E_REVERTED)}); return;
++      }
++      client_reads_[message.id] = {nullptr, query.count, clock::now() + std::chrono::seconds(15)}; event(std::move(message));
++    } else if (message.type == wire::kind::reply) {
++      auto found = reads_.find(message.id); if (found == reads_.end()) return;
++      auto value = std::move(found->second); reads_.erase(found);
++      if (message.body.size() < 4 || message.body.size() > value.count + 4) write(value.out, web::StatusCode::bad_gateway);
++      else write(value.out, web::StatusCode::ok, message.body);
++    }
++  }
++  void run() {
++    DWORD active_session = MAXDWORD; HANDLE child = nullptr; std::thread reader;
++    clock::time_point next_pair_check {}; std::string last_pair_uuid; bool pairing_valid = true;
++    auto retire = [&] {
++      std::shared_ptr<wire::pipe> old;
++      { std::lock_guard<std::mutex> lock(mutex_); old = std::move(pipe_); ready_ = false;
++        source_generation_ = 0; source_entries_.clear(); client_generation_ = 0; client_entries_.clear(); outgoing_.clear();
++        fail_reads(); if (!uuid_.empty()) event({wire::kind::offer, 0, {}}); }
++      if (old) old->stop(); if (reader.joinable()) reader.join();
++      if (child) { if (WaitForSingleObject(child, 2000) == WAIT_TIMEOUT) TerminateProcess(child, 0); CloseHandle(child); child = nullptr; }
++      active_session = MAXDWORD;
++    };
++    while (!stopped_) {
++      bool wanted = false; DWORD target = WTSGetActiveConsoleSessionId(); std::shared_ptr<wire::pipe> current;
++      std::string checked_uuid; std::function<bool(std::string_view)> paired;
++      { std::lock_guard<std::mutex> lock(mutex_); checked_uuid = uuid_; paired = paired_; }
++      // Pairing storage has its own lock. Never call it with the hub lock held.
++      if (checked_uuid != last_pair_uuid || clock::now() >= next_pair_check) {
++        pairing_valid = checked_uuid.empty() || (paired && paired(checked_uuid));
++        last_pair_uuid = checked_uuid; next_pair_check = clock::now() + std::chrono::milliseconds(20);
++      }
++      {
++        std::lock_guard<std::mutex> lock(mutex_);
++        if (!uuid_.empty() && (clock::now() - last_seen_ > std::chrono::seconds(35) || !sessions_.count(session_) ||
++            !config::input.clipboard_sync || (uuid_ == checked_uuid && !pairing_valid))) revoke();
++        wanted = !uuid_.empty() && config::input.clipboard_sync && target != MAXDWORD && target != 0;
++        current = pipe_; flush();
++        for (auto it = reads_.begin(); it != reads_.end();) {
++          if (clock::now() >= it->second.deadline) { write(it->second.out, web::StatusCode::gateway_timeout); it = reads_.erase(it); } else ++it;
++        }
++        for (auto it = client_reads_.begin(); it != client_reads_.end();) {
++          if (clock::now() >= it->second.deadline) { enqueue({wire::kind::reply, it->first, wire::reply(STG_E_REVERTED)}); it = client_reads_.erase(it); } else ++it;
++        }
++      }
++      if (current && (!wanted || target != active_session || !current->alive())) { retire(); current.reset(); }
++      if (wanted && !current) {
++        auto connection = launch_agent(target, child);
++        if (connection) {
++          active_session = target;
++          { std::lock_guard<std::mutex> lock(mutex_); pipe_ = connection; ready_ = true; }
++          reader = std::thread([this, connection] { wire::message message; while (connection->receive(message)) received(connection, std::move(message)); });
++          BOOST_LOG(info) << "File clipboard: user-session helper connected";
++        } else { retire(); std::this_thread::sleep_for(std::chrono::seconds(2)); }
++      }
++      for (;;) {
++        wire::message next; std::shared_ptr<wire::pipe> connection;
++        { std::lock_guard<std::mutex> lock(mutex_); if (outgoing_.empty() || !pipe_) break;
++          next = std::move(outgoing_.front()); outgoing_.pop_front(); connection = pipe_; }
++        if (!connection->send(next)) break;
++      }
++      std::unique_lock<std::mutex> lock(mutex_);
++      wake_.wait_for(lock, std::chrono::milliseconds(20), [this] { return stopped_ || !outgoing_.empty(); });
++    }
++    { std::lock_guard<std::mutex> lock(mutex_); revoke(); }
++    retire();
++  }
++  std::mutex mutex_; std::condition_variable wake_; std::atomic<bool> stopped_ {false}; std::thread thread_;
++  std::map<std::uint32_t, std::string> sessions_; std::string uuid_, key_; std::uint32_t session_ = 0;
++  std::function<bool(std::string_view)> paired_;
++  clock::time_point last_seen_ {}, event_deadline_ {}; response event_response_;
++  std::shared_ptr<wire::pipe> pipe_; bool ready_ = false; std::uint64_t request_id_ = 0;
++  std::uint64_t source_generation_ = 0, client_generation_ = 0;
++  std::vector<streaming::file_clipboard::entry> source_entries_, client_entries_;
++  std::deque<wire::message> events_, outgoing_;
++  std::map<std::uint64_t, read_response> reads_, client_reads_;
++};
++hub &instance() { static hub value; return value; }
++}
++void session_started(std::uint32_t id, const std::string &uuid) { instance().started(id, uuid); }
++void session_stopped(std::uint32_t id) { instance().ended(id); }
++void stop() { instance().stop(); }
++void register_routes(web::Server<nvhttp::SunshineHTTPS> &server, std::function<bool(std::string_view)> paired) {
++  instance().authorize_with(paired);
++  auto secured = [paired](auto handler) {
++    return [paired, handler](response out, request in) {
++      if (!paired(in->client_uuid)) { write(out, web::StatusCode::forbidden); return; }
++      handler(std::move(out), std::move(in));
++    };
++  };
++  server.resource["^/api/v1/clipboard/files/open$"]["POST"] = secured([](auto out, auto in) { instance().open(out, in); });
++  server.resource["^/api/v1/clipboard/files/events$"]["GET"] = secured([](auto out, auto in) { instance().events(out, in); });
++  server.resource["^/api/v1/clipboard/files/send$"]["POST"] = secured([](auto out, auto in) { instance().send(out, in, false); });
++  server.resource["^/api/v1/clipboard/files/read$"]["POST"] = secured([](auto out, auto in) { instance().send(out, in, true); });
++}
++}
++#else
++namespace file_clipboard {
++void session_started(std::uint32_t, const std::string &) {}
++void session_stopped(std::uint32_t) {}
++void register_routes(web::Server<nvhttp::SunshineHTTPS> &, std::function<bool(std::string_view)>) {}
++void stop() {}
++}
++#endif
+diff --git a/src/file_clipboard.h b/src/file_clipboard.h
+new file mode 100644
+index 00000000..749df948
+--- /dev/null
++++ b/src/file_clipboard.h
+@@ -0,0 +1,12 @@
++#pragma once
++#include <cstdint>
++#include <functional>
++#include <string>
++#include <string_view>
++#include "src/nvhttp.h"
++namespace file_clipboard {
++void session_started(std::uint32_t id, const std::string &paired_uuid);
++void session_stopped(std::uint32_t id);
++void register_routes(web::Server<nvhttp::SunshineHTTPS> &server, std::function<bool(std::string_view)> paired);
++void stop();
++}
+diff --git a/src/file_clipboard/file_clipboard_native.cpp b/src/file_clipboard/file_clipboard_native.cpp
+new file mode 100644
+index 00000000..27a4dd03
+--- /dev/null
++++ b/src/file_clipboard/file_clipboard_native.cpp
+@@ -0,0 +1,488 @@
++#include "file_clipboard_native.h"
++#include "file_clipboard_wire.h"
++#include <shlobj.h>
++#include <shellapi.h>
++#include <shldisp.h>
++#include <wtsapi32.h>
++#include <algorithm>
++#include <array>
++#include <condition_variable>
++#include <cstring>
++#include <cwctype>
++#include <limits>
++#include <mutex>
++#include <set>
++#include <thread>
++
++namespace streaming::file_clipboard {
++namespace {
++CLIPFORMAT descriptor_format() { return static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"FileGroupDescriptorW")); }
++CLIPFORMAT contents_format() { return static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"FileContents")); }
++CLIPFORMAT effect_format() { return static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"Preferred DropEffect")); }
++
++HRESULT global_medium(std::size_t size, STGMEDIUM *medium, const std::function<void(void *)> &fill) {
++  HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, size);
++  if (!memory) return E_OUTOFMEMORY;
++  void *data = GlobalLock(memory);
++  if (!data) { GlobalFree(memory); return E_OUTOFMEMORY; }
++  fill(data);
++  GlobalUnlock(memory);
++  medium->tymed = TYMED_HGLOBAL;
++  medium->hGlobal = memory;
++  medium->pUnkForRelease = nullptr;
++  return S_OK;
++}
++
++class file_stream final : public IStream {
++public:
++  file_stream(std::shared_ptr<offer> value, std::size_t index, std::uint64_t position = 0)
++      : value_(std::move(value)), index_(index), position_(position) {
++    CoCreateFreeThreadedMarshaler(static_cast<IStream *>(this), &marshaler_);
++  }
++  ~file_stream() { if (marshaler_) marshaler_->Release(); }
++  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
++    if (!out) return E_POINTER;
++    *out = nullptr;
++    if (id == IID_IUnknown || id == IID_ISequentialStream || id == IID_IStream) {
++      *out = static_cast<IStream *>(this); AddRef(); return S_OK;
++    }
++    if (id == IID_IMarshal && marshaler_) return marshaler_->QueryInterface(id, out);
++    return E_NOINTERFACE;
++  }
++  ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
++  ULONG STDMETHODCALLTYPE Release() override { auto n = --references_; if (!n) delete this; return n; }
++  HRESULT STDMETHODCALLTYPE Read(void *buffer, ULONG count, ULONG *read) override {
++    if (read) *read = 0;
++    if (!buffer && count) return STG_E_INVALIDPOINTER;
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (!value_->valid.load()) return STG_E_REVERTED;
++    const auto size = value_->entries[index_].size;
++    ULONG total = 0;
++    while (total < count && position_ < size) {
++      ULONG wanted = static_cast<ULONG>(std::min<std::uint64_t>(
++          std::min<ULONG>(max_chunk_bytes, count - total), size - position_));
++      ULONG received = 0;
++      HRESULT status = value_->source->read_at(index_, position_,
++          static_cast<unsigned char *>(buffer) + total, wanted, received);
++      if (FAILED(status)) { if (read) *read = total; return status; }
++      if (received == 0 || received > wanted) { if (read) *read = total; return STG_E_READFAULT; }
++      position_ += received;
++      total += received;
++      if (!value_->valid.load()) { if (read) *read = total; return STG_E_REVERTED; }
++    }
++    if (read) *read = total;
++    return total == count ? S_OK : S_FALSE;
++  }
++  HRESULT STDMETHODCALLTYPE Write(const void *, ULONG, ULONG *written) override {
++    if (written) *written = 0;
++    return STG_E_ACCESSDENIED;
++  }
++  HRESULT STDMETHODCALLTYPE Seek(LARGE_INTEGER move, DWORD origin, ULARGE_INTEGER *new_position) override {
++    std::lock_guard<std::mutex> lock(mutex_);
++    std::uint64_t base = 0;
++    if (origin == STREAM_SEEK_CUR) base = position_;
++    else if (origin == STREAM_SEEK_END) base = value_->entries[index_].size;
++    else if (origin != STREAM_SEEK_SET) return STG_E_INVALIDFUNCTION;
++    if (move.QuadPart < 0) {
++      const auto magnitude = static_cast<std::uint64_t>(-(move.QuadPart + 1)) + 1;
++      if (magnitude > base) return STG_E_INVALIDFUNCTION;
++      position_ = base - magnitude;
++    } else {
++      if (static_cast<std::uint64_t>(move.QuadPart) > UINT64_MAX - base) return STG_E_INVALIDFUNCTION;
++      position_ = base + static_cast<std::uint64_t>(move.QuadPart);
++    }
++    if (new_position) new_position->QuadPart = position_;
++    return S_OK;
++  }
++  HRESULT STDMETHODCALLTYPE SetSize(ULARGE_INTEGER) override { return STG_E_ACCESSDENIED; }
++  HRESULT STDMETHODCALLTYPE CopyTo(IStream *destination, ULARGE_INTEGER count,
++                                    ULARGE_INTEGER *read, ULARGE_INTEGER *written) override {
++    if (!destination) return STG_E_INVALIDPOINTER;
++    if (read) read->QuadPart = 0;
++    if (written) written->QuadPart = 0;
++    std::vector<unsigned char> buffer(max_chunk_bytes);
++    std::uint64_t remaining = count.QuadPart;
++    while (remaining) {
++      ULONG got = 0, sent = 0;
++      HRESULT status = Read(buffer.data(), static_cast<ULONG>(std::min<std::uint64_t>(remaining, buffer.size())), &got);
++      if (FAILED(status)) return status;
++      if (read) read->QuadPart += got;
++      if (got) {
++        HRESULT write_status = destination->Write(buffer.data(), got, &sent);
++        if (written) written->QuadPart += sent;
++        if (FAILED(write_status)) return write_status;
++        if (sent != got) return STG_E_WRITEFAULT;
++        remaining -= got;
++      }
++      if (status == S_FALSE) return S_OK;
++    }
++    return S_OK;
++  }
++  HRESULT STDMETHODCALLTYPE Commit(DWORD) override { return S_OK; }
++  HRESULT STDMETHODCALLTYPE Revert() override { return STG_E_INVALIDFUNCTION; }
++  HRESULT STDMETHODCALLTYPE LockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return STG_E_INVALIDFUNCTION; }
++  HRESULT STDMETHODCALLTYPE UnlockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return STG_E_INVALIDFUNCTION; }
++  HRESULT STDMETHODCALLTYPE Stat(STATSTG *stat, DWORD flags) override {
++    if (!stat) return STG_E_INVALIDPOINTER;
++    std::memset(stat, 0, sizeof(*stat));
++    const auto &item = value_->entries[index_];
++    stat->type = STGTY_STREAM;
++    stat->cbSize.QuadPart = item.size;
++    stat->mtime = item.last_write;
++    stat->grfMode = STGM_READ | STGM_SHARE_DENY_NONE;
++    if (!(flags & STATFLAG_NONAME)) {
++      const auto bytes = (item.relative_path.size() + 1) * sizeof(wchar_t);
++      stat->pwcsName = static_cast<wchar_t *>(CoTaskMemAlloc(bytes));
++      if (!stat->pwcsName) return E_OUTOFMEMORY;
++      std::memcpy(stat->pwcsName, item.relative_path.c_str(), bytes);
++    }
++    return S_OK;
++  }
++  HRESULT STDMETHODCALLTYPE Clone(IStream **out) override {
++    if (!out) return E_POINTER;
++    std::lock_guard<std::mutex> lock(mutex_);
++    *out = new (std::nothrow) file_stream(value_, index_, position_);
++    return *out ? S_OK : E_OUTOFMEMORY;
++  }
++private:
++  std::atomic<ULONG> references_ {1};
++  std::shared_ptr<offer> value_;
++  std::size_t index_;
++  std::uint64_t position_;
++  std::mutex mutex_;
++  IUnknown *marshaler_ = nullptr;
++};
++
++class data_object final : public IDataObject, public IDataObjectAsyncCapability {
++public:
++  explicit data_object(std::shared_ptr<offer> value): value_(std::move(value)) {
++    // IDataObject stays STA-marshalled. Free-threaded content IStreams remain
++    // separate: OLE's clipboard wrapper lost the registered descriptor format
++    // when this IDataObject itself used the free-threaded marshaler.
++    formats_ = {{{ descriptor_format(), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL },
++                 { contents_format(), nullptr, DVASPECT_CONTENT, -1, TYMED_ISTREAM },
++                 { effect_format(), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL }}};
++  }
++  ~data_object() = default;
++  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
++    if (!out) return E_POINTER;
++    *out = nullptr;
++    if (id == IID_IUnknown || id == IID_IDataObject) *out = static_cast<IDataObject *>(this);
++    else if (id == __uuidof(IDataObjectAsyncCapability)) *out = static_cast<IDataObjectAsyncCapability *>(this);
++    else return E_NOINTERFACE;
++    AddRef(); return S_OK;
++  }
++  ULONG STDMETHODCALLTYPE AddRef() override { return ++references_; }
++  ULONG STDMETHODCALLTYPE Release() override { auto n = --references_; if (!n) delete this; return n; }
++  HRESULT STDMETHODCALLTYPE GetData(FORMATETC *format, STGMEDIUM *medium) override {
++    if (!format || !medium) return E_POINTER;
++    std::memset(medium, 0, sizeof(*medium));
++    if (!value_->valid.load()) return STG_E_REVERTED;
++    HRESULT supported = QueryGetData(format);
++    if (FAILED(supported)) return supported;
++    if (format->cfFormat == descriptor_format()) {
++      const auto size = offsetof(FILEGROUPDESCRIPTORW, fgd) + value_->entries.size() * sizeof(FILEDESCRIPTORW);
++      return global_medium(size, medium, [&](void *memory) {
++        auto *group = static_cast<FILEGROUPDESCRIPTORW *>(memory);
++        group->cItems = static_cast<UINT>(value_->entries.size());
++        for (std::size_t i = 0; i < value_->entries.size(); ++i) {
++          const auto &item = value_->entries[i];
++          auto &descriptor = group->fgd[i];
++          descriptor.dwFlags = FD_ATTRIBUTES | FD_UNICODE | FD_WRITESTIME | FD_PROGRESSUI;
++          descriptor.dwFileAttributes = item.attributes;
++          descriptor.ftLastWriteTime = item.last_write;
++          if (!item.directory()) {
++            descriptor.dwFlags |= FD_FILESIZE;
++            descriptor.nFileSizeHigh = static_cast<DWORD>(item.size >> 32);
++            descriptor.nFileSizeLow = static_cast<DWORD>(item.size);
++          }
++          std::memcpy(descriptor.cFileName, item.relative_path.c_str(),
++                      (item.relative_path.size() + 1) * sizeof(wchar_t));
++        }
++      });
++    }
++    if (format->cfFormat == effect_format()) {
++      return global_medium(sizeof(DWORD), medium, [](void *memory) {
++        *static_cast<DWORD *>(memory) = DROPEFFECT_COPY;
++      });
++    }
++    if (format->cfFormat == contents_format()) {
++      if (format->lindex < 0 || static_cast<std::size_t>(format->lindex) >= value_->entries.size() ||
++          value_->entries[format->lindex].directory()) return DV_E_LINDEX;
++      medium->pstm = new (std::nothrow) file_stream(value_, static_cast<std::size_t>(format->lindex));
++      if (!medium->pstm) return E_OUTOFMEMORY;
++      medium->tymed = TYMED_ISTREAM;
++      return S_OK;
++    }
++    return DV_E_FORMATETC;
++  }
++  HRESULT STDMETHODCALLTYPE GetDataHere(FORMATETC *, STGMEDIUM *) override { return DATA_E_FORMATETC; }
++  HRESULT STDMETHODCALLTYPE QueryGetData(FORMATETC *format) override {
++    if (!format) return E_POINTER;
++    if (format->dwAspect != DVASPECT_CONTENT) return DV_E_DVASPECT;
++    if (format->cfFormat == descriptor_format() || format->cfFormat == effect_format())
++      return (format->tymed & TYMED_HGLOBAL) ? S_OK : DV_E_TYMED;
++    if (format->cfFormat == contents_format())
++      return (format->tymed & TYMED_ISTREAM) ? S_OK : DV_E_TYMED;
++    return DV_E_FORMATETC;
++  }
++  HRESULT STDMETHODCALLTYPE GetCanonicalFormatEtc(FORMATETC *, FORMATETC *out) override {
++    if (out) out->ptd = nullptr;
++    return E_NOTIMPL;
++  }
++  HRESULT STDMETHODCALLTYPE SetData(FORMATETC *format, STGMEDIUM *medium, BOOL release) override {
++    // Completion notifications never authorize deleting source files.
++    if (!format || !medium) return E_POINTER;
++    const auto performed = static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"Performed DropEffect"));
++    const auto pasted = static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"Paste Succeeded"));
++    if (format->cfFormat != performed && format->cfFormat != pasted) return DV_E_FORMATETC;
++    if (release) ReleaseStgMedium(medium);
++    return S_OK;
++  }
++  HRESULT STDMETHODCALLTYPE EnumFormatEtc(DWORD direction, IEnumFORMATETC **out) override {
++    if (direction != DATADIR_GET) return E_NOTIMPL;
++    return SHCreateStdEnumFmtEtc(static_cast<UINT>(formats_.size()), formats_.data(), out);
++  }
++  HRESULT STDMETHODCALLTYPE DAdvise(FORMATETC *, DWORD, IAdviseSink *, DWORD *) override { return OLE_E_ADVISENOTSUPPORTED; }
++  HRESULT STDMETHODCALLTYPE DUnadvise(DWORD) override { return OLE_E_ADVISENOTSUPPORTED; }
++  HRESULT STDMETHODCALLTYPE EnumDAdvise(IEnumSTATDATA **) override { return OLE_E_ADVISENOTSUPPORTED; }
++  HRESULT STDMETHODCALLTYPE SetAsyncMode(BOOL value) override { asynchronous_ = value != FALSE; return S_OK; }
++  HRESULT STDMETHODCALLTYPE GetAsyncMode(BOOL *out) override { if (!out) return E_POINTER; *out = asynchronous_ ? TRUE : FALSE; return S_OK; }
++  HRESULT STDMETHODCALLTYPE StartOperation(IBindCtx *) override { in_operation_ = true; return S_OK; }
++  HRESULT STDMETHODCALLTYPE InOperation(BOOL *out) override { if (!out) return E_POINTER; *out = in_operation_ ? TRUE : FALSE; return S_OK; }
++  HRESULT STDMETHODCALLTYPE EndOperation(HRESULT, IBindCtx *, DWORD) override { in_operation_ = false; return S_OK; }
++private:
++  std::atomic<ULONG> references_ {1};
++  std::shared_ptr<offer> value_;
++  std::array<FORMATETC, 3> formats_ {};
++  std::atomic<bool> asynchronous_ {true};
++  std::atomic<bool> in_operation_ {false};
++};
++}
++
++bool valid_relative_path(const std::wstring &path) {
++  if (path.empty() || path.size() >= MAX_PATH || path.front() == L'\\' || path.front() == L'/') return false;
++  std::size_t begin = 0;
++  while (begin < path.size()) {
++    auto end = path.find(L'\\', begin);
++    if (end == std::wstring::npos) end = path.size();
++    auto part = path.substr(begin, end - begin);
++    if (part.empty() || part == L"." || part == L".." || part.back() == L'.' || part.back() == L' ') return false;
++    for (std::size_t i = 0; i < part.size(); ++i) {
++      wchar_t c = part[i];
++      if (c < 32 || std::wstring(L"<>:\"/|?*").find(c) != std::wstring::npos) return false;
++      if (c >= 0xd800 && c <= 0xdbff) {
++        if (++i == part.size() || part[i] < 0xdc00 || part[i] > 0xdfff) return false;
++      } else if (c >= 0xdc00 && c <= 0xdfff) return false;
++    }
++    auto stem = part.substr(0, part.find(L'.'));
++    std::transform(stem.begin(), stem.end(), stem.begin(), [](wchar_t c) { return std::towupper(c); });
++    if (stem == L"CON" || stem == L"PRN" || stem == L"AUX" || stem == L"NUL" ||
++        (stem.size() == 4 && (stem.substr(0, 3) == L"COM" || stem.substr(0, 3) == L"LPT") &&
++          ((stem[3] >= L'1' && stem[3] <= L'9') || stem[3] == L'\u00b9' || stem[3] == L'\u00b2' || stem[3] == L'\u00b3'))) return false;
++    if (end == path.size()) return true;
++    begin = end + 1;
++    if (begin == path.size()) return false;
++  }
++  return false;
++}
++
++HRESULT create_data_object(std::shared_ptr<offer> value, IDataObject **result) {
++  if (!result) return E_POINTER;
++  *result = nullptr;
++  if (!value || !value->source || value->entries.empty() || value->entries.size() > max_entries) return E_INVALIDARG;
++  if (!wire::valid_manifest(value->entries)) return E_INVALIDARG;
++  *result = new (std::nothrow) data_object(std::move(value));
++  return *result ? S_OK : E_OUTOFMEMORY;
++}
++
++struct publisher::impl {
++  std::mutex mutex;
++  std::condition_variable ready;
++  std::thread thread;
++  HWND window = nullptr;
++  bool initialized = false;
++  HRESULT status = E_PENDING;
++  IDataObject *current = nullptr;
++  std::shared_ptr<offer> current_offer;
++  publisher::clipboard_change observer;
++  DWORD last_sequence = 0;
++  unsigned clipboard_retries = 0;
++  bool locked = false;
++  void changed(HWND window) {
++    if (!observer) return;
++    DWORD sequence = GetClipboardSequenceNumber();
++    if (sequence == last_sequence) return;
++    if (current && OleIsCurrentClipboard(current) == S_OK) { last_sequence = sequence; return; }
++    if (current_offer) current_offer->valid = false;
++    if (locked || !interactive_desktop_available()) {
++      last_sequence = sequence;
++      observer(sequence, {});
++      return;
++    }
++    if (!OpenClipboard(window)) {
++      if (++clipboard_retries <= 10) SetTimer(window, 1, 100, nullptr);
++      return;
++    }
++    std::vector<std::wstring> paths;
++    bool copy = true;
++    HANDLE effect = GetClipboardData(effect_format());
++    if (effect && GlobalSize(effect) >= sizeof(DWORD)) {
++      if (auto *value = static_cast<DWORD *>(GlobalLock(effect))) {
++        copy = (*value & DROPEFFECT_MOVE) == 0;
++        GlobalUnlock(effect);
++      }
++    }
++    if (copy && IsClipboardFormatAvailable(CF_HDROP)) {
++      const bool shell_files = IsClipboardFormatAvailable(RegisterClipboardFormatW(L"Shell IDList Array"));
++      const bool image = IsClipboardFormatAvailable(CF_DIB) || IsClipboardFormatAvailable(CF_DIBV5) ||
++                         IsClipboardFormatAvailable(RegisterClipboardFormatW(L"PNG"));
++      if (image && !shell_files) copy = false;
++    }
++    if (copy && IsClipboardFormatAvailable(CF_HDROP)) {
++      HDROP drop = static_cast<HDROP>(GetClipboardData(CF_HDROP));
++      UINT count = drop ? DragQueryFileW(drop, 0xffffffffu, nullptr, 0) : 0;
++      std::size_t path_characters = 0;
++      if (count <= max_entries) {
++        for (UINT i = 0; i < count; ++i) {
++          UINT length = DragQueryFileW(drop, i, nullptr, 0);
++          if (!length || length > 32766 || length > wire::max_manifest_bytes / sizeof(wchar_t) - path_characters) { paths.clear(); break; }
++          path_characters += length;
++          std::vector<wchar_t> path(length + 1);
++          if (DragQueryFileW(drop, i, path.data(), static_cast<UINT>(path.size())) != length) { paths.clear(); break; }
++          paths.emplace_back(path.data());
++        }
++      }
++    }
++    CloseClipboard();
++    clipboard_retries = 0;
++    last_sequence = sequence;
++    observer(sequence, std::move(paths));
++  }
++  struct request { std::shared_ptr<offer> value; HRESULT result = E_PENDING; };
++  static LRESULT CALLBACK procedure(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
++    auto *self = reinterpret_cast<impl *>(GetWindowLongPtrW(window, GWLP_USERDATA));
++    if (message == WM_NCCREATE) {
++      self = static_cast<impl *>(reinterpret_cast<CREATESTRUCTW *>(lparam)->lpCreateParams);
++      SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
++    }
++    if (self && message == WM_APP + 1) {
++      auto &call = *reinterpret_cast<request *>(lparam);
++      IDataObject *object = nullptr;
++      bool changed_clipboard = false;
++      call.result = call.value ? create_data_object(call.value, &object) : S_OK;
++      if (SUCCEEDED(call.result)) {
++        if (object) { call.result = OleSetClipboard(object); changed_clipboard = SUCCEEDED(call.result); }
++        else if (self->current && OleIsCurrentClipboard(self->current) == S_OK) {
++          call.result = OleSetClipboard(nullptr); changed_clipboard = SUCCEEDED(call.result);
++        }
++      }
++      if (SUCCEEDED(call.result)) {
++        if (self->current_offer) self->current_offer->valid = false;
++        if (self->current) self->current->Release();
++        self->current = object;
++        self->current_offer = call.value;
++        if (changed_clipboard) self->last_sequence = GetClipboardSequenceNumber();
++      } else if (object) object->Release();
++      return 0;
++    }
++    if (self && message == WM_APP + 2) { PostQuitMessage(0); return 0; }
++    if (self && message == WM_APP + 3) {
++      self->observer = *reinterpret_cast<publisher::clipboard_change *>(lparam);
++      self->last_sequence = GetClipboardSequenceNumber();
++      return 0;
++    }
++    if (self && message == WM_CLIPBOARDUPDATE) { self->changed(window); return 0; }
++    if (self && message == WM_TIMER && wparam == 1) { KillTimer(window, 1); self->changed(window); return 0; }
++    if (self && message == WM_TIMER && wparam == 2) {
++      const bool unavailable = !interactive_desktop_available();
++      if (unavailable && !self->locked) {
++        self->locked = true;
++        request clear;
++        SendMessageW(window, WM_APP + 1, 0, reinterpret_cast<LPARAM>(&clear));
++        if (self->observer) self->observer(GetClipboardSequenceNumber(), {});
++      } else if (!unavailable) self->locked = false;
++      return 0;
++    }
++    if (self && message == WM_WTSSESSION_CHANGE) {
++      if (wparam == WTS_SESSION_LOCK || wparam == WTS_SESSION_LOGOFF || wparam == WTS_CONSOLE_DISCONNECT || wparam == WTS_REMOTE_DISCONNECT) {
++        self->locked = true;
++        if (self->current_offer) self->current_offer->valid = false;
++        request clear;
++        SendMessageW(window, WM_APP + 1, 0, reinterpret_cast<LPARAM>(&clear));
++        if (self->observer) self->observer(GetClipboardSequenceNumber(), {});
++      } else if (wparam == WTS_SESSION_UNLOCK || wparam == WTS_SESSION_LOGON || wparam == WTS_CONSOLE_CONNECT || wparam == WTS_REMOTE_CONNECT) self->locked = false;
++      return 0;
++    }
++    return DefWindowProcW(window, message, wparam, lparam);
++  }
++  impl() {
++    thread = std::thread([this] {
++      HRESULT apartment = OleInitialize(nullptr);
++      HWND created = nullptr;
++      if (SUCCEEDED(apartment)) {
++        WNDCLASSW type {};
++        type.lpfnWndProc = procedure;
++        type.hInstance = GetModuleHandleW(nullptr);
++        type.lpszClassName = L"StreamingFileClipboardSTA";
++        if (RegisterClassW(&type) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS) {
++          created = CreateWindowExW(0, type.lpszClassName, L"", 0, 0, 0, 0, 0,
++                                    HWND_MESSAGE, nullptr, type.hInstance, this);
++        }
++      }
++      {
++        std::lock_guard<std::mutex> lock(mutex);
++        window = created;
++        initialized = true;
++        status = FAILED(apartment) ? apartment : created ? S_OK : HRESULT_FROM_WIN32(GetLastError());
++      }
++      ready.notify_all();
++      if (FAILED(apartment)) return;
++      if (!created) { OleUninitialize(); return; }
++      AddClipboardFormatListener(created);
++      WTSRegisterSessionNotification(created, NOTIFY_FOR_THIS_SESSION);
++      SetTimer(created, 2, 250, nullptr);
++      MSG message;
++      while (GetMessageW(&message, nullptr, 0, 0) > 0) {
++        TranslateMessage(&message); DispatchMessageW(&message);
++      }
++      if (current) {
++        if (OleIsCurrentClipboard(current) == S_OK) OleSetClipboard(nullptr);
++        current->Release(); current = nullptr;
++      }
++      WTSUnRegisterSessionNotification(created);
++      RemoveClipboardFormatListener(created);
++      DestroyWindow(created);
++      OleUninitialize();
++    });
++    std::unique_lock<std::mutex> lock(mutex);
++    ready.wait(lock, [&] { return initialized; });
++  }
++  ~impl() {
++    if (thread.joinable()) {
++      if (window) {
++        request clear;
++        SendMessageW(window, WM_APP + 1, 0, reinterpret_cast<LPARAM>(&clear));
++        PostMessageW(window, WM_APP + 2, 0, 0);
++      }
++      thread.join();
++    }
++  }
++};
++
++publisher::publisher(): state_(std::make_unique<impl>()) {}
++publisher::~publisher() = default;
++HRESULT publisher::publish(std::shared_ptr<offer> value) {
++  if (FAILED(state_->status)) return state_->status;
++  impl::request call {std::move(value), E_PENDING};
++  // SendMessage dispatches incoming nonqueued messages while waiting. A bare
++  // condition-variable wait here would deadlock if this caller owned the
++  // previous clipboard and OLE sent it WM_DESTROYCLIPBOARD during replacement.
++  SendMessageW(state_->window, WM_APP + 1, 0, reinterpret_cast<LPARAM>(&call));
++  return call.result;
++}
++void publisher::clear() { publish({}); }
++void publisher::observe(clipboard_change callback) {
++  if (SUCCEEDED(state_->status)) SendMessageW(state_->window, WM_APP + 3, 0, reinterpret_cast<LPARAM>(&callback));
++}
++}
+diff --git a/src/file_clipboard/file_clipboard_native.h b/src/file_clipboard/file_clipboard_native.h
+new file mode 100644
+index 00000000..fba45b1a
+--- /dev/null
++++ b/src/file_clipboard/file_clipboard_native.h
+@@ -0,0 +1,79 @@
++#pragma once
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
++#include <objidl.h>
++#include <atomic>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace streaming::file_clipboard {
++inline constexpr std::size_t max_entries = 20000;
++inline constexpr ULONG max_chunk_bytes = 1024 * 1024;
++
++struct entry {
++  std::wstring relative_path;
++  std::uint64_t size = 0;
++  DWORD attributes = FILE_ATTRIBUTE_NORMAL;
++  FILETIME last_write {};
++  bool directory() const { return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0; }
++};
++
++// The transport must authenticate the offer and supply bounded reads. No
++// destination path or arbitrary source path is accepted by this interface.
++class reader {
++public:
++  virtual ~reader() = default;
++  virtual HRESULT read_at(std::size_t index, std::uint64_t offset,
++                          void *buffer, ULONG requested, ULONG &received) = 0;
++};
++
++struct offer {
++  std::vector<entry> entries;
++  std::shared_ptr<reader> source;
++  std::atomic<bool> valid {true};
++};
++
++bool valid_relative_path(const std::wstring &path);
++HRESULT create_data_object(std::shared_ptr<offer> value, IDataObject **result);
++bool interactive_desktop_available();
++
++class source_files final : public reader {
++public:
++  static HRESULT collect(const std::vector<std::wstring> &paths,
++                         const std::function<bool()> &cancelled,
++                         std::shared_ptr<source_files> &result);
++  ~source_files();
++  const std::vector<entry> &entries() const;
++  HRESULT read_at(std::size_t index, std::uint64_t offset,
++                  void *buffer, ULONG requested, ULONG &received) override;
++private:
++  struct impl;
++  source_files();
++  std::unique_ptr<impl> state_;
++};
++
++// Owns a dedicated OLE STA. Network/source callbacks may run on COM worker
++// threads and must not depend on this thread's message pump to make progress.
++class publisher {
++public:
++  publisher();
++  ~publisher();
++  publisher(const publisher &) = delete;
++  publisher &operator=(const publisher &) = delete;
++  HRESULT publish(std::shared_ptr<offer> value);
++  void clear();
++  using clipboard_change = std::function<void(std::uint32_t, std::vector<std::wstring>)>;
++  void observe(clipboard_change callback);
++private:
++  struct impl;
++  std::unique_ptr<impl> state_;
++};
++}
+diff --git a/src/file_clipboard/file_clipboard_pipe.h b/src/file_clipboard/file_clipboard_pipe.h
+new file mode 100644
+index 00000000..4c60cb45
+--- /dev/null
++++ b/src/file_clipboard/file_clipboard_pipe.h
+@@ -0,0 +1,59 @@
++#pragma once
++#include "file_clipboard_wire.h"
++#include <chrono>
++
++namespace streaming::file_clipboard::wire {
++class pipe {
++public:
++  explicit pipe(HANDLE handle, bool server = false): handle_(handle), server_(server) {}
++  ~pipe() { stop(); if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_); }
++  bool alive() const { return alive_.load(); }
++  void stop() {
++    if (alive_.exchange(false)) {
++      CancelIoEx(handle_, nullptr);
++      if (server_) DisconnectNamedPipe(handle_);
++    }
++  }
++  bool send(const message &value) {
++    auto data = encode(value);
++    std::lock_guard<std::mutex> lock(write_mutex_);
++    return !data.empty() && transfer(data.data(), static_cast<DWORD>(data.size()), true);
++  }
++  bool receive(message &value) {
++    bytes data(16);
++    if (!transfer(data.data(), 16, false)) return false;
++    decoder header(data); std::uint64_t type, id, length;
++    if (!header.number(type, 4) || !header.number(id, 8) || !header.number(length, 4) || length > max_manifest_bytes) { stop(); return false; }
++    data.resize(16 + static_cast<std::size_t>(length));
++    if (length && !transfer(data.data() + 16, static_cast<DWORD>(length), false)) return false;
++    if (!decode(data, value)) { stop(); return false; }
++    return true;
++  }
++private:
++  bool transfer(void *buffer, DWORD bytes, bool writing) {
++    auto *position = static_cast<unsigned char *>(buffer);
++    while (bytes && alive_) {
++      OVERLAPPED operation {}; operation.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
++      if (!operation.hEvent) { stop(); return false; }
++      DWORD count = 0;
++      BOOL complete = writing ? WriteFile(handle_, position, bytes, &count, &operation) : ReadFile(handle_, position, bytes, &count, &operation);
++      DWORD error = complete ? ERROR_SUCCESS : GetLastError();
++      if (!complete && error == ERROR_IO_PENDING) {
++        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
++        while (alive_) {
++          auto wait = WaitForSingleObject(operation.hEvent, 250);
++          if (wait == WAIT_OBJECT_0) break;
++          if (wait != WAIT_TIMEOUT || (writing && std::chrono::steady_clock::now() >= deadline)) { stop(); break; }
++        }
++        if (!alive_) CancelIoEx(handle_, &operation);
++        complete = GetOverlappedResult(handle_, &operation, &count, TRUE);
++      }
++      CloseHandle(operation.hEvent);
++      if (!complete || !count) { stop(); return false; }
++      bytes -= count; position += count;
++    }
++    return bytes == 0 && alive_;
++  }
++  HANDLE handle_; bool server_; std::atomic<bool> alive_ {true}; std::mutex write_mutex_;
++};
++}
+diff --git a/src/file_clipboard/file_clipboard_source.cpp b/src/file_clipboard/file_clipboard_source.cpp
+new file mode 100644
+index 00000000..69f0fbbc
+--- /dev/null
++++ b/src/file_clipboard/file_clipboard_source.cpp
+@@ -0,0 +1,163 @@
++#include "file_clipboard_native.h"
++#include "file_clipboard_wire.h"
++#include <filesystem>
++#include <set>
++
++namespace streaming::file_clipboard {
++namespace {
++std::wstring extended(const std::wstring &path) {
++  if (path.rfind(L"\\\\?\\", 0) == 0) return path;
++  if (path.rfind(L"\\\\", 0) == 0) return L"\\\\?\\UNC\\" + path.substr(2);
++  return L"\\\\?\\" + path;
++}
++struct handle {
++  HANDLE value = INVALID_HANDLE_VALUE;
++  ~handle() { if (value != INVALID_HANDLE_VALUE) CloseHandle(value); }
++};
++struct ordinal_less {
++  bool operator()(const std::wstring &a, const std::wstring &b) const {
++    return CompareStringOrdinal(a.c_str(), static_cast<int>(a.size()), b.c_str(), static_cast<int>(b.size()), TRUE) == CSTR_LESS_THAN;
++  }
++};
++HRESULT full_path(const std::wstring &input, std::wstring &output) {
++  DWORD count = GetFullPathNameW(input.c_str(), 0, nullptr, nullptr);
++  if (!count || count > 32767) return E_INVALIDARG;
++  std::vector<wchar_t> buffer(count);
++  if (!GetFullPathNameW(input.c_str(), count, buffer.data(), nullptr)) return HRESULT_FROM_WIN32(GetLastError());
++  output = buffer.data();
++  while (output.size() > 3 && output.back() == L'\\') output.pop_back();
++  auto parent = std::filesystem::path(output);
++  while (!parent.empty()) {
++    auto attributes = GetFileAttributesW(extended(parent.wstring()).c_str());
++    if (attributes == INVALID_FILE_ATTRIBUTES) return HRESULT_FROM_WIN32(GetLastError());
++    if (attributes & FILE_ATTRIBUTE_REPARSE_POINT) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
++    auto next = parent.parent_path();
++    if (next == parent) break;
++    parent = next;
++  }
++  return S_OK;
++}
++}
++
++bool interactive_desktop_available() {
++  DWORD session = MAXDWORD;
++  if (!ProcessIdToSessionId(GetCurrentProcessId(), &session) || session != WTSGetActiveConsoleSessionId()) return false;
++  HDESK desktop = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
++  if (!desktop) return false;
++  wchar_t name[128] {};
++  DWORD bytes = 0;
++  BOOL success = GetUserObjectInformationW(desktop, UOI_NAME, name, sizeof(name), &bytes);
++  CloseDesktop(desktop);
++  return success && CompareStringOrdinal(name, -1, L"Default", -1, TRUE) == CSTR_EQUAL;
++}
++
++struct source_files::impl {
++  struct fingerprint {
++    std::wstring path;
++    BY_HANDLE_FILE_INFORMATION information {};
++  };
++  std::vector<entry> entries;
++  std::vector<fingerprint> files;
++  std::set<std::wstring, ordinal_less> names;
++  std::size_t path_characters = 0;
++  HRESULT append(const std::wstring &path, const std::wstring &relative,
++                 const std::function<bool()> &cancelled, unsigned depth) {
++    if (cancelled && cancelled()) return HRESULT_FROM_WIN32(ERROR_CANCELLED);
++    if (depth > 64 || entries.size() >= max_entries || !valid_relative_path(relative)) return E_INVALIDARG;
++    if (path.size() > wire::max_manifest_bytes / sizeof(wchar_t) - path_characters) return E_OUTOFMEMORY;
++    path_characters += path.size();
++    if (!names.insert(relative).second) return HRESULT_FROM_WIN32(ERROR_DUP_NAME);
++    WIN32_FILE_ATTRIBUTE_DATA attributes {};
++    if (!GetFileAttributesExW(extended(path).c_str(), GetFileExInfoStandard, &attributes)) return HRESULT_FROM_WIN32(GetLastError());
++    if (attributes.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE)) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
++    entry descriptor;
++    descriptor.relative_path = relative;
++    descriptor.attributes = attributes.dwFileAttributes &
++        (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_SYSTEM);
++    if (!descriptor.attributes) descriptor.attributes = FILE_ATTRIBUTE_NORMAL;
++    descriptor.last_write = attributes.ftLastWriteTime;
++    fingerprint identity;
++    identity.path = extended(path);
++    if (!descriptor.directory()) {
++      handle file;
++      file.value = CreateFileW(identity.path.c_str(), FILE_READ_ATTRIBUTES,
++                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++                               nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
++      if (file.value == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
++      if (!GetFileInformationByHandle(file.value, &identity.information)) return HRESULT_FROM_WIN32(GetLastError());
++      if (identity.information.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
++      descriptor.size = (static_cast<std::uint64_t>(identity.information.nFileSizeHigh) << 32) | identity.information.nFileSizeLow;
++      descriptor.last_write = identity.information.ftLastWriteTime;
++    }
++    entries.push_back(descriptor);
++    files.push_back(std::move(identity));
++    if (!descriptor.directory()) return S_OK;
++    WIN32_FIND_DATAW found {};
++    HANDLE search = FindFirstFileW(extended(path + L"\\*").c_str(), &found);
++    if (search == INVALID_HANDLE_VALUE) {
++      DWORD error = GetLastError();
++      return error == ERROR_FILE_NOT_FOUND ? S_OK : HRESULT_FROM_WIN32(error);
++    }
++    std::set<std::wstring, ordinal_less> children;
++    do {
++      if (std::wstring(found.cFileName) != L"." && std::wstring(found.cFileName) != L"..") children.insert(found.cFileName);
++      if (children.size() + entries.size() > max_entries || (cancelled && cancelled())) {
++        FindClose(search); return HRESULT_FROM_WIN32(ERROR_CANCELLED);
++      }
++    } while (FindNextFileW(search, &found));
++    DWORD error = GetLastError();
++    FindClose(search);
++    if (error != ERROR_NO_MORE_FILES) return HRESULT_FROM_WIN32(error);
++    for (const auto &child : children) {
++      HRESULT status = append(path + L"\\" + child, relative + L"\\" + child, cancelled, depth + 1);
++      if (FAILED(status)) return status;
++    }
++    return S_OK;
++  }
++};
++
++source_files::source_files(): state_(std::make_unique<impl>()) {}
++source_files::~source_files() = default;
++const std::vector<entry> &source_files::entries() const { return state_->entries; }
++HRESULT source_files::collect(const std::vector<std::wstring> &paths,
++                              const std::function<bool()> &cancelled,
++                              std::shared_ptr<source_files> &result) {
++  result.reset();
++  if (paths.empty() || paths.size() > max_entries || !interactive_desktop_available()) return E_ACCESSDENIED;
++  auto collection = std::shared_ptr<source_files>(new source_files);
++  for (const auto &path : paths) {
++    std::wstring full;
++    HRESULT status = full_path(path, full);
++    if (FAILED(status)) return status;
++    auto name = std::filesystem::path(full).filename().wstring();
++    status = collection->state_->append(full, name, cancelled, 0);
++    if (FAILED(status)) return status;
++  }
++  result = std::move(collection);
++  return S_OK;
++}
++HRESULT source_files::read_at(std::size_t index, std::uint64_t offset,
++                             void *buffer, ULONG requested, ULONG &received) {
++  received = 0;
++  if (!interactive_desktop_available()) return E_ACCESSDENIED;
++  if (index >= state_->entries.size() || state_->entries[index].directory() || requested > max_chunk_bytes) return E_INVALIDARG;
++  const auto &descriptor = state_->entries[index];
++  if (offset > descriptor.size || requested > descriptor.size - offset) return E_INVALIDARG;
++  const auto &identity = state_->files[index];
++  handle file;
++  file.value = CreateFileW(identity.path.c_str(), GENERIC_READ, FILE_SHARE_READ,
++                           nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
++  if (file.value == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
++  BY_HANDLE_FILE_INFORMATION current {};
++  if (!GetFileInformationByHandle(file.value, &current)) return HRESULT_FROM_WIN32(GetLastError());
++  const auto &before = identity.information;
++  if ((current.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
++      current.dwVolumeSerialNumber != before.dwVolumeSerialNumber || current.nFileIndexHigh != before.nFileIndexHigh ||
++      current.nFileIndexLow != before.nFileIndexLow || current.nFileSizeHigh != before.nFileSizeHigh ||
++      current.nFileSizeLow != before.nFileSizeLow || CompareFileTime(&current.ftLastWriteTime, &before.ftLastWriteTime) != 0) return STG_E_REVERTED;
++  LARGE_INTEGER position; position.QuadPart = static_cast<LONGLONG>(offset);
++  if (!SetFilePointerEx(file.value, position, nullptr, FILE_BEGIN)) return HRESULT_FROM_WIN32(GetLastError());
++  if (!ReadFile(file.value, buffer, requested, &received, nullptr)) return HRESULT_FROM_WIN32(GetLastError());
++  return received == requested ? S_OK : STG_E_READFAULT;
++}
++}
+diff --git a/src/file_clipboard/file_clipboard_wire.h b/src/file_clipboard/file_clipboard_wire.h
+new file mode 100644
+index 00000000..4008d120
+--- /dev/null
++++ b/src/file_clipboard/file_clipboard_wire.h
+@@ -0,0 +1,155 @@
++#pragma once
++#include "file_clipboard_native.h"
++#include <condition_variable>
++#include <cstring>
++#include <deque>
++#include <limits>
++#include <mutex>
++#include <set>
++#include <thread>
++
++namespace streaming::file_clipboard::wire {
++using bytes = std::vector<unsigned char>;
++inline constexpr std::size_t max_manifest_bytes = 16 * 1024 * 1024;
++enum class kind : std::uint32_t { hello = 1, offer = 2, request = 3, reply = 4, publish = 5 };
++struct message { kind type {}; std::uint64_t id = 0; bytes body; };
++inline void number(bytes &out, std::uint64_t value, unsigned count) {
++  for (unsigned i = 0; i < count; ++i) out.push_back(static_cast<unsigned char>(value >> (i * 8)));
++}
++struct decoder {
++  const unsigned char *data; std::size_t size, position = 0;
++  explicit decoder(const bytes &in): data(in.data()), size(in.size()) {}
++  bool number(std::uint64_t &value, unsigned count) {
++    if (count > 8 || count > size - position) return false;
++    value = 0;
++    for (unsigned i = 0; i < count; ++i) value |= std::uint64_t(data[position++]) << (i * 8);
++    return true;
++  }
++  bool done() const { return position == size; }
++};
++inline bytes encode(const message &value) {
++  if (value.body.size() > max_manifest_bytes) return {};
++  bytes out; out.reserve(16 + value.body.size());
++  number(out, static_cast<std::uint32_t>(value.type), 4);
++  number(out, value.id, 8); number(out, value.body.size(), 4);
++  out.insert(out.end(), value.body.begin(), value.body.end());
++  return out;
++}
++inline bool decode(const bytes &data, message &value) {
++  decoder input(data); std::uint64_t type, size;
++  if (!input.number(type, 4) || !input.number(value.id, 8) || !input.number(size, 4) ||
++      type < 1 || type > 5 || size > max_manifest_bytes || size != data.size() - input.position) return false;
++  value.type = static_cast<kind>(type);
++  value.body.assign(data.begin() + input.position, data.end()); return true;
++}
++struct ordinal_less {
++  bool operator()(const std::wstring &a, const std::wstring &b) const {
++    return CompareStringOrdinal(a.c_str(), static_cast<int>(a.size()), b.c_str(), static_cast<int>(b.size()), TRUE) == CSTR_LESS_THAN;
++  }
++};
++inline bool valid_manifest(const std::vector<entry> &entries) {
++  if (entries.empty() || entries.size() > max_entries) return false;
++  std::set<std::wstring, ordinal_less> names, directories;
++  for (const auto &item : entries) {
++    if (!valid_relative_path(item.relative_path) || !names.insert(item.relative_path).second ||
++        item.size > static_cast<std::uint64_t>(INT64_MAX) || (item.directory() && item.size)) return false;
++    const auto slash = item.relative_path.rfind(L'\\');
++    if (slash != std::wstring::npos && !directories.count(item.relative_path.substr(0, slash))) return false;
++    if (item.attributes & ~(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_HIDDEN |
++                            FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_NORMAL)) return false;
++    if (item.directory()) directories.insert(item.relative_path);
++  }
++  return true;
++}
++inline bytes manifest(const std::vector<entry> &entries) {
++  if (!valid_manifest(entries)) return {};
++  bytes out; number(out, entries.size(), 4);
++  for (const auto &item : entries) {
++    number(out, item.relative_path.size(), 2);
++    for (wchar_t character : item.relative_path) number(out, static_cast<std::uint16_t>(character), 2);
++    number(out, item.size, 8); number(out, item.attributes, 4);
++    number(out, (std::uint64_t(item.last_write.dwHighDateTime) << 32) | item.last_write.dwLowDateTime, 8);
++    if (out.size() > max_manifest_bytes) return {};
++  }
++  return out;
++}
++inline bool manifest(const bytes &body, std::vector<entry> &entries) {
++  entries.clear(); if (body.size() > max_manifest_bytes) return false;
++  decoder input(body); std::uint64_t count, length, value;
++  if (!input.number(count, 4) || !count || count > max_entries) return false;
++  entries.reserve(static_cast<std::size_t>(count));
++  for (std::uint64_t i = 0; i < count; ++i) {
++    entry item;
++    if (!input.number(length, 2) || !length || length >= MAX_PATH) return false;
++    for (std::uint64_t j = 0; j < length; ++j) {
++      if (!input.number(value, 2)) return false;
++      item.relative_path.push_back(static_cast<wchar_t>(value));
++    }
++    if (!input.number(item.size, 8) || !input.number(value, 4)) return false;
++    item.attributes = static_cast<DWORD>(value);
++    if (!input.number(value, 8)) return false;
++    item.last_write.dwLowDateTime = static_cast<DWORD>(value);
++    item.last_write.dwHighDateTime = static_cast<DWORD>(value >> 32);
++    entries.push_back(std::move(item));
++  }
++  return input.done() && valid_manifest(entries);
++}
++struct read_query { std::uint64_t generation = 0; std::uint32_t index = 0; std::uint64_t offset = 0; std::uint32_t count = 0; };
++inline bytes query(const read_query &value) {
++  bytes out; number(out, value.generation, 8); number(out, value.index, 4);
++  number(out, value.offset, 8); number(out, value.count, 4); return out;
++}
++inline bool query(const bytes &body, read_query &value) {
++  decoder input(body); std::uint64_t index, count;
++  if (!input.number(value.generation, 8) || !input.number(index, 4) || !input.number(value.offset, 8) ||
++      !input.number(count, 4) || !input.done() || count > max_chunk_bytes) return false;
++  value.index = static_cast<std::uint32_t>(index); value.count = static_cast<std::uint32_t>(count); return true;
++}
++inline bool within(const read_query &value, std::uint64_t generation, const std::vector<entry> &entries) {
++  return value.generation && value.generation == generation && value.index < entries.size() &&
++      !entries[value.index].directory() && value.offset <= entries[value.index].size &&
++      value.count <= max_chunk_bytes && value.count <= entries[value.index].size - value.offset;
++}
++inline bytes reply(HRESULT status, const void *data = nullptr, std::size_t size = 0) {
++  bytes out; number(out, static_cast<std::uint32_t>(status), 4);
++  if (data && size <= max_chunk_bytes) out.insert(out.end(), static_cast<const unsigned char *>(data), static_cast<const unsigned char *>(data) + size);
++  return out;
++}
++inline HRESULT reply(const bytes &body, void *data, ULONG count, ULONG &received) {
++  received = 0; decoder input(body); std::uint64_t status;
++  if (!input.number(status, 4) || body.size() - 4 > count) return STG_E_READFAULT;
++  HRESULT result = static_cast<HRESULT>(status);
++  if (FAILED(result)) return result;
++  received = static_cast<ULONG>(body.size() - 4);
++  if (received != count) return STG_E_READFAULT;
++  if (received) std::memcpy(data, body.data() + 4, received);
++  return S_OK;
++}
++
++// Two workers and a bounded queue keep file operations away from UI and video threads.
++class workers {
++public:
++  workers() { for (unsigned i = 0; i < 2; ++i) threads_.emplace_back([this] { run(); }); }
++  ~workers() {
++    { std::lock_guard<std::mutex> lock(mutex_); stop_ = true; queue_.clear(); }
++    ready_.notify_all(); for (auto &thread : threads_) thread.join();
++  }
++  bool post(std::function<void()> task) {
++    std::lock_guard<std::mutex> lock(mutex_);
++    if (stop_ || queue_.size() >= 8) return false;
++    queue_.push_back(std::move(task)); ready_.notify_one(); return true;
++  }
++private:
++  void run() {
++    for (;;) {
++      std::function<void()> task;
++      { std::unique_lock<std::mutex> lock(mutex_); ready_.wait(lock, [this] { return stop_ || !queue_.empty(); });
++        if (stop_) return;
++        task = std::move(queue_.front()); queue_.pop_front(); }
++      try { task(); } catch (...) { /* A failed offer must not terminate the helper. */ }
++    }
++  }
++  std::mutex mutex_; std::condition_variable ready_; bool stop_ = false;
++  std::deque<std::function<void()>> queue_; std::vector<std::thread> threads_;
++};
++}
+diff --git a/src/nvhttp.cpp b/src/nvhttp.cpp
+index 9fb8afe0..4b68446c 100644
+--- a/src/nvhttp.cpp
++++ b/src/nvhttp.cpp
+@@ -61,6 +61,7 @@
+ #include "nvhttp/ai_api.h"
+ #include "nvhttp/apps.h"
+ #include "nvhttp/clipboard_api.h"
++#include "file_clipboard.h"
+ #include "nvhttp/display_control.h"
+ #include "nvhttp/display_scale.h"
+ #include "nvhttp/dynamic_params.h"
+@@ -1145,6 +1146,7 @@ namespace nvhttp {
+     // clients can reuse their existing certificate-authenticated GameStream
+     // channel for large clipboard payloads. The local GUI agent continues to
+     // use the confighttp /api/v1/clipboard/* endpoints on loopback.
++    file_clipboard::register_routes(https_server, is_client_paired);
+     https_server.resource["^/api/v1/clipboard/blob$"]["POST"] = clipboard_api::upload_blob;
+     https_server.resource["^/api/v1/clipboard/blob/([A-Za-z0-9_\\-]{1,128})$"]["GET"] = clipboard_api::get_blob;
+ 
+@@ -1250,6 +1252,7 @@ namespace nvhttp {
+     /* Stop the public HTTP listeners first.  Once their worker threads have
+      * joined, no capability request or route callback can race broker/host
+      * teardown below. */
++    file_clipboard::stop();
+     ai::http::shutdown_streams();
+     https_server.stop();
+     http_server.stop();
+diff --git a/src/stream.cpp b/src/stream.cpp
+index 5f3e4c88..2443ff98 100644
+--- a/src/stream.cpp
++++ b/src/stream.cpp
+@@ -65,6 +65,7 @@ extern "C" {
+ #include "webhook/webhook.h"
+ 
+ #include "clipboard_bridge.h"
++#include "file_clipboard.h"
+ #include "cursor_channel.h"
+ #include "platform/common.h"
+ #include "touch_keyboard_session.h"
+@@ -2442,6 +2443,7 @@ namespace stream {
+ 
+           if (session->lifecycle.state() == session::state_e::STOPPING) {
+             clipboard_bridge::bridge_t::instance().session_stopped(session->launch_session_id);
++            file_clipboard::session_stopped(session->launch_session_id);
+             text_context::bridge_t::instance().session_stopped(session->launch_session_id);
+             cursor_channel::remove_session(session->launch_session_id);
+             pos = server->_sessions->erase(pos);
+@@ -2651,6 +2653,7 @@ namespace stream {
+       // final shutdown path instead, make the same paired lifecycle update here
+       // so capability/session_count cannot retain stale launch IDs.
+       clipboard_bridge::bridge_t::instance().session_stopped(session->launch_session_id);
++            file_clipboard::session_stopped(session->launch_session_id);
+       text_context::bridge_t::instance().session_stopped(session->launch_session_id);
+       cursor_channel::remove_session(session->launch_session_id);
+ 
+@@ -4548,6 +4551,7 @@ namespace stream {
+         session.broadcast_ref->control_server._sessions->push_back(&session);
+       }
+       clipboard_bridge::bridge_t::instance().session_started(session.launch_session_id);
++      if (!session.control_only) file_clipboard::session_started(session.launch_session_id, session.client_cert_uuid);
+ 
+       // 仅控制流会话不启动视频/音频线程
+       if (!session.control_only) {
+diff --git a/tests/unit/test_file_clipboard.cpp b/tests/unit/test_file_clipboard.cpp
+new file mode 100644
+index 00000000..c743f0d7
+--- /dev/null
++++ b/tests/unit/test_file_clipboard.cpp
+@@ -0,0 +1,74 @@
++#ifdef _WIN32
++#include "src/file_clipboard/file_clipboard_wire.h"
++#include "src/file_clipboard.h"
++#include <gtest/gtest.h>
++#include <shlobj.h>
++namespace fc = streaming::file_clipboard;
++namespace wire = fc::wire;
++
++TEST(FileClipboard, RejectsTraversalDevicesAndAmbiguousNames) {
++  for (const auto *name : {L"..\\secret", L"C:\\secret", L"\\server\\file", L"a\\..\\b", L"a/b", L"a:",
++                           L"CON.txt", L"a\\LPT1", L"COM\u00b9.txt", L"a.", L"a ", L"a\\", L"a\\\\b"}) {
++    EXPECT_FALSE(fc::valid_relative_path(name));
++  }
++  EXPECT_FALSE(fc::valid_relative_path(std::wstring(1, wchar_t(0xd800))));
++  EXPECT_TRUE(fc::valid_relative_path(L"\u4e2d\u6587\\file.txt"));
++}
++TEST(FileClipboard, ValidatesDirectoryHierarchyAndCaseInsensitiveCollisions) {
++  EXPECT_FALSE(wire::valid_manifest({{L"missing\\file", 1, FILE_ATTRIBUTE_NORMAL, {}}}));
++  EXPECT_FALSE(wire::valid_manifest({{L"A.txt", 1, FILE_ATTRIBUTE_NORMAL, {}}, {L"a.TXT", 1, FILE_ATTRIBUTE_NORMAL, {}}}));
++  EXPECT_FALSE(wire::valid_manifest({{L"folder", 1, FILE_ATTRIBUTE_DIRECTORY, {}}}));
++  EXPECT_FALSE(wire::valid_manifest({{L"file", UINT64_MAX, FILE_ATTRIBUTE_NORMAL, {}}}));
++  EXPECT_FALSE(wire::valid_manifest({{L"link", 0, FILE_ATTRIBUTE_REPARSE_POINT, {}}}));
++}
++TEST(FileClipboard, ManifestPreservesUnicodeEmptyDirectoriesAnd64BitSizes) {
++  const std::vector<fc::entry> original {{L"\u4e2d\u6587", 0, FILE_ATTRIBUTE_DIRECTORY, {1, 2}},
++      {L"\u4e2d\u6587\\empty", 0, FILE_ATTRIBUTE_DIRECTORY, {}},
++      {L"\u4e2d\u6587\\large.bin", (std::uint64_t(1) << 32) + 27, FILE_ATTRIBUTE_NORMAL, {12, 34}}};
++  auto body = wire::manifest(original); std::vector<fc::entry> decoded;
++  ASSERT_TRUE(wire::manifest(body, decoded)); ASSERT_EQ(decoded.size(), original.size());
++  EXPECT_EQ(decoded[0].relative_path, original[0].relative_path); EXPECT_EQ(decoded[2].size, original[2].size);
++  EXPECT_EQ(decoded[2].last_write.dwHighDateTime, 34u);
++  body.pop_back(); EXPECT_FALSE(wire::manifest(body, decoded));
++}
++TEST(FileClipboard, RejectsTruncatedOversizedAndUnknownFrames) {
++  wire::message decoded; auto data = wire::encode({wire::kind::offer, 18, {1, 2, 3}});
++  ASSERT_TRUE(wire::decode(data, decoded)); EXPECT_EQ(decoded.id, 18u);
++  data.pop_back(); EXPECT_FALSE(wire::decode(data, decoded));
++  data = wire::encode({wire::kind::offer, 18, {}}); data[0] = 255;
++  EXPECT_FALSE(wire::decode(data, decoded));
++  data[0] = 2; data[12] = 255; data[13] = 255; data[14] = 255; data[15] = 127;
++  EXPECT_FALSE(wire::decode(data, decoded));
++}
++TEST(FileClipboard, ReadsCannotEscapeOfferBounds) {
++  const std::vector<fc::entry> entries {{L"empty", 0, FILE_ATTRIBUTE_DIRECTORY, {}}, {L"file", 10, FILE_ATTRIBUTE_NORMAL, {}}};
++  EXPECT_TRUE(wire::within({17, 1, 8, 2}, 17, entries));
++  EXPECT_FALSE(wire::within({16, 1, 8, 2}, 17, entries));
++  EXPECT_FALSE(wire::within({17, 0, 0, 0}, 17, entries));
++  EXPECT_FALSE(wire::within({17, 1, UINT64_MAX, 2}, 17, entries));
++  EXPECT_FALSE(wire::within({17, 1, 8, 3}, 17, entries));
++  wire::read_query query;
++  EXPECT_FALSE(wire::query(wire::query({17, 1, 0, fc::max_chunk_bytes + 1}), query));
++  unsigned char buffer[2]; ULONG got = 0;
++  EXPECT_EQ(wire::reply(wire::reply(S_OK, "x", 1), buffer, 2, got), STG_E_READFAULT);
++  EXPECT_EQ(wire::reply(wire::reply(STG_E_REVERTED), buffer, 2, got), STG_E_REVERTED);
++}
++TEST(FileClipboard, RoutesRequirePairedIdentityAndLiveStream) {
++  web::Server<nvhttp::SunshineHTTPS> server;
++  file_clipboard::register_routes(server, [](std::string_view uuid) { return uuid == "paired-test"; });
++  auto call = [&](std::string uuid) {
++    auto request = std::make_shared<web::Request>(); request->method = "POST";
++    request->path = "/api/v1/clipboard/files/open"; request->client_uuid = std::move(uuid);
++    auto output = std::make_shared<std::string>();
++    web::detail::ResponseChannel channel;
++    channel.send = [output](std::string value, auto done, bool, bool) { *output += value; if (done) done({}); };
++    channel.closed = [] { return false; }; channel.abort = [] {}; channel.begin_stream = [] {};
++    auto response = std::make_shared<web::ServerBase<nvhttp::SunshineHTTPS>::Response>(*request, std::move(channel));
++    server.resource.at("^/api/v1/clipboard/files/open$").at("POST")(response, request); response->send();
++    return *output;
++  };
++  EXPECT_NE(call("").find("403"), std::string::npos);
++  EXPECT_NE(call("unpaired-test").find("403"), std::string::npos);
++  EXPECT_NE(call("paired-test").find("409"), std::string::npos);
++}
++#endif
+diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
+index 4b802cb6..35ba9c44 100644
+--- a/tools/CMakeLists.txt
++++ b/tools/CMakeLists.txt
+@@ -115,3 +115,15 @@ if(WIN32)
+             WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+             COMMENT "Checking Sunshine/VDD IOCTL ABI header sync; set VDD_DRIVER_HEADER when DriverHeader is not passed")
+ endif()
++
++if(WIN32)
++  add_executable(sunshine-file-clipboard file_clipboard_agent.cpp
++      "${CMAKE_SOURCE_DIR}/src/file_clipboard/file_clipboard_native.cpp"
++      "${CMAKE_SOURCE_DIR}/src/file_clipboard/file_clipboard_source.cpp")
++  set_target_properties(sunshine-file-clipboard PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON)
++  target_compile_definitions(sunshine-file-clipboard PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
++  target_link_libraries(sunshine-file-clipboard PRIVATE Threads::Threads ole32 oleaut32 shell32 uuid user32 advapi32 wtsapi32 sunshine_project_options)
++  if(MINGW)
++    target_link_options(sunshine-file-clipboard PRIVATE -municode -static -static-libgcc -static-libstdc++)
++  endif()
++endif()
+\ No newline at end of file
+diff --git a/tools/file_clipboard_agent.cpp b/tools/file_clipboard_agent.cpp
+new file mode 100644
+index 00000000..3b43b1c0
+--- /dev/null
++++ b/tools/file_clipboard_agent.cpp
+@@ -0,0 +1,134 @@
++// Runs in the console user's token; the Sunshine service never opens user files.
++#include "src/file_clipboard/file_clipboard_pipe.h"
++#include <aclapi.h>
++#include <wtsapi32.h>
++#include <map>
++
++namespace fc = streaming::file_clipboard;
++namespace wire = fc::wire;
++namespace {
++struct pending_read {
++  std::mutex mutex; std::condition_variable ready; bool done = false; wire::bytes body;
++};
++struct remote_reader final : fc::reader {
++  std::function<HRESULT(std::size_t, std::uint64_t, void *, ULONG, ULONG &)> read;
++  std::timed_mutex gate;
++  HRESULT read_at(std::size_t index, std::uint64_t offset, void *buffer, ULONG count, ULONG &got) override {
++    got = 0;
++    std::unique_lock<std::timed_mutex> lock(gate, std::defer_lock);
++    if (!lock.try_lock_for(std::chrono::seconds(20))) return STG_E_INUSE;
++    return read(index, offset, buffer, count, got);
++  }
++};
++class agent {
++public:
++  explicit agent(std::shared_ptr<wire::pipe> connection): pipe_(std::move(connection)) {}
++  ~agent() {
++    stopped_ = true; pipe_->stop(); generation_++;
++    publisher_.observe({}); cancel_reads(); publisher_.clear();
++    // Drain callbacks while all state they capture still exists.
++    workers_.reset();
++  }
++  int run() {
++    workers_ = std::make_unique<wire::workers>();
++    publisher_.observe([this](std::uint32_t, std::vector<std::wstring> paths) {
++      auto epoch = ++generation_;
++      cancel_reads();
++      { std::lock_guard<std::mutex> lock(mutex_); source_.reset(); }
++      pipe_->send({wire::kind::offer, 0, {}});
++      if (paths.empty()) return;
++      workers_->post([this, epoch, paths = std::move(paths)] {
++        std::shared_ptr<fc::source_files> source;
++        auto status = fc::source_files::collect(paths, [this, epoch] { return stopped_ || generation_ != epoch; }, source);
++        if (FAILED(status) || generation_ != epoch || stopped_) return;
++        auto manifest = wire::manifest(source->entries());
++        if (manifest.empty()) return;
++        { std::lock_guard<std::mutex> lock(mutex_); if (generation_ != epoch) return; source_ = source; }
++        pipe_->send({wire::kind::offer, epoch, std::move(manifest)});
++      });
++    });
++    if (!pipe_->send({wire::kind::hello, 1, {}})) return 1;
++    wire::message message;
++    while (pipe_->receive(message)) {
++      if (message.type == wire::kind::reply) {
++        std::shared_ptr<pending_read> read;
++        { std::lock_guard<std::mutex> lock(mutex_); auto found = reads_.find(message.id);
++          if (found != reads_.end()) { read = found->second; reads_.erase(found); } }
++        if (read) { { std::lock_guard<std::mutex> lock(read->mutex); read->body = std::move(message.body); read->done = true; } read->ready.notify_all(); }
++      } else if (message.type == wire::kind::publish) {
++        auto value = std::make_shared<fc::offer>();
++        if (!message.id || !wire::manifest(message.body, value->entries) || !fc::interactive_desktop_available()) {
++          publisher_.clear(); cancel_reads(); continue;
++        }
++        generation_++; { std::lock_guard<std::mutex> lock(mutex_); source_.reset(); }
++        cancel_reads();
++        const auto remote_epoch = message.id;
++        auto remote = std::make_shared<remote_reader>();
++        remote->read = [this, remote_epoch](std::size_t index, std::uint64_t offset, void *buffer, ULONG count, ULONG &got) {
++          got = 0;
++          if (stopped_ || !fc::interactive_desktop_available()) return E_ACCESSDENIED;
++          auto request = std::make_shared<pending_read>(); auto id = ++request_id_;
++          { std::lock_guard<std::mutex> lock(mutex_); if (reads_.size() >= 4) return STG_E_INUSE; reads_[id] = request; }
++          if (!pipe_->send({wire::kind::request, id, wire::query({remote_epoch, static_cast<std::uint32_t>(index), offset, count})})) return STG_E_REVERTED;
++          std::unique_lock<std::mutex> lock(request->mutex);
++          bool ready = request->ready.wait_for(lock, std::chrono::seconds(16), [&] { return request->done || stopped_; });
++          lock.unlock();
++          { std::lock_guard<std::mutex> guard(mutex_); reads_.erase(id); }
++          if (!ready || stopped_) return STG_E_REVERTED;
++          return wire::reply(request->body, buffer, count, got);
++        };
++        value->source = remote; publisher_.publish(std::move(value));
++      } else if (message.type == wire::kind::request) {
++        const auto id = message.id; wire::read_query query;
++        std::shared_ptr<fc::source_files> source;
++        { std::lock_guard<std::mutex> lock(mutex_); source = source_; }
++        if (!wire::query(message.body, query) || !source || !wire::within(query, generation_, source->entries())) {
++          pipe_->send({wire::kind::reply, id, wire::reply(STG_E_REVERTED)}); continue;
++        }
++        if (!workers_->post([this, source, query, id] {
++          wire::bytes data(query.count); ULONG got = 0;
++          auto status = generation_ == query.generation ? source->read_at(query.index, query.offset, data.data(), query.count, got) : STG_E_REVERTED;
++          if (generation_ != query.generation) status = STG_E_REVERTED;
++          pipe_->send({wire::kind::reply, id, wire::reply(status, data.data(), SUCCEEDED(status) ? got : 0)});
++        })) pipe_->send({wire::kind::reply, id, wire::reply(STG_E_INUSE)});
++      }
++    }
++    return 0;
++  }
++private:
++  void cancel_reads() {
++    std::map<std::uint64_t, std::shared_ptr<pending_read>> reads;
++    { std::lock_guard<std::mutex> lock(mutex_); reads.swap(reads_); }
++    for (auto &[id, read] : reads) {
++      { std::lock_guard<std::mutex> lock(read->mutex); read->body = wire::reply(STG_E_REVERTED); read->done = true; }
++      read->ready.notify_all();
++    }
++  }
++  std::shared_ptr<wire::pipe> pipe_; std::mutex mutex_;
++  std::atomic<bool> stopped_ {false}; std::atomic<std::uint64_t> generation_ {1}, request_id_ {1};
++  std::shared_ptr<fc::source_files> source_; std::map<std::uint64_t, std::shared_ptr<pending_read>> reads_;
++  fc::publisher publisher_; std::unique_ptr<wire::workers> workers_;
++};
++}
++int wmain(int argc, wchar_t **argv) {
++  if (argc != 3) return 2;
++  const std::wstring name = argv[1];
++  if (name.rfind(L"\\\\.\\pipe\\SunshineFileClipboard-", 0) != 0) return 2;
++  wchar_t *end = nullptr; auto expected = wcstoul(argv[2], &end, 10);
++  if (!expected || !end || *end) return 2;
++  HANDLE handle = CreateFileW(name.c_str(), GENERIC_READ | GENERIC_WRITE | READ_CONTROL, 0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
++  if (handle == INVALID_HANDLE_VALUE) return 3;
++  ULONG actual = 0;
++  if (!GetNamedPipeServerProcessId(handle, &actual) || actual != expected) { CloseHandle(handle); return 4; }
++  // A standard user's token cannot inspect the restricted service process.
++  // Authenticate the kernel pipe's SYSTEM owner and server session instead;
++  // no process ACL or user privilege is relaxed for the clipboard helper.
++  ULONG session = MAXDWORD; PSID owner = nullptr; PSECURITY_DESCRIPTOR security = nullptr;
++  if (!GetNamedPipeServerSessionId(handle, &session) || session != 0) { CloseHandle(handle); return 5; }
++  const auto status = GetSecurityInfo(handle, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, &owner,
++                                     nullptr, nullptr, nullptr, &security);
++  bool valid = status == ERROR_SUCCESS && owner && IsWellKnownSid(owner, WinLocalSystemSid);
++  if (security) LocalFree(security);
++  if (!valid) { CloseHandle(handle); return status == ERROR_SUCCESS ? 6 : 0x10000 | status; }
++  agent application(std::make_shared<wire::pipe>(handle)); return application.run();
++}

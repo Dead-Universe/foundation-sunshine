@@ -1,0 +1,65 @@
+diff --git a/app/streaming/video/ffmpeg-renderers/d3d11va.cpp b/app/streaming/video/ffmpeg-renderers/d3d11va.cpp
+index 1ae4879a1ad89825d17b557432ff4143afe2d6bd..8c1eaccebe7b84aa317c573b59380595f1a34f93 100644
+--- a/app/streaming/video/ffmpeg-renderers/d3d11va.cpp
++++ b/app/streaming/video/ffmpeg-renderers/d3d11va.cpp
+@@ -814,6 +814,10 @@ bool D3D11VARenderer::prepareDecoderContext(AVCodecContext* context, AVDictionar
+ 
+ bool D3D11VARenderer::prepareDecoderContextInGetFormat(AVCodecContext *context, AVPixelFormat pixelFormat)
+ {
++    std::lock_guard<std::mutex> renderLock(m_RenderLock);
++    lockContext(this);
++    const auto contextUnlock = qScopeGuard([this] { unlockContext(this); });
++
+     // Create a new hardware frames context suitable for decoding our specified format
+     av_buffer_unref(&context->hw_frames_ctx);
+     int err = avcodec_get_hw_frames_parameters(context, m_HwDeviceContext, pixelFormat, &context->hw_frames_ctx);
+@@ -861,6 +865,8 @@ bool D3D11VARenderer::prepareDecoderContextInGetFormat(AVCodecContext *context,
+ 
+ void D3D11VARenderer::renderFrame(AVFrame* frame)
+ {
++    std::lock_guard<std::mutex> renderLock(m_RenderLock);
++
+     if (m_RenderResetPending) {
+         return;
+     }
+@@ -1405,6 +1411,8 @@ bool D3D11VARenderer::createOverlayVertexBuffer(Overlay::OverlayType type, int w
+ 
+ bool D3D11VARenderer::notifyWindowChanged(PWINDOW_STATE_CHANGE_INFO stateInfo)
+ {
++    std::lock_guard<std::mutex> renderLock(m_RenderLock);
++
+     if (stateInfo->stateChangeFlags & WINDOW_STATE_CHANGE_DISPLAY) {
+         int adapterIndex, outputIndex;
+         if (!SDL_DXGIGetOutputInfo(stateInfo->displayIndex,
+@@ -2191,6 +2199,10 @@ bool D3D11VARenderer::needsTestFrame()
+ 
+ void D3D11VARenderer::setHdrMode(bool enabled)
+ {
++    std::lock_guard<std::mutex> renderLock(m_RenderLock);
++    lockContext(this);
++    const auto contextUnlock = qScopeGuard([this] { unlockContext(this); });
++
+     auto clearVideoProcessorOutputHdrMetadata = [this]() {
+         if (m_VideoProcessor && m_VideoContext) {
+             m_VideoContext->VideoProcessorSetOutputHDRMetaData(
+diff --git a/app/streaming/video/ffmpeg-renderers/d3d11va.h b/app/streaming/video/ffmpeg-renderers/d3d11va.h
+index 37d13f9891b284d1c10a800a03e1140e99553f4f..fd7349306ac5af692add1dc142ba465aa870ca6f 100644
+--- a/app/streaming/video/ffmpeg-renderers/d3d11va.h
++++ b/app/streaming/video/ffmpeg-renderers/d3d11va.h
+@@ -5,6 +5,7 @@
+ #include <d3d11_4.h>
+ #include <dxgi1_6.h>
+ #include <CGuid.h>
++#include <mutex>
+ #include "streaming/video/videoenhancement.h"
+ #include "amfsession.h"
+ 
+@@ -101,6 +102,8 @@ private:
+     UINT64 m_D2RFenceValue;
+     Microsoft::WRL::ComPtr<ID3D11Fence> m_DecodeR2DFence, m_RenderR2DFence;
+     UINT64 m_R2DFenceValue;
++    // Acquire before m_ContextLock to serialize render, HDR and window updates.
++    std::mutex m_RenderLock;
+     SDL_mutex* m_ContextLock;
+     bool m_BindDecoderOutputTextures;
+     bool m_UseFenceHack;
