@@ -26,3 +26,28 @@ TEST(VideoProbe, EmptyCaptureReadyListUsesBackendAutoselection) {
   const std::array<std::string, 0> displays {};
   EXPECT_TRUE(video::select_encoder_probe_display(R"(\\.\DISPLAY18)", displays).empty());
 }
+
+TEST(VideoProbe, AutoServiceUsesVddWhenDdxIsUnavailable) {
+  EXPECT_TRUE(video::should_try_vdd_auto_fallback(true, false, false, false, false));
+}
+
+TEST(VideoProbe, AutoServiceKeepsDdxWhenCaptureIsReady) {
+  EXPECT_FALSE(video::should_try_vdd_auto_fallback(true, false, true, false, false));
+}
+
+TEST(VideoProbe, AutoInteractiveWaitsForStandardProbe) {
+  EXPECT_FALSE(video::should_try_vdd_auto_fallback(false, false, false, false, false));
+}
+
+TEST(VideoProbe, AutoInteractiveUsesVddAfterStandardProbeFails) {
+  EXPECT_TRUE(video::should_try_vdd_auto_fallback(false, false, false, true, false));
+}
+
+TEST(VideoProbe, AutoInteractiveKeepsStandardCaptureAfterProbeSucceeds) {
+  EXPECT_FALSE(video::should_try_vdd_auto_fallback(false, false, false, true, true));
+}
+
+TEST(VideoProbe, ExplicitOutputDisablesAutomaticVddSwitch) {
+  EXPECT_FALSE(video::should_try_vdd_auto_fallback(true, true, false, false, false));
+  EXPECT_FALSE(video::should_try_vdd_auto_fallback(false, true, false, true, false));
+}
