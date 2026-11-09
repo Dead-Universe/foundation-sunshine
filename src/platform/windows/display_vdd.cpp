@@ -15,10 +15,13 @@
 
 #include "display.h"
 #include "misc.h"
+#include "console_input_bridge.h"
+#include "service_vdd.h"
 #include "src/config.h"
 #include "src/display_device/vdd_ioctl.h"
 #include "src/main.h"
 #include "vdd_frame_channel.h"
+#include "vdd_cursor_security.h"
 
 #include <d3d11_1.h>
 #include <sddl.h>
@@ -397,6 +400,21 @@ namespace platf::dxgi {
       UnmapViewOfFile(cursor_mapping);
       CloseHandle(cursor_meta);
       return false;
+    }
+
+    // Keep a surviving legacy cursor object reopenable by its LocalService
+    // producer when IddCx replaces the swap chain during a console handoff.
+    for (const bool event : {false, true}) {
+      bool changed = false;
+      const DWORD status = vdd_cursor_security::preserve_producer_access(
+        event ? cursor_event_name.c_str() : cursor_meta_name.c_str(), event, changed);
+      if (changed) {
+        BOOST_LOG(info) << "[vdd_capture] preserved legacy cursor "sv
+                        << (event ? "event" : "mapping") << " producer access for monitor "sv << m_monitorIdx;
+      }
+      else if (status != ERROR_SUCCESS && status != ERROR_NOT_SUPPORTED) {
+        BOOST_LOG(debug) << "[vdd_capture] cursor producer-access compatibility check: "sv << status;
+      }
     }
 
     m_hCursorMeta = cursor_meta;
@@ -1204,13 +1222,20 @@ namespace platf::dxgi {
                                  const display_device::vdd_ioctl::frame_channel_caps &sealed_caps,
                                  unsigned int target_w,
                                  unsigned int target_h,
-                                 unsigned int max_probe) {
+                                 unsigned int max_probe,
+                                 bool report_failures = false) {
     vdd_probe_result_t result;
 
     const UINT32 desired_slots = std::min<UINT32>(vdd_frame_channel::max_shared_slots, sealed_caps.max_shared_slots);
     for (unsigned int i = 0; i < max_probe; ++i) {
       display_device::vdd_ioctl::frame_channel_open_response sealed_channel;
-      const auto open_status = open_sealed_frame_channel(i, device_luid, desired_slots, sealed_channel, false);
+      const auto open_status = open_sealed_frame_channel(i, device_luid, desired_slots, sealed_channel, report_failures);
+      if (report_failures) {
+        BOOST_LOG(warning) << "[vdd] producer discovery: monitor="sv << i
+                           << " status="sv << display_device::vdd_ioctl::frame_channel_open_status_name(open_status)
+                           << " target="sv << target_w << 'x' << target_h
+                           << " device_luid="sv << device_luid.LowPart << ':' << device_luid.HighPart;
+      }
       if (open_status == display_device::vdd_ioctl::frame_channel_open_status::unsupported ||
           open_status == display_device::vdd_ioctl::frame_channel_open_status::interface_missing) {
         close_sealed_frame_channel_handles(sealed_channel);
@@ -1245,6 +1270,13 @@ namespace platf::dxgi {
       UnmapViewOfFile(p_meta);
       close_sealed_frame_channel_handles(sealed_channel);
       if (!valid) {
+        if (report_failures) {
+          BOOST_LOG(warning) << "[vdd] producer metadata rejected: monitor="sv << i
+                             << " stable="sv << stable << " reason="sv << static_cast<int>(validation.reason)
+                             << " producer_luid="sv << meta_snapshot.AdapterLuidLowPart << ':' << meta_snapshot.AdapterLuidHighPart
+                             << " size="sv << meta_snapshot.Width << 'x' << meta_snapshot.Height
+                             << " metadata_size="sv << meta_snapshot.MetadataSize;
+        }
         BOOST_LOG(debug) << "[vdd] sealed probe rejected monitor "sv << i
                          << " stable="sv << stable
                          << " reason="sv << static_cast<int>(validation.reason);
@@ -1336,8 +1368,9 @@ namespace platf::dxgi {
     vdd_probe_result_t last_result;
     const auto deadline = deadline_override.value_or(std::chrono::steady_clock::now() + vdd_producer_discovery_window);
 
+    bool report_failures = false;
     for (;;) {
-      last_result = probe_sealed_vdd_monitor_index(*device_luid, sealed_caps, target_w, target_h, max_probe);
+      last_result = probe_sealed_vdd_monitor_index(*device_luid, sealed_caps, target_w, target_h, max_probe, report_failures);
       const auto selection = vdd_frame_channel::select_producer(
         last_result.exact,
         last_result.only_valid,
@@ -1357,8 +1390,13 @@ namespace platf::dxgi {
         return selection;
       }
 
-      if (std::chrono::steady_clock::now() >= deadline) {
+      if (report_failures) {
         break;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) {
+        // Report one final probe instead of flooding the log on every retry.
+        report_failures = true;
+        continue;
       }
 
       std::this_thread::sleep_for(vdd_producer_discovery_retry_delay);
@@ -1377,8 +1415,80 @@ namespace platf::dxgi {
     return {};
   }
 
+  bool
+  display_vdd_vram_t::init_headless_target(const ::video::config_t &config) {
+    if (!console_input_bridge::needs_forwarding()) return false;
+    display_device::vdd_ioctl::frame_channel_caps caps {};
+    if (probe_sealed_frame_channel(caps) != vdd_frame_channel::channel_selection::unknown) return false;
+    const auto deadline = GetTickCount64() + 5000;
+    for (;;) {
+    adapter_t selected_adapter;
+    SharedFrameMetadata selected {};
+    unsigned int selected_monitor = 0;
+    unsigned int matches = 0;
+    const auto configured_adapter = from_utf8(config::video.adapter_name);
+    for (unsigned int index = 0; index < 32; ++index) {
+      adapter_t candidate;
+      const auto hr = factory->EnumAdapters1(index, &candidate);
+      if (hr != S_OK) break;
+      DXGI_ADAPTER_DESC1 desc {};
+      if (FAILED(candidate->GetDesc1(&desc)) || (!configured_adapter.empty() && configured_adapter != desc.Description)) continue;
+      for (unsigned int monitor = 0; monitor < 16; ++monitor) {
+        display_device::vdd_ioctl::frame_channel_open_response channel {};
+        if (open_sealed_frame_channel(monitor, desc.AdapterLuid, caps.max_shared_slots, channel, false) != display_device::vdd_ioctl::frame_channel_open_status::opened) continue;
+        auto close_channel = util::fail_guard([&]() { close_sealed_frame_channel_handles(channel); });
+        auto view = static_cast<const SharedFrameMetadata *>(MapViewOfFile(reinterpret_cast<HANDLE>(channel.metadata_handle), FILE_MAP_READ, 0, 0, sizeof(SharedFrameMetadata)));
+        if (!view) continue;
+        SharedFrameMetadata meta {};
+        const bool valid = vdd_frame_channel::read_stable_metadata(view, meta) && vdd_metadata_is_attachable(meta, desc.AdapterLuid);
+        UnmapViewOfFile(view);
+        if (!valid) continue;
+        if (++matches != 1) {
+          BOOST_LOG(error) << "[vdd] Multiple sealed producers are visible across sessions; refusing an ambiguous capture target"sv;
+          return false;
+        }
+        selected_adapter = std::move(candidate);
+        selected = meta;
+        selected_monitor = monitor;
+        // Keep enumerating this adapter with a separate COM reference.
+        if (FAILED(selected_adapter->QueryInterface(IID_IDXGIAdapter1, reinterpret_cast<void **>(&candidate)))) return false;
+      }
+    }
+    if (matches != 1) {
+      if (!console_input_bridge::persistent_service_core || GetTickCount64() >= deadline) return false;
+      Sleep(100);
+      continue;
+    }
+    adapter = std::move(selected_adapter);
+    monitor_idx = selected_monitor;
+    width = width_before_rotation = env_width = selected.Width;
+    height = height_before_rotation = env_height = selected.Height;
+    offset_x = offset_y = 0;
+    display_rotation = DXGI_MODE_ROTATION_IDENTITY;
+    display_refresh_rate = {static_cast<UINT>(std::max(config.framerate, 1)), 1};
+    display_refresh_rate_rounded = std::max(config.framerate, 1);
+    BOOST_LOG(info) << "[vdd] Restoring sealed capture across Windows sessions without a session-local DXGI output: monitor="sv
+                    << monitor_idx << " size="sv << width << 'x' << height;
+    return true;
+    }
+  }
+
   int
   display_vdd_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
+    if (!service_vdd::refresh_console_producer()) return -1;
+    service_capture_epoch = service_vdd::capture_epoch.load(std::memory_order_acquire);
+    // Direct VDD selection bypasses the DDX retry that normally wakes the
+    // display. After idle power-off, IddCx exposes the output but publishes no
+    // frame channel until the interactive session's display is awake again.
+    // This one-shot request resets the idle timer without changing persistent
+    // thread execution flags or the user's display-sleep policy.
+    if (!SetThreadExecutionState(ES_DISPLAY_REQUIRED)) {
+      BOOST_LOG(warning) << "[vdd] Failed to reset display idle timer before producer discovery"sv;
+    }
+    else {
+      BOOST_LOG(info) << "[vdd] Display wake requested before producer discovery"sv;
+    }
+
     if (display_base_t::init(config, display_name)) {
       BOOST_LOG(error) << "[vdd] display_base_t::init failed for "sv << display_name;
       return -1;
@@ -1505,6 +1615,10 @@ namespace platf::dxgi {
                     << " producer_slots="sv << dup.producer_slot_count()
                     << " generation="sv << dup.producer_channel_generation()
                     << " borrowed_texture="sv << vdd_borrow_enabled;
+
+    if (!dup.legacy_named_channel() && console_input_bridge::enable_for_sealed_vdd()) {
+      BOOST_LOG(info) << "[vdd] Session-independent capture and console input helper are ready"sv;
+    }
 
     // Cursor export is optional and older drivers do not expose it. Likewise,
     // a cursor-only shader failure must not take down otherwise valid capture.
