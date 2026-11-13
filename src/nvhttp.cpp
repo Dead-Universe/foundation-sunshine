@@ -61,6 +61,7 @@
 #include "nvhttp/ai_api.h"
 #include "nvhttp/apps.h"
 #include "nvhttp/clipboard_api.h"
+#include "file_clipboard.h"
 #include "nvhttp/display_control.h"
 #include "nvhttp/display_scale.h"
 #include "nvhttp/dynamic_params.h"
@@ -1145,6 +1146,7 @@ namespace nvhttp {
     // clients can reuse their existing certificate-authenticated GameStream
     // channel for large clipboard payloads. The local GUI agent continues to
     // use the confighttp /api/v1/clipboard/* endpoints on loopback.
+    file_clipboard::register_routes(https_server, is_client_paired);
     https_server.resource["^/api/v1/clipboard/blob$"]["POST"] = clipboard_api::upload_blob;
     https_server.resource["^/api/v1/clipboard/blob/([A-Za-z0-9_\\-]{1,128})$"]["GET"] = clipboard_api::get_blob;
 
@@ -1250,6 +1252,7 @@ namespace nvhttp {
     /* Stop the public HTTP listeners first.  Once their worker threads have
      * joined, no capability request or route callback can race broker/host
      * teardown below. */
+    file_clipboard::stop();
     ai::http::shutdown_streams();
     https_server.stop();
     http_server.stop();
