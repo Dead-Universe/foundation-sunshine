@@ -9,6 +9,22 @@
 
 namespace sunshinesvc {
 
+  constexpr bool should_retain_transport(bool streaming_active, bool sealed_capture_ready, bool console_input_ready) {
+    return streaming_active && sealed_capture_ready && console_input_ready;
+  }
+
+  enum class ConsoleSessionAction { keep_core, probe_again, restart_core };
+
+  constexpr ConsoleSessionAction console_session_action(std::uint32_t core_session,
+                                                       std::uint32_t active_console,
+                                                       bool sealed_capture_and_input_ready,
+                                                       bool persistent_service_core = false) {
+    if (active_console == UINT32_MAX) return ConsoleSessionAction::probe_again;
+    if (persistent_service_core && core_session == 0) return ConsoleSessionAction::keep_core;
+    if (active_console == core_session || sealed_capture_and_input_ready) return ConsoleSessionAction::keep_core;
+    return ConsoleSessionAction::restart_core;
+  }
+
   constexpr std::uint32_t GUI_RESTART_INITIAL_DELAY_MS = 1000;
   constexpr std::uint32_t GUI_RESTART_MAX_DELAY_MS = 30000;
   constexpr std::uint64_t GUI_RESTART_STABLE_RUNTIME_MS = 60000;

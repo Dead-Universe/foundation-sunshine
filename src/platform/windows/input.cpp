@@ -20,6 +20,7 @@
 #include "src/ds5/config.h"
 #include "keylayout.h"
 #include "misc.h"
+#include "console_input_bridge.h"
 #include "virtual_mouse.h"
 #include "src/config.h"
 #include "src/globals.h"
@@ -648,6 +649,17 @@ namespace platf {
    */
   void
   send_input(INPUT &i) {
+    if (console_input_bridge::needs_forwarding()) {
+      if (!console_input_bridge::helper().send(i)) {
+        static std::atomic<ULONGLONG> last_warning {0};
+        const auto now = GetTickCount64();
+        if (now - last_warning.load(std::memory_order_relaxed) > 5000) {
+          last_warning.store(now, std::memory_order_relaxed);
+          BOOST_LOG(warning) << "[console-input] Active-console helper unavailable; input was not sent to the old session"sv;
+        }
+      }
+      return;
+    }
   retry:
     auto send = SendInput(1, &i, sizeof(INPUT));
     if (send != 1) {

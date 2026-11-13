@@ -67,3 +67,57 @@ TEST(GuiAgentCrashLogLimiter, LogsStateChangesAndPeriodicReminders) {
   limiter.reset();
   EXPECT_TRUE(limiter.should_log_acquisition(false));
 }
+
+TEST(ConsoleSessionAction, SealedVddSurvivesCapturedConsoleRoundTrip) {
+  using A = sunshinesvc::ConsoleSessionAction;
+  for (auto target : std::array<std::uint32_t, 5>{1, UINT32_MAX, 4, UINT32_MAX, 1}) {
+    EXPECT_NE(sunshinesvc::console_session_action(1, target, true), A::restart_core);
+  }
+}
+
+TEST(ConsoleSessionAction, StandardCaptureStillMovesToAnotherSession) {
+  using A = sunshinesvc::ConsoleSessionAction;
+  EXPECT_EQ(sunshinesvc::console_session_action(1, 1, false), A::keep_core);
+  EXPECT_EQ(sunshinesvc::console_session_action(1, 4, false), A::restart_core);
+}
+
+TEST(ConsoleSessionAction, ServiceCoreSurvivesAnonymousSessionRetirementEvenWhileIdle) {
+  using A = sunshinesvc::ConsoleSessionAction;
+  // Captured terminal-session trace: the anonymous console is retired when
+  // credentials reconnect the existing RDP user. Core must already be in 0.
+  for (bool media_ready : {false, true}) {
+    for (auto target : std::array<std::uint32_t, 5>{2, UINT32_MAX, 4, UINT32_MAX, 2}) {
+      EXPECT_NE(sunshinesvc::console_session_action(0, target, media_ready, true), A::restart_core);
+    }
+  }
+}
+
+TEST(ConsoleSessionAction, PersistentPolicyCannotMakeAnInteractiveCoreDurable) {
+  using A = sunshinesvc::ConsoleSessionAction;
+  EXPECT_EQ(sunshinesvc::console_session_action(4, 2, false, true), A::restart_core);
+  EXPECT_EQ(sunshinesvc::console_session_action(0, 2, false, false), A::restart_core);
+}
+
+TEST(ConsoleSessionAction, InvalidConsoleNeverTerminatesEitherCaptureMode) {
+  using A = sunshinesvc::ConsoleSessionAction;
+  EXPECT_EQ(sunshinesvc::console_session_action(1, UINT32_MAX, false), A::probe_again);
+  EXPECT_EQ(sunshinesvc::console_session_action(1, UINT32_MAX, true), A::probe_again);
+}
+TEST(ConsoleTransportReadiness, EncoderPreflightDoesNotPinAnIdleCore) {
+  using A = sunshinesvc::ConsoleSessionAction;
+  const bool preflight_only = sunshinesvc::should_retain_transport(false, true, true);
+  EXPECT_FALSE(preflight_only);
+  EXPECT_EQ(sunshinesvc::console_session_action(1, 3, preflight_only), A::restart_core);
+  EXPECT_FALSE(sunshinesvc::should_retain_transport(true, false, true));
+  EXPECT_FALSE(sunshinesvc::should_retain_transport(true, true, false));
+}
+
+TEST(ConsoleTransportReadiness, ActiveLoginStreamSurvivesUntilItsLastMediaSessionStops) {
+  using A = sunshinesvc::ConsoleSessionAction;
+  const bool streaming = sunshinesvc::should_retain_transport(true, true, true);
+  EXPECT_TRUE(streaming);
+  EXPECT_EQ(sunshinesvc::console_session_action(3, UINT32_MAX, streaming), A::probe_again);
+  EXPECT_EQ(sunshinesvc::console_session_action(3, 1, streaming), A::keep_core);
+  const bool stopped = sunshinesvc::should_retain_transport(false, true, true);
+  EXPECT_EQ(sunshinesvc::console_session_action(3, 1, stopped), A::restart_core);
+}
