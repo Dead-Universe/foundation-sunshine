@@ -11,6 +11,9 @@
 
 #include <algorithm>
 #include <limits>
+#ifdef _WIN32
+  #include <windows.h>
+#endif
 
 namespace {
 
@@ -241,6 +244,12 @@ INSTANTIATE_TEST_SUITE_P(
   [](const auto &info) { return std::string(info.param->name); });
 
 TEST_P(EncoderTest, ValidateEncoder) {
+#ifdef _WIN32
+  DWORD session_id = 0;
+  if (ProcessIdToSessionId(GetCurrentProcessId(), &session_id) && session_id == 0) {
+    GTEST_SKIP() << "Hardware desktop capture requires an interactive Windows session; Session 0 cannot enumerate DXGI outputs";
+  }
+#endif
   auto &encoder = *GetParam();
   const auto probe_display_name = display_device::get_display_name(config::video.output_name);
   const bool available = video::validate_encoder(encoder, false, std::nullopt, probe_display_name);
@@ -286,3 +295,27 @@ TEST(HdrPipelineStatus, LiveControlsValidateAndPreserveNewerRequests) {
   EXPECT_FLOAT_EQ(video::requested_nr_settings(id)->intensity, 0.5f);
   video::unregister_hdr_pipeline_status(id);
 }
+
+#ifdef _WIN32
+// EnumOutputs is documented to return NOT_CURRENTLY_AVAILABLE in Session 0.
+// Exercise the real failure path so a capture probe cannot dereference its output.
+TEST_F(PlatformTestSuite, SessionZeroDxgiCaptureReturnsUnavailable) {
+  DWORD session_id = 0;
+  ASSERT_TRUE(ProcessIdToSessionId(GetCurrentProcessId(), &session_id));
+  if (session_id != 0) {
+    GTEST_SKIP() << "This regression requires Session 0";
+  }
+  video::config_t config {1920, 1080, 60, 1000, 1, 1, 1, 0, 0, 0, 0};
+  config.capture_backend_override = "ddx";
+  EXPECT_EQ(platf::display(platf::mem_type_e::dxgi, {}, config), nullptr);
+}
+
+TEST_F(PlatformTestSuite, SessionZeroDxgiDisplayEnumerationReturnsEmpty) {
+  DWORD session_id = 0;
+  ASSERT_TRUE(ProcessIdToSessionId(GetCurrentProcessId(), &session_id));
+  if (session_id != 0) {
+    GTEST_SKIP() << "This regression requires Session 0";
+  }
+  EXPECT_TRUE(platf::display_names(platf::mem_type_e::dxgi).empty());
+}
+#endif
