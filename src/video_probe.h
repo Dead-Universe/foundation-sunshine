@@ -23,4 +23,26 @@ namespace video {
     return {};
   }
 
+  inline bool
+  should_try_vdd_auto_fallback(
+    bool running_as_system,
+    bool output_is_explicit,
+    bool ddx_capture_ready,
+    bool standard_probe_finished,
+    bool standard_probe_succeeded) {
+    if (output_is_explicit) {
+      return false;
+    }
+
+    if (running_as_system) {
+      // WGC is unavailable in service mode. If no output passed the DDX
+      // preflight, VDD is the only remaining Windows capture path.
+      return !ddx_capture_ready;
+    }
+
+    // In an interactive session, preserve the existing DDX -> WGC order first.
+    // Only try VDD after that complete standard probe has actually failed.
+    return standard_probe_finished && !standard_probe_succeeded;
+  }
+
 }  // namespace video

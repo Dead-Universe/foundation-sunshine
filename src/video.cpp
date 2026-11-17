@@ -75,21 +75,6 @@ namespace video {
     std::map<std::uint64_t, hdr_pipeline_status_t> hdr_pipeline_statuses;
     std::atomic<std::uint64_t> next_hdr_pipeline_status_id { 1 };
 
-    std::optional<std::string>
-    capture_override_for_encoder_probe() {
-#ifdef _WIN32
-      // VDD shared-texture producer may not be ready (metadata mapping / KeyedMutex
-      // not yet published) at encoder-probe time. Probing the real VDD backend
-      // therefore tends to fail on cold start, even though runtime capture works
-      // fine once the producer comes up. Fall back to ddx for the probe only;
-      // this override is injected per-display via config_t::capture_backend_override
-      // so it does not mutate the global config::video.capture used at runtime.
-      if (config::video.capture == "vdd") {
-        return std::string { "ddx" };
-      }
-#endif
-      return std::nullopt;
-    }
 
     /** Serialises the startup/stream probe with the health check's probes. */
     std::timed_mutex &
@@ -5209,13 +5194,12 @@ namespace video {
       return result;
     }
     const auto begin = std::chrono::steady_clock::now();
-    const auto capture_override = capture_override_for_encoder_probe();
     const auto display_name = display_device::get_display_name(config::video.output_name);
     // The copy keeps the host's own capability flags untouched.
     encoder_t probe = **found;
     std::string failure;
     result.ran = true;
-    result.usable = validate_encoder_detailed(probe, false, capture_override, display_name, &failure, true);
+    result.usable = validate_encoder_detailed(probe, false, std::nullopt, display_name, &failure, true);
     result.failure = result.usable ? std::string {} : (failure.empty() ? std::string { "h264_session" } : failure);
     auto codec = [](const auto &flags, bool tested) {
       doctor_codec_result_t out;
@@ -5251,11 +5235,6 @@ namespace video {
     const encoder_t *encoder = chosen_for_doctor ? chosen_for_doctor.get() : encoders.front();
     config_t config { 1920, 1080, 60, 1000, 1, 1, 0, 0, 0, 0, 0 };
     result.method = config::video.capture.empty() ? std::string { "auto" } : config::video.capture;
-    // The VDD producer only publishes frames during a stream; capture through its probe stand-in, like the encoder probe.
-    if (const auto stand_in = capture_override_for_encoder_probe()) {
-      config.capture_backend_override = *stand_in;
-      result.method += " → " + *stand_in;
-    }
     result.display = display_device::get_display_name(config::video.output_name);
     const auto begin = std::chrono::steady_clock::now();
     auto disp = platf::display(encoder->platform_formats->dev_type, result.display, config);
@@ -5343,8 +5322,6 @@ namespace video {
       return 0;
     }
 
-    const auto probe_capture_override = capture_override_for_encoder_probe();
-
 #ifdef _WIN32
     // Reuse CUDA interop across this probe's short-lived 10-bit 4:4:4
     // candidates, but release it on every exit when no real encoder needs it.
@@ -5367,42 +5344,7 @@ namespace video {
       return -1;
     }
     auto probe_display_name = configured_display_name;
-    if (probe_capture_override) {
-      // The Windows implementation enumerates all DXGI capture-ready outputs
-      // regardless of memory type, so one pass serves every encoder candidate.
-      const auto capture_ready_displays = encoder_list.empty() ?
-                                            std::vector<std::string> {} :
-                                            platf::display_names(encoder_list.front()->platform_formats->dev_type);
-      const bool exact_target_unavailable = target_requires_exact_resolution &&
-                                            std::ranges::find(capture_ready_displays, configured_display_name) == capture_ready_displays.end();
-      if (exact_target_unavailable) {
-        last_encoder_probe_result = {
-          probe_error_e::no_active_display,
-          "The requested display is not available to the encoder probe capture backend.",
-          "Connect or enable the selected display, then try again."
-        };
-        BOOST_LOG(error) << "Requested output ["sv << configured_output_name
-                         << "] is unavailable to temporary capture backend ["sv
-                         << *probe_capture_override << "]"sv;
-        return -1;
-      }
-      probe_display_name = select_encoder_probe_display(configured_display_name, capture_ready_displays);
-      if (target && target->policy != probe_target_policy_e::backend_autoselect &&
-          !configured_output_name.empty() && configured_display_name.empty()) {
-        BOOST_LOG(warning) << "Configured output ["sv << configured_output_name
-                           << "] could not be resolved for temporary capture backend ["sv
-                           << *probe_capture_override
-                           << "]; encoder probing will use backend display auto-selection"sv;
-      }
-      else if (target && target->policy != probe_target_policy_e::backend_autoselect &&
-               !configured_display_name.empty() && probe_display_name.empty()) {
-        BOOST_LOG(warning) << "Configured output ["sv << configured_display_name
-                           << "] is unavailable to temporary capture backend ["sv
-                           << *probe_capture_override
-                           << "]; encoder probing will use backend display auto-selection"sv;
-      }
-    }
-    else if (target && target->policy == probe_target_policy_e::vdd_compatible && configured_display_name.empty()) {
+    if (target && target->policy == probe_target_policy_e::vdd_compatible && configured_display_name.empty()) {
       last_encoder_probe_result = {
         probe_error_e::no_active_display,
         "The requested display is not connected or active for encoder probing.",
@@ -5419,7 +5361,6 @@ namespace video {
 #endif
     fingerprint.options = probe_options_digest();
     fingerprint.capture_backend = config::video.capture;
-    fingerprint.probe_capture = probe_capture_override.value_or(std::string {});
     fingerprint.probe_display = probe_display_name;
     fingerprint.desktop = desktop_facts();
     if (target) {
@@ -5477,7 +5418,7 @@ namespace video {
           if (!validate_encoder(
                 *encoder,
                 expect_failure_for(encoder),
-                probe_capture_override,
+                std::nullopt,
                 probe_display_name)) {
             pos = encoder_list.erase(pos);
             break;
@@ -5509,7 +5450,7 @@ namespace video {
         if (!validate_encoder(
               *encoder,
               expect_failure_for(encoder),
-              probe_capture_override,
+              std::nullopt,
               probe_display_name)) {
           pos = encoder_list.erase(pos);
           continue;
@@ -5550,7 +5491,7 @@ namespace video {
         if (!validate_encoder(
               *encoder,
               expect_failure_for(encoder),
-              probe_capture_override,
+              std::nullopt,
               probe_display_name)) {
           pos = encoder_list.erase(pos);
           continue;
