@@ -31,6 +31,7 @@ typedef enum _D3DKMT_GPU_PREFERENCE_QUERY_STATE: DWORD {
 #include "display.h"
 #include "display_device/windows_utils.h"
 #include "misc.h"
+#include "console_input_bridge.h"
 #include "src/config.h"
 #include "src/cursor_channel.h"
 #include "src/display_device/display_device.h"
@@ -651,6 +652,11 @@ namespace platf::dxgi {
       BOOST_LOG(debug) << "[Display Init] Initializing display: " << display_name;
     }
 
+    // Service session 0 cannot enumerate interactive DXGI outputs. Resolve
+    // the real sealed producer before entering that session-local API path.
+    const bool service_headless = direct_vdd_capture && console_input_bridge::persistent_service_core;
+    if (service_headless && !init_headless_target(config)) return -1;
+
     adapter_t::pointer adapter_p;
     // Tries:
     //   0 - normal pass with the configured adapter filter (if any).
@@ -658,7 +664,7 @@ namespace platf::dxgi {
     //   2 - last resort: if the configured adapter never matched, drop the
     //       filter and accept any adapter so a misconfigured / stale
     //       adapter_name doesn't make capture init fail outright.
-    for (int tries = 0; tries < 3 && !output; ++tries) {
+    for (int tries = 0; tries < 3 && !output && !service_headless; ++tries) {
       if (tries == 1) {
         SetThreadExecutionState(ES_DISPLAY_REQUIRED);
         Sleep(500);
@@ -771,7 +777,7 @@ namespace platf::dxgi {
       }
     }
 
-    if (!output) {
+    if (!output && !service_headless && !init_headless_target(config)) {
       BOOST_LOG(error) << "Failed to locate an output device"sv;
       return -1;
     }
@@ -922,7 +928,7 @@ namespace platf::dxgi {
     }
 
     dxgi::output6_t output6 {};
-    status = output->QueryInterface(IID_IDXGIOutput6, (void **) &output6);
+    status = output ? output->QueryInterface(IID_IDXGIOutput6, (void **) &output6) : E_NOINTERFACE;
     if (SUCCEEDED(status)) {
       DXGI_OUTPUT_DESC1 desc1;
       output6->GetDesc1(&desc1);
@@ -1406,6 +1412,7 @@ namespace platf {
       }
 
       if (ret) {
+        if (type != "vdd") console_input_bridge::disable_for_standard_capture();
         cursor_channel::set_producer_available(type == "ddx" || type == "vdd");
         return ret;
       }

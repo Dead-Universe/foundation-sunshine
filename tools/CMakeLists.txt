@@ -72,6 +72,7 @@ add_executable(sunshinesvc sunshinesvc.cpp
         ${CMAKE_SOURCE_DIR}/src/crash/crash_win.cpp
         ${CMAKE_SOURCE_DIR}/src/crash/crash_posix.cpp)
 target_compile_definitions(sunshinesvc PRIVATE SUNSHINESVC_VERSION="${SUNSHINE_PARENT_VERSION}")
+target_link_libraries(sunshinesvc PRIVATE setupapi advapi32)
 set_target_properties(sunshinesvc PROPERTIES CXX_STANDARD 23)
 target_link_libraries(sunshinesvc
         PRIVATE Threads::Threads
