@@ -89,6 +89,7 @@ extern "C" {
 #include "webhook/webhook.h"
 
 #include "clipboard_bridge.h"
+#include "file_clipboard.h"
 #include "cursor_channel.h"
 #include "platform/common.h"
 #include "telemetry/hooks.h"
@@ -2630,6 +2631,7 @@ namespace stream {
 
           if (session->lifecycle.state() == session::state_e::STOPPING) {
             clipboard_bridge::bridge_t::instance().session_stopped(session->launch_session_id);
+            file_clipboard::session_stopped(session->launch_session_id);
             text_context::bridge_t::instance().session_stopped(session->launch_session_id);
             cursor_channel::remove_session(session->launch_session_id);
             pos = server->_sessions->erase(pos);
@@ -2853,6 +2855,7 @@ namespace stream {
       // final shutdown path instead, make the same paired lifecycle update here
       // so capability/session_count cannot retain stale launch IDs.
       clipboard_bridge::bridge_t::instance().session_stopped(session->launch_session_id);
+            file_clipboard::session_stopped(session->launch_session_id);
       text_context::bridge_t::instance().session_stopped(session->launch_session_id);
       cursor_channel::remove_session(session->launch_session_id);
 
@@ -5023,6 +5026,7 @@ namespace stream {
         session.broadcast_ref->control_server._sessions->push_back(&session);
       }
       clipboard_bridge::bridge_t::instance().session_started(session.launch_session_id);
+      if (!session.control_only) file_clipboard::session_started(session.launch_session_id, session.client_cert_uuid);
 
       // Publish before capture threads run so a perf snapshot can see the
       // first frames. The handle drops the publication when the session
