@@ -3,6 +3,8 @@
  * @brief Definitions for abstract Direct3D11 NVENC encoder.
  */
 #include "nvenc_d3d11_base.h"
+#include "nvenc_async_wait.h"
+#include "src/logging.h"
 
 #ifdef NVENC_NAMESPACE
 namespace NVENC_NAMESPACE {
@@ -42,8 +44,17 @@ namespace nvenc {
 
     return false;
   }
-  
+
   bool nvenc_d3d11_base::wait_for_async_event(uint32_t timeout_ms) {
-    return WaitForSingleObject(async_event_handle, timeout_ms) == WAIT_OBJECT_0;
+    const auto started = GetTickCount64();
+    const auto result = ::nvenc::async_completion::wait(async_event_handle, timeout_ms);
+    if (result.status == WAIT_OBJECT_0 && result.extended) {
+      BOOST_LOG(warning) << "NvEnc: delayed completion recovered without encoder reset after "
+                         << GetTickCount64() - started << " ms";
+    }
+    else if (result.status == WAIT_FAILED) {
+      BOOST_LOG(error) << "NvEnc: completion wait failed, Windows error " << result.error;
+    }
+    return result.status == WAIT_OBJECT_0;
   }
 }
