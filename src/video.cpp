@@ -62,6 +62,7 @@ extern "C" {
   #include "platform/windows/pyrowave/color_metadata.h"
   #include "platform/windows/pyrowave/cpu_encoder.h"
   #include "platform/windows/pyrowave/gpu_encoder.h"
+  #include "platform/windows/console_input_bridge.h"
 extern "C" {
   #include <libavutil/hwcontext_d3d11va.h>
 }
@@ -1919,6 +1920,18 @@ namespace video {
     return name;
   }
 
+  std::string
+  resolve_capture_display(const std::string &name, bool require_target) {
+#ifdef _WIN32
+    if (name == VDD_NAME && platf::console_input_bridge::persistent_service_core &&
+        config::video.capture == "vdd") {
+      return name;
+    }
+#endif
+    auto resolved = display_device::get_display_name(name);
+    return resolved.empty() && !require_target ? name : resolved;
+  }
+
   void
   refresh_displays(platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index) {
     // It is possible that the output display name may be empty even if it wasn't before (device disconnected)
@@ -2053,8 +2066,7 @@ namespace video {
 #ifdef _WIN32
       require_target = config.display_name == VDD_NAME;
 #endif
-      auto resolved = display_device::get_display_name(config.display_name);
-      if (resolved.empty() && !require_target) resolved = config.display_name;
+      const auto resolved = resolve_capture_display(config.display_name, require_target);
       auto selected = streaming::select_recovery_display(display_names, resolved, display_names[display_p], require_target);
       if (selected) {
         target_display_name = *selected;
@@ -2320,8 +2332,7 @@ namespace video {
 #ifdef _WIN32
             require_target = !user_switched && config.display_name == VDD_NAME;
 #endif
-            auto resolved = user_switched ? std::string {} : display_device::get_display_name(config.display_name);
-            if (resolved.empty() && !require_target && !user_switched) resolved = config.display_name;
+            const auto resolved = user_switched ? std::string {} : resolve_capture_display(config.display_name, require_target);
             const auto selected = streaming::select_recovery_display(display_names, resolved, display_names[display_p], require_target);
             if (!selected) {
               std::this_thread::sleep_for(100ms);
@@ -4245,8 +4256,7 @@ namespace video {
 #ifdef _WIN32
       require_target = !user_switched && config.display_name == VDD_NAME;
 #endif
-      auto resolved = user_switched ? std::string {} : display_device::get_display_name(config.display_name);
-      if (resolved.empty() && !require_target && !user_switched) resolved = config.display_name;
+      const auto resolved = user_switched ? std::string {} : resolve_capture_display(config.display_name, require_target);
       const auto selected = streaming::select_recovery_display(display_names, resolved, display_names[display_p], require_target);
       if (!selected) {
         std::this_thread::sleep_for(100ms);
@@ -5427,6 +5437,17 @@ namespace video {
     // The token itself does not initialize CUDA or create a GPU context.
     const auto nvenc_factory = nvenc::nvenc_dynamic_factory::get();
     const auto cuda_probe_contexts = nvenc_factory ? nvenc_factory->retain_cuda_interop_contexts() : nullptr;
+#endif
+
+#ifdef _WIN32
+    // A sealed service-session producer has no console-local CCD display ID.
+    // Keep the real capture/encoder probe and use its existing auto-selection
+    // policy only for this VDD target; explicit physical targets stay exact.
+    if (target && platf::console_input_bridge::persistent_service_core &&
+        config::video.capture == "vdd" && target->output_name.empty() &&
+        target->policy == probe_target_policy_e::vdd_compatible) {
+      target->policy = probe_target_policy_e::backend_autoselect;
+    }
 #endif
 
     const auto configured_output_name = target ? target->output_name : config::video.output_name;
