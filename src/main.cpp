@@ -50,7 +50,10 @@
 #include "webhook/webhook_auth.h"
 
 #ifdef _WIN32
+  #include "display_device/vdd_utils.h"
   #include "platform/windows/misc.h"
+  #include "platform/windows/console_input_bridge.h"
+  #include "platform/windows/service_vdd.h"
   #include "platform/windows/win_dark_mode.h"
   #include "spatial_audio/mat_capture_process.h"
 #endif
@@ -345,6 +348,21 @@ main(int argc, char *argv[]) {
   lifetime::argv = argv;
 
 #ifdef _WIN32
+  if ((argc == 4 || argc == 5) && std::string_view(argv[1]) == "--service-session-event") {
+    std::uintptr_t parent = 0, event = 0;
+    if (!platf::console_input_bridge::parse_handle(argv[2], parent) || parent > MAXDWORD ||
+        !platf::console_input_bridge::parse_handle(argv[3], event) ||
+        !platf::console_input_bridge::bind_service_event(static_cast<DWORD>(parent), reinterpret_cast<HANDLE>(event))) {
+      return ERROR_INVALID_HANDLE;
+    }
+    if (argc == 5) {
+      DWORD session = MAXDWORD;
+      if (std::string_view(argv[4]) != "--service-vdd-core" ||
+          !ProcessIdToSessionId(GetCurrentProcessId(), &session) || session != 0) return ERROR_ACCESS_DENIED;
+      platf::console_input_bridge::persistent_service_core = true;
+    }
+    argc = 1;
+  }
   // Note: this only fires on a normal `return` from main. If the program
   // crashes mid-run (uncaught exception, AV, abort/terminate), atexit is
   // not invoked, so the service supervisor still observes a non-zero exit
@@ -438,6 +456,18 @@ main(int argc, char *argv[]) {
 
   // logging can begin at this point
   // if anything is logged prior to this point, it will appear in stdout, but not in the log viewer in the UI
+#ifdef _WIN32
+  if (platf::service_vdd::enabled()) {
+    if (!config::video.capture.empty() && config::video.capture != "auto" && config::video.capture != "vdd") {
+      BOOST_LOG(warning) << "Persistent service Core requires VDD; retaining the explicitly configured capture backend";
+      g_final_exit_code.store(ERROR_NOT_SUPPORTED);
+      return ERROR_NOT_SUPPORTED;
+    }
+    config::video.capture = "vdd";
+    config::video.output_name.clear();
+    BOOST_LOG(info) << "[service-vdd] Persistent Core is running in Windows service session 0";
+  }
+#endif
   // the version should be printed to the log before anything else
   BOOST_LOG(info) << build_info::product_name() << " version: " << build_info::version();
 
@@ -725,12 +755,6 @@ main(int argc, char *argv[]) {
 
   std::unique_ptr<platf::deinit_t> mDNS;
   std::future<void> sync_mDNS;
-  if (config::sunshine.flags[config::flag::MDNS_BROADCAST]) {
-    BOOST_LOG(info) << "mDNS broadcast enabled"sv;
-    sync_mDNS = std::async(std::launch::async, [&mDNS]() {
-      mDNS = platf::publish::start();
-    });
-  }
 
   std::unique_ptr<platf::deinit_t> upnp_unmap;
   auto sync_upnp = std::async(std::launch::async, [&upnp_unmap]() {
@@ -791,6 +815,29 @@ main(int argc, char *argv[]) {
   std::thread httpThread { nvhttp::start };
   std::thread rtspThread { rtsp_stream::start };
 
+#ifdef _WIN32
+  if (config::video.capture == "auto") {
+    config::video.capture.clear();
+  }
+  if (platf::service_vdd::enabled()) {
+    display_device::parsed_config_t initial {};
+    if (!platf::service_vdd::prepare_monitor(initial, 1280, 720, 60)) {
+      BOOST_LOG(warning) << "[service-vdd] Initial VDD preparation failed; launch will retry the driver channel";
+    }
+    platf::service_vdd::start_display_follower();
+  }
+  else if (config::video.capture == "vdd") {
+    auto &display_session = display_device::session_t::get();
+    if (!display_session.is_display_on() && !display_session.create_vdd_monitor_noninteractive()) {
+      BOOST_LOG(error) << "[vdd] Failed to create ZakoVDD before encoder probe"sv;
+    }
+    if (display_session.is_display_on() &&
+        !display_device::vdd_utils::normalize_vdd_source_mode_for_direct_capture()) {
+      BOOST_LOG(error) << "[vdd] Failed to establish source=target mode before encoder probe"sv;
+    }
+  }
+#endif
+
   // The probe runs on a thread of its own: the tray and the ready state do not wait for the driver. In the safe mode it is left out, and a stream checks the encoders
   // when it is asked for (the launch path does it every time). The phase word "encoder-probe" stays on the reports while the probe runs, whatever phase the main thread is in.
   probe_task_t probe_task;
@@ -805,6 +852,15 @@ main(int argc, char *argv[]) {
   crash::context::set_phase(crash::context::phase_e::input_wait);
   input_deinit_guard = input_init.get();
   crash::context::set_phase(crash::context::phase_e::tray);
+  // Moonlight requests /serverinfo immediately after mDNS discovery. Advertise
+  // only after the GameStream server threads have been started so a slow graphics
+  // probe cannot publish a host whose advertised HTTP endpoint is not listening.
+  if (config::sunshine.flags[config::flag::MDNS_BROADCAST]) {
+    BOOST_LOG(info) << "mDNS broadcast enabled"sv;
+    sync_mDNS = std::async(std::launch::async, [&mDNS]() {
+      mDNS = platf::publish::start();
+    });
+  }
 
 #if defined(_WIN32) && defined(SUNSHINE_GUI_TRAY) && SUNSHINE_GUI_TRAY >= 1
   // The service wrapper owns user-session agent startup in service mode, and
