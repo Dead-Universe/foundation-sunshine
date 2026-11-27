@@ -63,6 +63,7 @@ set(SUNSHINE_HOST_SOURCES
     src/system_load.cpp src/system_load.h src/system_load_stub.cpp
     src/stream.cpp src/stream.h
     src/clipboard_bridge.cpp src/clipboard_bridge.h
+    src/file_clipboard.cpp src/file_clipboard.h
     src/cursor_channel.cpp src/cursor_channel.h
     src/clipboard_blob_store.cpp src/clipboard_blob_store.h
     src/clipboard_http.cpp src/clipboard_http.h
@@ -302,3 +303,7 @@ set(SUNSHINE_HOST_SOURCES
     src/confighttp/telemetry.cpp src/confighttp/telemetry.h
 )
 list(TRANSFORM SUNSHINE_HOST_SOURCES PREPEND "${CMAKE_SOURCE_DIR}/")
+
+if(WIN32)
+  list(APPEND SUNSHINE_HOST_SOURCES "${CMAKE_SOURCE_DIR}/src/file_clipboard/file_clipboard_native.cpp" "${CMAKE_SOURCE_DIR}/src/file_clipboard/file_clipboard_source.cpp")
+endif()

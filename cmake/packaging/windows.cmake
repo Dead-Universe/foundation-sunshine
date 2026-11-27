@@ -108,6 +108,7 @@ install(TARGETS alkaidlab_pyrowave_probe RUNTIME DESTINATION "tools" COMPONENT a
 # The host runs the probe next to its own executable: a targeted build of sunshine must produce
 # the tool as well, or the probe cannot start and PyroWave stays unavailable in that build.
 add_dependencies(sunshine alkaidlab_pyrowave_probe)
+install(TARGETS sunshine-file-clipboard RUNTIME DESTINATION "tools" COMPONENT application)
 
 # The touch application command uses this host-owned protocol launcher. It is
 # published from tools/sparxie-launch when the Windows SDK build has dotnet.
