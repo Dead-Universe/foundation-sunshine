@@ -13,6 +13,7 @@
 #define MyWelcomeBmp "@CMAKE_SOURCE_DIR@\assets\installer\welcome.bmp"
 #define MySmallBmp "@CMAKE_SOURCE_DIR@\assets\installer\wizard_small.bmp"
 #define MyLicenseFile "@CMAKE_SOURCE_DIR@\LICENSE"
+#define MyVbCableBundled @VBCABLE_BUNDLED@
 
 [Setup]
 ; 基本设置
@@ -102,6 +103,11 @@ english.ComponentApplication=Sunshine main application
 english.ComponentAssets=Required assets (shaders, web UI)
 english.ComponentGUI=Sunshine GUI and tray agent (required)
 english.ComponentVDD=Foundation Virtual Display (HDR)
+english.ComponentVbCable=VB-CABLE virtual sound card (VB-Audio)
+english.ComponentVbCableDesc=Standard Pack46, Donationware - https://vb-audio.com/Cable/; existing drivers are retained
+english.StatusInstallVbCable=Checking or installing VB-CABLE. Complete the original VB-Audio window if it opens.
+english.MsgVbCableFailed=VB-CABLE was not installed or could not be verified. See the installer log and the bundled VB-CABLE notice. Existing drivers were not removed.
+english.MsgVbCableOlder=An older VB-CABLE driver was retained. To update, follow the original VB-Audio installer and restart workflow; this installation did not upgrade that driver.
 english.ComponentAutostart=Launch on system startup
 english.ComponentFirewall=Add firewall exclusions
 english.ComponentGamepad=Virtual Gamepad (ViGEmBus)
@@ -153,6 +159,11 @@ chinesesimplified.ComponentApplication=Sunshine 主程序
 chinesesimplified.ComponentAssets=必要资源（着色器、Web UI）
 chinesesimplified.ComponentGUI=Sunshine GUI 与托盘代理（必需）
 chinesesimplified.ComponentVDD=基地虚拟显示器（HDR）
+chinesesimplified.ComponentVbCable=VB-CABLE 虚拟声卡（VB-Audio）
+chinesesimplified.ComponentVbCableDesc=标准版 Pack46，Donationware：https://vb-audio.com/Cable/；保留已有驱动
+chinesesimplified.StatusInstallVbCable=正在检查或安装 VB-CABLE；如弹出原厂窗口，请手动完成安装。
+chinesesimplified.MsgVbCableFailed=VB-CABLE 未安装或验证失败。请查看安装日志及随包说明；没有删除已有驱动。
+chinesesimplified.MsgVbCableOlder=保留了已有旧版 VB-CABLE。本次未升级此驱动；请通过原厂安装器及重启流程手动更新。
 chinesesimplified.ComponentAutostart=开机自动启动
 chinesesimplified.ComponentFirewall=添加防火墙规则
 chinesesimplified.ComponentGamepad=虚拟手柄（ViGEmBus）
@@ -218,6 +229,9 @@ Name: "gamepad"; Description: "{cm:ComponentGamepad} — {cm:ComponentGamepadDes
 Name: "usbip"; Description: "{cm:ComponentUsbip} — {cm:ComponentUsbipDesc}"; Types: full; MinVersion: 10.0.18362
 Name: "vmouse"; Description: "{cm:ComponentVmouse} — {cm:ComponentVmouseDesc}"; Types: full; MinVersion: 10.0.22000
 Name: "tools"; Description: "{cm:ComponentTools} — {cm:ComponentToolsDesc}"; Types: recommended full
+#if MyVbCableBundled
+Name: "vb_cable"; Description: "{cm:ComponentVbCable} — {cm:ComponentVbCableDesc}"; Types: recommended full
+#endif
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
@@ -363,6 +377,13 @@ Source: "{#MySourceDir}\scripts\install-vsink.bat"; DestDir: "{app}\scripts"; Fl
 Source: "{#MySourceDir}\scripts\uninstall-vsink.bat"; DestDir: "{app}\scripts"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#MySourceDir}\scripts\uninstall-vsink.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion skipifsourcedoesntexist
 
+; Optional offline VB-CABLE installer payload.
+Source: "{#MySourceDir}\tools\vbcable\vb-cable-helper.ps1"; DestDir: "{app}\tools\vbcable"; Flags: ignoreversion
+Source: "{#MySourceDir}\tools\vbcable\VB-CABLE-NOTICE.txt"; DestDir: "{app}\tools\vbcable"; Flags: ignoreversion
+#if MyVbCableBundled
+Source: "{#MySourceDir}\tools\vbcable\VBCABLE_Driver_Pack46.zip"; DestDir: "{app}\tools\vbcable"; Flags: ignoreversion
+#endif
+
 ; Optional diagnostic tools
 Source: "{#MySourceDir}\tools\dxgi-info.exe"; DestDir: "{app}\tools"; Flags: ignoreversion; Components: tools
 Source: "{#MySourceDir}\tools\audio-info.exe"; DestDir: "{app}\tools"; Flags: ignoreversion; Components: tools
@@ -495,6 +516,8 @@ var
   PermissionsRepairInProgress: Boolean;
   // 0 = ready/not selected, 101 = failed, 3010 = reboot required.
   VDDResultCode: Integer;
+  // 102 = failed, 103 = older shared driver retained, 3010 = reboot required.
+  VbCableResultCode: Integer;
   InstallRunDir: String;
   InstallRunId: String;
   InstallEventSequence: Integer;
@@ -803,7 +826,7 @@ end;
 
 function GetServiceInstallParameters(Param: String): String;
 begin
-  if VDDResultCode = 0 then
+  if (VDDResultCode = 0) and ((VbCableResultCode = 0) or (VbCableResultCode = 103)) then
     Result := ''
   else
     Result := '--no-start';
@@ -811,7 +834,7 @@ end;
 
 function ShouldConfigureServiceAutostart(): Boolean;
 begin
-  Result := (VDDResultCode <> 101) and (not ServiceVerifyFailed);
+  Result := (VDDResultCode <> 101) and (VbCableResultCode <> 102) and (not ServiceVerifyFailed);
 end;
 
 procedure InstallAndVerifyVDD();
@@ -865,6 +888,42 @@ begin
   end;
 end;
 
+procedure InstallAndVerifyVbCable();
+#if MyVbCableBundled
+var
+  ResultCode: Integer;
+  Params: String;
+#endif
+begin
+#if MyVbCableBundled
+  if not WizardIsComponentSelected('vb_cable') then
+    Exit;
+  WizardForm.StatusLabel.Caption := CustomMessage('StatusInstallVbCable');
+  Params := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File "' +
+    ExpandConstant('{app}\tools\vbcable\vb-cable-helper.ps1') + '" -ResultPath "' +
+    ExpandConstant('{tmp}\sunshine-vbcable-result.json') + '"';
+  // Missing drivers in silent mode fail visibly in the log; never open an invisible GUI.
+  if not WizardSilent then
+    Params := Params + ' -AllowVendorUI';
+  ResultCode := -1;
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'), Params, '',
+              SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    VbCableResultCode := 102
+  else if (ResultCode = 0) or (ResultCode = 103) or (ResultCode = 3010) then
+    VbCableResultCode := ResultCode
+  else
+    VbCableResultCode := 102;
+  Log('VB-CABLE helper result: ' + IntToStr(ResultCode) +
+      '; details: ' + ExpandConstant('{tmp}\sunshine-vbcable-result.json'));
+  if not WizardSilent then
+  begin
+    if VbCableResultCode = 102 then
+      MsgBox(CustomMessage('MsgVbCableFailed'), mbError, MB_OK)
+    else if VbCableResultCode = 103 then
+      MsgBox(CustomMessage('MsgVbCableOlder'), mbInformation, MB_OK);
+  end;
+#endif
+end;
 procedure InitializeWizard();
 var
   WelcomeLeft: Integer;
@@ -1561,6 +1620,8 @@ begin
   RebootReasons := '';
   if VDDResultCode = 3010 then
     AddRebootReason('vdd');
+  if VbCableResultCode = 3010 then
+    AddRebootReason('vb-cable');
   if GamepadResult = 3010 then
     AddRebootReason('vigem');
   if UsbipResult = 3010 then
@@ -1602,10 +1663,14 @@ begin
   DecideRestart();
   if VDDResultCode = 101 then
     Result := 101
+  else if VbCableResultCode = 102 then
+    Result := 102
   else if ServiceVerifyFailed or ServiceStartFailed then
     Result := 100
   else if RebootReasons <> '' then
     Result := 3010
+  else if VbCableResultCode = 103 then
+    Result := 103
   else
     Result := 0;
 end;
@@ -2103,6 +2168,7 @@ begin
     // Sunshine service is allowed to start. A bound-but-not-ready device is
     // kept for Windows to finish during the requested reboot.
     InstallAndVerifyVDD();
+    InstallAndVerifyVbCable();
     if not IsUnderProgramFiles(ExpandConstant('{app}')) then
       LogFolderPermissions('after install', RemoveBackslash(ExpandConstant('{app}')));
     // Delete portable scripts in installed version

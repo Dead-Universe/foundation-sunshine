@@ -2,6 +2,7 @@
 
 # Fetch driver dependencies (downloads at configure time)
 include(${CMAKE_MODULE_PATH}/packaging/FetchDriverDeps.cmake)
+include(${CMAKE_MODULE_PATH}/packaging/BundleVbCable.cmake)
 
 # Every driver the fetcher can download must have a reviewed license text. The
 # manifest pins the version variables selected above, so a pin bump without a
@@ -194,7 +195,19 @@ if(USBIP_AVAILABLE)
 endif()
 install(DIRECTORY "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vsink/"
         DESTINATION "scripts"
+        COMPONENT vsink
+        PATTERN "vb-cable-helper.ps1" EXCLUDE
+        PATTERN "VB-CABLE-NOTICE.txt" EXCLUDE)
+install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vsink/vb-cable-helper.ps1"
+              "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vsink/VB-CABLE-NOTICE.txt"
+        DESTINATION "tools/vbcable"
         COMPONENT vsink)
+if(VBCABLE_BUNDLED)
+  install(FILES "${VBCABLE_ARCHIVE}"
+          DESTINATION "tools/vbcable"
+          RENAME "VBCABLE_Driver_Pack46.zip"
+          COMPONENT vsink)
+endif()
 # VDD: scripts & shared config from source tree, driver binaries from download cache
 install(FILES "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vdd/install-vdd.bat"
               "${SUNSHINE_SOURCE_ASSETS_DIR}/windows/misc/vdd/vdd-device-helper.ps1"
